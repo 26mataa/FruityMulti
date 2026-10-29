@@ -1026,7 +1026,7 @@ static std::string executeCommand (const std::string& line)
 		return "STATE OK";
 	}
 	if (line == "VERSION")
-		return "VERSION 27-fenetre";
+		return "VERSION 28-fenetre";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)

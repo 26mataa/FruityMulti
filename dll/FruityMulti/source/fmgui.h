@@ -26,6 +26,6 @@ int  role ();
 bool agentLance ();
 
 // Version du plugin, telle qu'annoncee par la commande VERSION.
-constexpr int kVersionPlugin = 27;
+constexpr int kVersionPlugin = 28;
 
 } // namespace fmgui

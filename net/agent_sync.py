@@ -25,7 +25,7 @@ from collections import Counter
 # Le depot public qui heberge les versions. L'agent y lit la derniere release
 # et telecharge le plugin + lui-meme. A incrementer a chaque publication.
 DEPOT = "26mataa/FruityMulti"
-AGENT_VERSION = 27
+AGENT_VERSION = 28
 ADRESSE_RELEASES = f"https://github.com/{DEPOT}/releases/latest"
 
 PLUGIN_HOST = "127.0.0.1"
@@ -787,6 +787,10 @@ class Sync:
         self.last_clipsync = 0.0
         self.nb_canaux_hote = None   # taille du rack de l hote
         self.averti_canaux = False
+        # correspondance par nom entre les deux racks
+        self.carte_hote_vers_local = {}
+        self.carte_local_vers_hote = {}
+        self.averti_noms = set()
         self.position = None
         self.channels_state = None
         self.peer_channels = None
@@ -987,16 +991,22 @@ class Sync:
 
             elif kind == "add":
                 notes = [tuple(n) for n in message.get("notes", [])]
-                if notes:
-                    # Plus besoin de selectionner un canal : la note porte son
-                    # canal, on l'ecrit directement au bon endroit.
-                    self.plugin.add_many(int(index), notes)
+                cible = self.index_local(int(index))
+                if notes and cible is None:
+                    nom = self.nom_hote(int(index))
+                    if nom not in self.averti_noms:
+                        self.averti_noms.add(nom)
+                        print(f"[rack] canal '{nom or index}' absent ici : "
+                              f"ses notes ne sont pas ecrites")
+                elif notes:
+                    self.plugin.add_many(int(cible), notes)
                     applied += len(notes)
 
             elif kind == "del":
                 notes = [tuple(n) for n in message.get("notes", [])]
-                if notes:
-                    self.plugin.del_many(int(index), notes)
+                cible = self.index_local(int(index))
+                if notes and cible is not None:
+                    self.plugin.del_many(int(cible), notes)
                     applied += len(notes)
 
             elif kind == "tempo":
@@ -1089,6 +1099,7 @@ class Sync:
                 wanted = [(int(i), int(t), str(n))
                           for i, t, n in message.get("channels", [])]
                 self.nb_canaux_hote = len(wanted)
+                self.rack_hote = wanted
                 local = self.plugin.channels() or []
                 print(f"[rack] l'hote a {len(wanted)} canal(aux), "
                       f"j'en ai {len(local)}")
@@ -1125,6 +1136,7 @@ class Sync:
                 fresh = self.plugin.channels()
                 if fresh is not None:
                     self.channels_state = {i: t for i, t, _ in fresh}
+                self.construire_carte(wanted)
                 if crees:
                     print(f"[rack] {crees} canal(aux) cree(s) — "
                           f"verifie l'ordre a l'ecran")
@@ -1716,14 +1728,15 @@ class Sync:
             # Le canal est dans la note elle-meme : plus besoin de selectionner
             # le piano roll avant d'ecrire (c'etait la cause du "tout sur le
             # premier canal").
+            cible = self.index_hote(channel)
             removed = diff_removals(old, new)
             if removed:
-                self.publish({"type": "del", "ch": channel, "notes": removed})
+                self.publish({"type": "del", "ch": cible, "notes": removed})
                 changed += len(removed)
 
             added = diff_additions(old, new)
             if added:
-                self.publish({"type": "add", "ch": channel, "notes": added})
+                self.publish({"type": "add", "ch": cible, "notes": added})
                 changed += len(added)
 
         if changed:
@@ -1739,6 +1752,53 @@ class Sync:
             print("[autorite] actions de l'hote rendues")
         except (OSError, TimeoutError, IndexError):
             pass
+
+    def nom_hote(self, index_hote):
+        """Nom du canal de l'hote, pour les messages."""
+        for index, _t, name in getattr(self, "rack_hote", []) or []:
+            if index == index_hote:
+                return name
+        return None
+
+    def index_local(self, index_hote):
+        """Mon canal qui correspond a ce canal de l'hote, ou None."""
+        if self.is_host:
+            return index_hote
+        if not self.carte_hote_vers_local:
+            return index_hote      # pas encore de table : on garde l'index
+        return self.carte_hote_vers_local.get(index_hote)
+
+    def index_hote(self, index_local):
+        """Le canal de l'hote qui correspond a mon canal."""
+        if self.is_host:
+            return index_local
+        return self.carte_local_vers_hote.get(index_local, index_local)
+
+    def construire_carte(self, wanted):
+        """Table de correspondance par nom entre le rack de l'hote et le mien."""
+        if self.is_host:
+            return
+        local = self.plugin.channels() or []
+        par_nom = {}
+        for i, _t, n in local:
+            cle = (n or "").strip().lower()
+            if cle and cle not in par_nom:
+                par_nom[cle] = i
+
+        self.carte_hote_vers_local = {}
+        self.carte_local_vers_hote = {}
+        for index, _t, name in wanted:
+            cle = (name or "").strip().lower()
+            if not cle or cle not in par_nom:
+                continue
+            self.carte_hote_vers_local[index] = par_nom[cle]
+            self.carte_local_vers_hote[par_nom[cle]] = index
+
+        if self.carte_hote_vers_local:
+            print(f"[rack] correspondance par nom : "
+                  f"{len(self.carte_hote_vers_local)} canal(aux) reconnu(s)")
+        else:
+            print("[rack] aucun nom commun : les notes suivront les index")
 
     def run(self):
         print("[sync] pret")
