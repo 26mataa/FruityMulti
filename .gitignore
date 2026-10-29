@@ -1,0 +1,48 @@
+﻿# --- Chaines de compilation -------------------------------------------------
+dll/vst3sdk/
+dll/build-fm/
+net/build/
+net/dist/
+net/*.spec
+
+# --- Analyse (volumineux, regenerable) --------------------------------------
+re/ghidra/
+re/bin/
+re/reports/
+re/archive/
+re/capture-frida*.json
+re/frida/*.txt
+
+# --- Fichiers produits -------------------------------------------------------
+Partage/*.exe
+Partage/*.vst3
+Partage/*.zip
+
+# --- Divers ------------------------------------------------------------------
+*.log
+*.tmp
+__pycache__/
+*.pyc
+
+# --- Sorties de compilation (binaires : uniquement en release) --------------
+build/
+dist/
+Partage/*.exe
+FruityMulti-v*.zip
+
+# --- Reste en local : la distribution passe par les releases -------------
+Partage/
+re/
+A-FAIRE.md
+PROTOCOLE-TEST.md
+ETAT-DU-PROJET.md
+
+FruityMulti-v*.zip
+inventaire_*.json
+net/archive/
+net/sync.py
+
+# --- binaires embarques dans l'installateur (regeneres) -------------------
+setup/payload/
+setup/payload.rc
+setup/build/

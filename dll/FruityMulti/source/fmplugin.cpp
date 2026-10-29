@@ -1,0 +1,3327 @@
+// FruityMulti - plugin VST3 "cheval de Troie".
+//
+// Objectif de cette premiere version : prouver que notre code s'execute bien
+// a l'interieur du processus de FL Studio, sans injecteur externe.
+// Il ne traite aucun audio et n'affiche aucune interface.
+//
+// Preuve : ecriture d'un fichier de log avec l'adresse de base de FLEngine.
+
+#include "pluginterfaces/base/fplatform.h"
+#include "pluginterfaces/base/ustring.h"
+#include "pluginterfaces/vst/vstspeaker.h"
+#include "public.sdk/source/vst/vstsinglecomponenteffect.h"
+// inclus en dernier : son BEGIN_FACTORY_DEF doit ecraser celui de pluginfactory.h
+#include "public.sdk/source/main/pluginfactory_constexpr.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include "fmgui.h"
+#include <shellapi.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "ws2_32.lib")
+
+using namespace Steinberg;
+using namespace Steinberg::Vst;
+
+// UID du plugin (doit rester stable d'une version a l'autre) — scope global,
+// car les macros de fabrique l'utilisent hors de tout namespace.
+static DECLARE_UID (FruityMultiBridgeUID, 0x8F3A1C21, 0x4B7E4C11, 0xA9D23E5B, 0x7C6D8E9F);
+static constexpr size_t numberOfClasses = 1;
+
+namespace FruityMulti {
+
+static std::string logPath ()
+{
+	char tempPath[MAX_PATH] = { 0 };
+	DWORD n = GetEnvironmentVariableA ("TEMP", tempPath, MAX_PATH);
+	if (n == 0)
+		return std::string ();
+	std::string p (tempPath);
+	p += "\\FruityMulti_agent.log";
+	return p;
+}
+
+static void logLine (const char* fmt, ...)
+{
+	std::string path = logPath ();
+	if (path.empty ())
+		return;
+
+	FILE* f = nullptr;
+	if (fopen_s (&f, path.c_str (), "a") != 0 || f == nullptr)
+		return;
+
+	SYSTEMTIME st;
+	GetLocalTime (&st);
+	fprintf (f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+	va_list ap;
+	va_start (ap, fmt);
+	vfprintf (f, fmt, ap);
+	va_end (ap);
+
+	fprintf (f, "\n");
+	fclose (f);
+}
+
+//------------------------------------------------------------------------
+// Recherche d'une signature d'octets dans l'image d'un module.
+// Format : "57 56 53 48 ?? ?? 20" — "??" = joker.
+// C'est ce qui remplace les adresses fixes : le code peut bouger, le motif reste.
+static void* findSignature (HMODULE module, const char* sig)
+{
+	if (module == nullptr)
+		return nullptr;
+
+	const unsigned char* base = (const unsigned char*)module;
+
+	const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+		return nullptr;
+
+	const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE)
+		return nullptr;
+
+	const size_t imageSize = nt->OptionalHeader.SizeOfImage;
+
+	std::vector<unsigned char> bytes;
+	std::vector<bool> mask;
+
+	auto hexVal = [] (char c) -> int {
+		if (c >= '0' && c <= '9') return c - '0';
+		if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+		if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+		return -1;
+	};
+
+	for (const char* p = sig; *p != 0;)
+	{
+		if (*p == ' ')
+		{
+			++p;
+			continue;
+		}
+		if (p[0] == '?' && p[1] == '?')
+		{
+			bytes.push_back (0);
+			mask.push_back (false);
+			p += 2;
+		}
+		else
+		{
+			int hi = hexVal (p[0]);
+			int lo = hexVal (p[1]);
+			if (hi < 0 || lo < 0)
+				return nullptr;
+			bytes.push_back ((unsigned char)((hi << 4) | lo));
+			mask.push_back (true);
+			p += 2;
+		}
+	}
+
+	const size_t n = bytes.size ();
+	if (n < 8 || n >= imageSize)
+		return nullptr;
+
+	for (size_t i = 0; i + n < imageSize; ++i)
+	{
+		size_t j = 0;
+		for (; j < n; ++j)
+		{
+			if (mask[j] && base[i + j] != bytes[j])
+				break;
+		}
+		if (j == n)
+			return (void*)(base + i);
+	}
+	return nullptr;
+}
+
+// Verifie qu'une zone est lisible avant de la dereferencer : evite un plantage
+// de FL si une entree de table est perimee.
+static bool isReadable (const void* p, size_t n)
+{
+	if (p == nullptr)
+		return false;
+	MEMORY_BASIC_INFORMATION mbi;
+	if (VirtualQuery (p, &mbi, sizeof (mbi)) == 0)
+		return false;
+	if (mbi.State != MEM_COMMIT)
+		return false;
+	if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+		return false;
+	const unsigned char* start = (const unsigned char*)p;
+	const unsigned char* regionEnd = (const unsigned char*)mbi.BaseAddress + mbi.RegionSize;
+	return (start + n) <= regionEnd;
+}
+
+//------------------------------------------------------------------------
+// Ecriture depuis le thread principal de FL.
+// ---------------------------------------------------------------------
+
+static DWORD g_flMainThreadId = 0;
+static void* g_container = nullptr;
+static bool  g_testDone = false;
+static UINT_PTR g_timerId = 0;
+
+static const char* kInsertSig =
+	"57 56 53 48 83 EC 20 48 89 CB 48 89 D6 48 89 D9 48 8D 53 1C 44 8B 06 "
+	"E8 ?? ?? ?? ?? 48 89 D9 8B 53 1C 41 B8 01 00 00 00 E8 ?? ?? ?? ??";
+
+struct FindWindowCtx
+{
+	DWORD pid;
+	HWND  best;
+};
+
+static BOOL CALLBACK enumWindowsProc (HWND hwnd, LPARAM lp)
+{
+	FindWindowCtx* ctx = (FindWindowCtx*)lp;
+	DWORD pid = 0;
+	GetWindowThreadProcessId (hwnd, &pid);
+	if (pid != ctx->pid)
+		return TRUE;
+
+	char title[256] = { 0 };
+	GetWindowTextA (hwnd, title, sizeof (title));
+	if (strstr (title, "FL Studio") != nullptr)
+	{
+		ctx->best = hwnd;
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static HWND findFlMainWindow ()
+{
+	FindWindowCtx ctx { GetCurrentProcessId (), nullptr };
+	EnumWindows (enumWindowsProc, (LPARAM)&ctx);
+	return ctx.best;
+}
+
+// --- Reveil immediat du thread principal ------------------------------------
+// Le thread reseau ne touche jamais au modele : il depose la requete et previent
+// le thread principal par un message. Sans cela il fallait attendre le tick de
+// la minuterie (jusqu'a 15,6 ms) a chaque requete : c'est ce qui faisait 31 ms
+// par cycle de synchronisation.
+// DESACTIVE le 28/10 a 23h50 apres un crash de FL (defaut dans FLEngine).
+// Cause probable : la fenetre etait creee dans initialize(), qui ne tourne pas
+// forcement sur le thread principal de FL ; processPending() pouvait donc
+// toucher au moteur hors du thread de l'interface.
+// Pour le reactiver : creer la fenetre depuis fmTimerProc, qui lui tourne sur
+// le thread principal (c'est prouve par tout le reste du plugin).
+static const bool kUseWakeWindow = false;
+static HWND g_wakeWnd = nullptr;
+
+static void processPending ();          // definie plus bas
+
+static LRESULT CALLBACK fmWakeProc (HWND h, UINT m, WPARAM w, LPARAM l)
+{
+	if (m == WM_APP + 1)
+	{
+		processPending ();
+		return 0;
+	}
+	return DefWindowProcA (h, m, w, l);
+}
+
+static void createWakeWindow ()
+{
+	if (g_wakeWnd != nullptr)
+		return;
+
+	WNDCLASSA wc;
+	memset (&wc, 0, sizeof (wc));
+	wc.lpfnWndProc = fmWakeProc;
+	wc.hInstance = GetModuleHandleA (nullptr);
+	wc.lpszClassName = "FruityMultiWake";
+
+	if (RegisterClassA (&wc) == 0 && GetLastError () != ERROR_CLASS_ALREADY_EXISTS)
+	{
+		logLine ("reveil           : RegisterClass echec");
+		return;
+	}
+
+	g_wakeWnd = CreateWindowExA (0, "FruityMultiWake", "", 0, 0, 0, 0, 0,
+	                             HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+	logLine ("reveil           : %p", (void*)g_wakeWnd);
+}
+
+static void destroyWakeWindow ()
+{
+	if (g_wakeWnd != nullptr)
+	{
+		DestroyWindow (g_wakeWnd);
+		g_wakeWnd = nullptr;
+	}
+}
+
+
+// --- Autorite : l'hote fait foi ---------------------------------------------
+// Role : 0 = pas de session, 1 = hote, 2 = invite.
+//
+// En session, l'invite ne decide pas du projet : le plugin refuse les commandes
+// qui le touchent (TEMPO, PATTERN, PLAY/STOP, SONGPOS) et l'agent le ramene aux
+// valeurs de l'hote. Les ordres venus de l'hote, eux, passent : l'agent les
+// prefixe par FORCE.
+//
+// Note du 28/10 au soir : griser les menus de FL est IMPOSSIBLE par Win32 —
+// FL n'a aucun menu Win32 (GetMenu renvoie 0, et aucun enfant n'en a). La
+// fonction fmApplyRoleLock ci-dessous ne trouve donc rien a griser ; elle est
+// conservee car elle ne coute rien et redeviendrait utile si FL changeait.
+static volatile LONG g_role = 0;
+// Un ordre venu de l'hote s'execute meme chez l'invite : l'agent le prefixe
+// par FORCE. C'est la difference entre "l'invite change le projet" (refuse)
+// et "l'invite applique ce que l'hote a decide" (autorise).
+static volatile LONG g_forceRole = 0;
+
+static bool roleBloque ()
+{
+	if (InterlockedCompareExchange (&g_forceRole, 0, 0) != 0)
+		return false;
+	return InterlockedCompareExchange (&g_role, 0, 0) == 2;
+}
+
+struct FmLockedMenu
+{
+	HMENU menu;
+	UINT id;
+};
+
+static std::vector<FmLockedMenu> g_locked;
+static DWORD g_lockScanAt = 0;
+static DWORD g_lockApplyAt = 0;
+
+// Un libelle de menu est-il reserve a l'hote ?
+static bool fmHostOnly (const wchar_t* texte)
+{
+	if (texte == nullptr)
+		return false;
+
+	static const wchar_t* mots[] = {
+		L"export", L"render", L"save", L"open", L"revert",
+		L"new from template", L"close project", L"close",
+		L"manage plugins", L"scan", L"plugin manager", L"project info"
+	};
+
+	std::wstring bas (texte);
+	for (size_t i = 0; i < bas.size (); i++)
+	{
+		if (bas[i] >= L'A' && bas[i] <= L'Z')
+			bas[i] = (wchar_t)(bas[i] - L'A' + L'a');
+	}
+	for (size_t m = 0; m < sizeof (mots) / sizeof (mots[0]); m++)
+	{
+		if (bas.find (mots[m]) != std::wstring::npos)
+			return true;
+	}
+	return false;
+}
+
+static void fmScanMenu (HMENU menu, int profondeur)
+{
+	if (menu == nullptr || profondeur > 4)
+		return;
+
+	const int n = GetMenuItemCount (menu);
+	for (int i = 0; i < n; i++)
+	{
+		wchar_t buf[192] = { 0 };
+		const int len = GetMenuStringW (menu, i, buf, 191, MF_BYPOSITION);
+		if (len > 0 && fmHostOnly (buf))
+		{
+			const UINT id = GetMenuItemID (menu, i);
+			if (id != 0 && id != (UINT)-1)
+			{
+				FmLockedMenu item { menu, id };
+				g_locked.push_back (item);
+			}
+		}
+		HMENU sous = GetSubMenu (menu, i);
+		if (sous != nullptr)
+			fmScanMenu (sous, profondeur + 1);
+	}
+}
+
+// Appelee par la minuterie : gratte les menus toutes les 5 s, applique l'etat
+// toutes les 250 ms (FL reconstruit ses menus, donc il faut insister).
+static void fmApplyRoleLock ()
+{
+	const DWORD maintenant = GetTickCount ();
+	if (maintenant - g_lockApplyAt < 250)
+		return;
+	g_lockApplyAt = maintenant;
+
+	const int role = (int)InterlockedCompareExchange (&g_role, 0, 0);
+
+	if (g_locked.empty () || maintenant - g_lockScanAt > 5000)
+	{
+		g_locked.clear ();
+		HWND fl = findFlMainWindow ();
+		if (fl != nullptr)
+			fmScanMenu (GetMenu (fl), 0);
+		g_lockScanAt = maintenant;
+	}
+
+	if (g_locked.empty ())
+		return;
+
+	const UINT drapeau = (role == 2) ? MF_GRAYED : MF_ENABLED;
+	for (size_t i = 0; i < g_locked.size (); i++)
+		EnableMenuItem (g_locked[i].menu, g_locked[i].id, MF_BYCOMMAND | drapeau);
+}
+
+
+static void processPending ();              // definie plus bas
+static void applyClipLength (unsigned, unsigned); // definie plus bas
+static unsigned char* getClipContainer ();        // definie plus bas
+
+// Correction de longueur differee : FL recalcule la longueur d'un clip qu'il
+// vient d'inserer, donc on la reecrit quelques cycles APRES le rafraichissement.
+static volatile LONG g_clipFixPending = 0;
+static int g_clipFixWait = 0;
+static unsigned g_clipFixPos = 0;
+static unsigned g_clipFixLen = 0;
+static void forceRefresh ();   // definie plus bas
+static DWORD WINAPI serverThread (LPVOID);
+static volatile LONG g_refreshPending = 0;
+static volatile LONG g_disabled = 0;   // version de FL non reconnue
+static volatile LONG g_serverWanted = 0;
+static volatile LONG g_serverAlive = 0;
+static volatile LONG g_serverStarting = 0;
+static HANDLE g_serverThread = nullptr;
+
+// Relance le serveur s'il est tombe. FL peut appeler terminate() dans
+// plusieurs situations sans nous rendre la main ; plutot que de deviner
+// lesquelles, on surveille et on repare.
+static void ensureServer ()
+{
+	if (InterlockedCompareExchange (&g_serverWanted, 1, 1) == 0)
+		return;
+	if (InterlockedCompareExchange (&g_serverAlive, 1, 1) != 0)
+		return;
+	if (InterlockedExchange (&g_serverStarting, 1) != 0)
+		return;
+
+	HANDLE t = CreateThread (nullptr, 0, serverThread, nullptr, 0, nullptr);
+	if (t != nullptr)
+		g_serverThread = t;   // conserve pour pouvoir attendre son arret
+
+	InterlockedExchange (&g_serverStarting, 0);
+}
+
+static VOID CALLBACK fmTimerProc (HWND, UINT, UINT_PTR, DWORD)
+{
+	// S'execute sur le thread principal de FL : c'est ici, et seulement ici,
+	// qu'on a le droit de toucher au modele.
+	processPending ();
+
+	// Un seul saut de pattern par periode, meme si plusieurs notes sont arrivees.
+	if (InterlockedExchange (&g_refreshPending, 0) != 0)
+		forceRefresh ();
+
+	// correction de longueur differee, apres que FL a recalcule
+	if (InterlockedCompareExchange (&g_clipFixPending, 0, 0) != 0)
+	{
+		if (g_clipFixWait > 0)
+			--g_clipFixWait;
+		else
+		{
+			applyClipLength (g_clipFixPos, g_clipFixLen);
+			InterlockedExchange (&g_clipFixPending, 0);
+		}
+	}
+
+	// surveille le serveur et le relance s'il est tombe
+	ensureServer ();
+
+	// grise (ou rend) les actions reservees a l'hote selon notre role
+	fmApplyRoleLock ();
+}
+
+//------------------------------------------------------------------------
+// Serveur TCP local.
+//
+// Le thread reseau ne touche JAMAIS au modele de FL : il depose une requete
+// dans une file, et c'est la minuterie — qui s'execute sur le thread principal
+// de FL — qui la traite. C'est la regle d'or : tout appel dans FL vient du
+// thread principal.
+// ---------------------------------------------------------------------
+
+static HMODULE g_engine = nullptr;
+static void*   g_insertFn = nullptr;
+static SOCKET  g_srv = INVALID_SOCKET;
+static volatile LONG g_stopServer = 0;
+
+struct Request
+{
+	std::string cmd;
+	std::string reply;
+	bool done;
+};
+
+static std::mutex g_mtx;
+static std::vector<Request*> g_pending;
+
+static BOOL CALLBACK invalidateProc (HWND hwnd, LPARAM lp)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId (hwnd, &pid);
+	if (pid != GetCurrentProcessId ())
+		return TRUE;
+
+	// Invalidation ASYNCHRONE uniquement.
+	// RDW_UPDATENOW provoque un repaint synchrone : appele depuis la minuterie,
+	// il fait rentrer FL dans sa propre boucle de peinture et le fait planter.
+	InvalidateRect (hwnd, nullptr, FALSE);
+	RedrawWindow (hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+
+	int* count = (int*)lp;
+	(*count)++;
+	return TRUE;
+}
+
+// Rafraichissement differe.
+//
+// Le saut de pattern est le seul moyen connu de faire relire le modele aux vues
+// de FL, mais il touche le moteur audio : repete a chaque note, il produit des
+// micro-clics. On le regroupe donc : une demande pose un drapeau, et la minuterie
+// (thread principal, toutes les 20 ms) n'execute qu'UN saut par periode.
+// Le drapeau g_refreshPending est declare plus haut, avant la minuterie.
+
+static void requestRefresh ()
+{
+	InterlockedExchange (&g_refreshPending, 1);
+}
+
+// Force les vues de FL a relire le pattern.
+//
+// FL ne repeint pas quand on modifie le modele en memoire : il ne le fait
+// que sur un vrai changement de pattern. On reproduit donc ce que fait
+// l'utilisateur a la main — passer a un autre pattern puis revenir — en
+// deux appels immediats.
+static void forceRefresh ()
+{
+	if (g_engine == nullptr)
+		return;
+
+	const int current = *(const int*)((const unsigned char*)g_engine + 0x11D51A0);
+	if (current < 1 || current > 999)
+		return;
+
+	using PatternFn = void (*) (int);
+	PatternFn setPattern = (PatternFn)((unsigned char*)g_engine + 0xED8B30);
+
+	const int other = (current == 1) ? 2 : 1;
+	setPattern (other);
+	setPattern (current);
+}
+
+//------------------------------------------------------------------------
+// Curseur distant.
+//
+// On ne dessine PAS dans les fenetres de FL : on cree une petite fenetre
+// superposee, transparente (cle de couleur) et traversable par les clics.
+// Elle suit la position envoyee par le pair.
+// ---------------------------------------------------------------------
+
+static HWND g_cursorWnd = nullptr;
+static HWND g_flWindow = nullptr;
+static volatile LONG g_remoteX = 0;
+static volatile LONG g_remoteY = 0;
+static char g_remoteLabel[64] = "peer";
+static volatile LONG g_cursorThreadId = 0;
+static HANDLE g_cursorThread = nullptr;
+
+#define FM_KEY_COLOR RGB(255, 0, 255)
+
+// Nombre de tranches de mixage suivies. FL en propose bien plus, mais chaque
+// tranche coute deux nombres dans STATUS a chaque cycle.
+#define FM_MIX_TRACKS 16
+
+static LRESULT CALLBACK cursorWndProc (HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+	if (msg == WM_CLOSE)
+	{
+		DestroyWindow (h);
+		return 0;
+	}
+	if (msg == WM_DESTROY)
+	{
+		PostQuitMessage (0);
+		return 0;
+	}
+	if (msg == WM_PAINT)
+	{
+		PAINTSTRUCT ps;
+		HDC dc = BeginPaint (h, &ps);
+
+		RECT rc;
+		GetClientRect (h, &rc);
+		HBRUSH bg = CreateSolidBrush (FM_KEY_COLOR);
+		FillRect (dc, &rc, bg);
+		DeleteObject (bg);
+
+		// petite fleche orange
+		POINT pts[3] = { { 4, 4 }, { 4, 34 }, { 14, 24 } };
+		HBRUSH fill = CreateSolidBrush (RGB (255, 90, 0));
+		HPEN edge = CreatePen (PS_SOLID, 2, RGB (0, 0, 0));
+		HGDIOBJ oldBrush = SelectObject (dc, fill);
+		HGDIOBJ oldPen = SelectObject (dc, edge);
+		Polygon (dc, pts, 3);
+		SelectObject (dc, oldBrush);
+		SelectObject (dc, oldPen);
+		DeleteObject (fill);
+		DeleteObject (edge);
+
+		// L'etiquette du pair a ete retiree le 29/10 (demande) : on ne garde
+		// que la fleche orange, qui suffit a montrer ou l'autre a son curseur.
+
+		EndPaint (h, &ps);
+		return 0;
+	}
+	return DefWindowProc (h, msg, w, l);
+}
+
+// Bouton flottant "FruityMulti" : retire le 29/10 (demande).
+static const bool kShowToolbar = false;
+
+static HWND g_barWnd = nullptr;
+static volatile LONG g_barThreadId = 0;
+static HANDLE g_barThread = nullptr;
+
+static bool agentPath (char* sortie, size_t taille)
+{
+	const char* local = getenv ("LOCALAPPDATA");
+	if (local != nullptr)
+	{
+		sprintf_s (sortie, taille, "%s\\FruityMulti\\fm_agent.exe", local);
+		if (GetFileAttributesA (sortie) != INVALID_FILE_ATTRIBUTES)
+			return true;
+	}
+	sortie[0] = 0;
+	return false;
+}
+
+static std::string clipboardText ()
+{
+	std::string resultat;
+	if (!OpenClipboard (g_barWnd))
+		return resultat;
+	HANDLE donnees = GetClipboardData (CF_TEXT);
+	if (donnees != nullptr)
+	{
+		const char* texte = (const char*)GlobalLock (donnees);
+		if (texte != nullptr)
+		{
+			resultat = texte;
+			GlobalUnlock (donnees);
+		}
+	}
+	CloseClipboard ();
+	while (!resultat.empty () && (resultat.back () == '\n' || resultat.back () == '\r'))
+		resultat.pop_back ();
+	return resultat;
+}
+
+static void launchAgent (const char* arguments)
+{
+	char agent[MAX_PATH];
+	if (!agentPath (agent, sizeof (agent)))
+	{
+		MessageBoxA (g_barWnd,
+			"fm_agent.exe introuvable.\n\n"
+			"Lance une fois 1-Installer-plugin.bat : il place l'agent au bon endroit.",
+			"FruityMulti", MB_OK | MB_ICONWARNING);
+		return;
+	}
+
+	SHELLEXECUTEINFOA info;
+	memset (&info, 0, sizeof (info));
+	info.cbSize = sizeof (info);
+	info.lpVerb = "open";
+	info.lpFile = agent;
+	info.lpParameters = arguments;
+	info.nShow = SW_SHOWNORMAL;
+
+	if (!ShellExecuteExA (&info))
+		MessageBoxA (g_barWnd, "Impossible de lancer l'agent.",
+		             "FruityMulti", MB_OK | MB_ICONERROR);
+}
+
+static void barMenu ()
+{
+	POINT p;
+	GetCursorPos (&p);
+
+	HMENU menu = CreatePopupMenu ();
+	AppendMenuA (menu, MF_STRING, 1, "Heberger la session");
+	AppendMenuA (menu, MF_STRING, 2, "Rejoindre (adresse du presse-papier)");
+	AppendMenuA (menu, MF_SEPARATOR, 0, nullptr);
+	AppendMenuA (menu, MF_STRING, 3, "A propos");
+
+	const int choix = (int)TrackPopupMenu (menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+	                                       p.x, p.y, 0, g_barWnd, nullptr);
+	DestroyMenu (menu);
+
+	if (choix == 1)
+		launchAgent ("--listen 5000");
+	else if (choix == 2)
+	{
+		const std::string adresse = clipboardText ();
+		if (adresse.empty ())
+		{
+			MessageBoxA (g_barWnd,
+				"Copie d'abord l'adresse de l'hote dans le presse-papier\n"
+				"(par exemple 203.0.113.10:50000, adresse d'exemple), puis reclique.",
+				"FruityMulti", MB_OK | MB_ICONINFORMATION);
+			return;
+		}
+		const std::string arguments = "--peer " + adresse;
+		launchAgent (arguments.c_str ());
+	}
+	else if (choix == 3)
+		MessageBoxA (g_barWnd,
+			"FruityMulti\n\n"
+			"Session FL Studio partagee entre deux postes.\n"
+			"Heberger : ouvre la session et affiche l'adresse.\n"
+			"Rejoindre : lit l'adresse dans le presse-papier.",
+			"FruityMulti", MB_OK | MB_ICONINFORMATION);
+}
+
+static void positionBar ();   // definie plus bas
+
+static LRESULT CALLBACK barWndProc (HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+	switch (msg)
+	{
+	case WM_PAINT:
+	{
+		PAINTSTRUCT ps;
+		HDC dc = BeginPaint (h, &ps);
+		RECT rc;
+		GetClientRect (h, &rc);
+
+		HBRUSH fond = CreateSolidBrush (RGB (48, 48, 52));
+		FillRect (dc, &rc, fond);
+		DeleteObject (fond);
+
+		SetBkMode (dc, TRANSPARENT);
+		SetTextColor (dc, RGB (235, 235, 235));
+		SelectObject (dc, (HFONT)GetStockObject (DEFAULT_GUI_FONT));
+		DrawTextA (dc, "FruityMulti", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+		EndPaint (h, &ps);
+		return 0;
+	}
+	case WM_TIMER:
+		positionBar ();
+		return 0;
+	case WM_LBUTTONUP:
+		barMenu ();
+		return 0;
+	}
+	return DefWindowProc (h, msg, w, l);
+}
+
+static void positionBar ()
+{
+	if (g_barWnd == nullptr || g_flWindow == nullptr)
+		return;
+
+	// Fenetre INDEPENDANTE (pas enfant) : coordonnees ecran, recalculees
+	// periodiquement pour suivre FL. Cela evite le melange client/ecran qui
+	// envoyait le bouton dans la barre des taches.
+	RECT fl;
+	if (!GetWindowRect (g_flWindow, &fl))
+		return;
+	if (fl.right - fl.left < 600)
+		return;
+
+	const int x = fl.right - 400;
+	const int y = fl.top + 44;
+
+	SetWindowPos (g_barWnd, HWND_TOPMOST, x, y, 96, 22,
+	              SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static DWORD WINAPI barThread (LPVOID)
+{
+	InterlockedExchange (&g_barThreadId, (LONG)GetCurrentThreadId ());
+
+	WNDCLASSA wc;
+	memset (&wc, 0, sizeof (wc));
+	wc.lpfnWndProc = barWndProc;
+	wc.hInstance = GetModuleHandleA (nullptr);
+	wc.lpszClassName = "FruityMultiBar";
+	wc.hCursor = LoadCursor (nullptr, IDC_ARROW);
+	if (RegisterClassA (&wc) == 0 && GetLastError () != ERROR_CLASS_ALREADY_EXISTS)
+		return 0;
+
+	g_barWnd = CreateWindowExA (
+		WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+		"FruityMultiBar", "FruityMulti", WS_POPUP,
+		0, 0, 96, 22, nullptr, nullptr, wc.hInstance, nullptr);
+
+	if (g_barWnd == nullptr)
+		return 0;
+
+	positionBar ();
+	SetTimer (g_barWnd, 1, 500, nullptr);   // suit les deplacements de FL
+
+	MSG msg;
+	while (GetMessageA (&msg, nullptr, 0, 0) > 0)
+	{
+		TranslateMessage (&msg);
+		DispatchMessageA (&msg);
+	}
+	return 0;
+}
+
+static DWORD WINAPI cursorThread (LPVOID)
+{
+	InterlockedExchange (&g_cursorThreadId, (LONG)GetCurrentThreadId ());
+
+	WNDCLASSA wc;
+	memset (&wc, 0, sizeof (wc));
+	wc.lpfnWndProc = cursorWndProc;
+	wc.hInstance = GetModuleHandleA (nullptr);
+	wc.lpszClassName = "FruityMultiCursor";
+	wc.hCursor = nullptr;
+	if (RegisterClassA (&wc) == 0 && GetLastError () != ERROR_CLASS_ALREADY_EXISTS)
+		return 0;
+
+	g_cursorWnd = CreateWindowExA (
+		WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+		"FruityMultiCursor", "", WS_POPUP,
+		0, 0, 160, 64, nullptr, nullptr, wc.hInstance, nullptr);
+
+	if (g_cursorWnd == nullptr)
+		return 0;
+
+	SetLayeredWindowAttributes (g_cursorWnd, FM_KEY_COLOR, 0, LWA_COLORKEY);
+	ShowWindow (g_cursorWnd, SW_SHOWNOACTIVATE);
+
+	MSG msg;
+	while (GetMessageA (&msg, nullptr, 0, 0) > 0)
+	{
+		TranslateMessage (&msg);
+		DispatchMessageA (&msg);
+	}
+	return 0;
+}
+
+// --- Notes -------------------------------------------------------------------
+// Verifie le 28/10 a 20h15, en direct :
+//   la table FLEngine+0x153FCE0 n'est pas un tableau de canaux mais de MOTIFS.
+//   Un motif n (numero a partir de 1) occupe 0xC0 octets ; sa liste de notes
+//   est a +0x28. Le motif courant se lit par le pointeur +0x11E4018.
+//   Chaque note (24 octets) porte son CANAL en +0x06 : une seule liste contient
+//   les notes de tous les canaux, et le piano roll filtre a l'affichage.
+// C'est ce qui manquait : on ecrivait toujours canal 0.
+static int currentPattern ()
+{
+	if (g_engine == nullptr)
+		return 0;
+	const int* slot = *(const int* const*)((const unsigned char*)g_engine + 0x11E4018);
+	if (slot == nullptr || !isReadable (slot, sizeof (int)))
+		return 0;
+	return *slot;
+}
+
+static unsigned char* noteList (int pattern)
+{
+	if (g_engine == nullptr || pattern <= 0)
+		return nullptr;
+	unsigned char** slot = (unsigned char**)((unsigned char*)g_engine + 0x153FCE0
+	                                          + (size_t)pattern * 0xC0 + 0x28);
+	if (!isReadable (slot, 8))
+		return nullptr;
+	unsigned char* list = *slot;
+	if (!isReadable (list, 0x20))
+		return nullptr;
+	if (*(const int*)(list + 0x10) != 24)
+		return nullptr;
+	return list;
+}
+
+static int noteChannelOf (const unsigned char* note)
+{
+	return (int)*(const unsigned short*)(note + 0x06);
+}
+
+static void fillNote (unsigned char* note, unsigned channel, unsigned t, unsigned l,
+                      unsigned p, unsigned v)
+{
+	memset (note, 0, 24);
+	note[0x05] = 0x40;
+	*(unsigned short*)(note + 0x06) = (unsigned short)channel;
+	*(unsigned*)(note + 0x00) = t;
+	*(unsigned*)(note + 0x08) = l;
+	*(unsigned*)(note + 0x0C) = p;
+	note[0x10] = 0x78;
+	note[0x12] = 0x40;
+	note[0x14] = 0x40;
+	note[0x15] = (unsigned char)(v > 127 ? 127 : v);
+	note[0x16] = 0x80;
+	note[0x17] = 0x80;
+}
+
+// --- Effets du mixeur --------------------------------------------------------
+// Structure verifiee le 28/10 a 21h, en direct :
+//   tableau des pistes = *(void**)(FLEngine + 0x11E06A0), pas de 0x1478
+//   slot               = *(void**)(piste + 0x134C + slot*8)
+//   slot + 0x58 : nom du plugin (UTF-16)   "Fruity Reeverb 2"
+//   slot + 0x88 : DLL du plugin
+//   slot + 0xE8 : preset .fst charge dans le slot
+// Un slot vide a son +0x58 nul : c'est le test de presence.
+static unsigned char* mixerTrack (int track)
+{
+	if (g_engine == nullptr || track < 0 || track > 125)
+		return nullptr;
+	void** table = (void**)((unsigned char*)g_engine + 0x11E06A0);
+	if (!isReadable (table, 8))
+		return nullptr;
+	unsigned char* base = (unsigned char*)*table;
+	if (base == nullptr)
+		return nullptr;
+	unsigned char* trackObj = base + (size_t)track * 0x1478;
+	if (!isReadable (trackObj, 0x100))
+		return nullptr;
+	return trackObj;
+}
+
+static unsigned char* mixerSlot (int track, int slot)
+{
+	if (slot < 0 || slot > 63)
+		return nullptr;
+	unsigned char* trackObj = mixerTrack (track);
+	if (trackObj == nullptr)
+		return nullptr;
+	unsigned char** slotPtr = (unsigned char**)(trackObj + 0x134C + (size_t)slot * 8);
+	if (!isReadable (slotPtr, 8))
+		return nullptr;
+	unsigned char* s = *slotPtr;
+	if (s == nullptr || !isReadable (s, 0x100))
+		return nullptr;
+	return s;
+}
+
+// Chaine UTF-16 pointee par l'objet a l'offset donne.
+static std::string widePtr (const unsigned char* obj, size_t off, int maxChars)
+{
+	std::string out;
+	if (obj == nullptr || !isReadable (obj + off, 8))
+		return out;
+	const unsigned short* text = *(const unsigned short* const*)(obj + off);
+	if (text == nullptr || !isReadable (text, 2))
+		return out;
+	for (int i = 0; i < maxChars; i++)
+	{
+		if (!isReadable (text + i, 2))
+			break;
+		const unsigned short code = text[i];
+		if (code == 0)
+			break;
+		// On ne touche pas au ':' : il fait partie des chemins ("C:\...").
+		if (code == '|' || code == '\n' || code == '\r')
+			out += ' ';
+		else if (code < 0x80)
+			out += (char)code;
+		else
+			out += '?';
+	}
+	return out;
+}
+
+static std::string slotName (const unsigned char* s)
+{
+	// +0x58 porte le nom affiche. Pour un VST, FL met "Fruity Wrapper" (le
+	// conteneur) et le vrai nom est en +0x50 : on prefere celui-la.
+	const std::string affiche = widePtr (s, 0x58, 96);
+	const std::string interne = widePtr (s, 0x50, 96);
+	std::string nom = (!interne.empty () && (affiche.empty () || affiche == "Fruity Wrapper"))
+		? interne : affiche;
+	if (nom.empty ())
+		nom = interne;
+	// Le nom sert de jeton dans FXALL, ou ':' separe la place du nom.
+	for (size_t i = 0; i < nom.size (); i++)
+		if (nom[i] == ':')
+			nom[i] = ' ';
+	return nom;
+}
+
+static std::string executeCommand (const std::string& line)
+{
+	// FORCE <commande> : execute sans tenir compte du role (ordre de l'hote).
+	if (line.rfind ("FORCE ", 0) == 0)
+	{
+		InterlockedExchange (&g_forceRole, 1);
+		std::string r = executeCommand (line.substr (6));
+		InterlockedExchange (&g_forceRole, 0);
+		return r;
+	}
+
+	if (InterlockedCompareExchange (&g_disabled, 0, 0) != 0)
+		return "ERR version de FL non reconnue par le plugin";
+
+	if (line == "PING")
+		return "OK";
+
+	// Identifiant de build : permet de savoir quelle version tourne
+	// chez chacun, sans ambiguite.
+	// L'agent annonce son etat a la fenetre : "STATE en attente…"
+	if (line.rfind ("STATE", 0) == 0)
+	{
+		std::string quoi = line.size () > 6 ? line.substr (6) : std::string ();
+		if (quoi.rfind ("ROLE ", 0) == 0)
+		{
+			const std::string r = quoi.substr (5);
+			fmgui::setRole (r == "hote" ? 1 : (r == "invite" ? 2 : 0));
+		}
+		else if (quoi.rfind ("ADRESSE ", 0) == 0)
+		{
+			fmgui::setAddress (quoi.substr (8).c_str ());
+		}
+		else
+		{
+			fmgui::setStatus (quoi.c_str ());
+		}
+		return "STATE OK";
+	}
+	if (line == "VERSION")
+		return "VERSION 26-fenetre";
+
+	// Role dans la session, annonce par l'agent :
+	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
+	// En invite, les actions reservees a l'hote sont grisees dans les menus.
+	if (line.rfind ("ROLE", 0) == 0)
+	{
+		std::istringstream ss (line.substr (4));
+		std::string quoi;
+		ss >> quoi;
+
+		if (quoi == "hote" || quoi == "host")
+			InterlockedExchange (&g_role, 1);
+		else if (quoi == "invite" || quoi == "guest")
+			InterlockedExchange (&g_role, 2);
+		else if (quoi == "aucun" || quoi == "none")
+			InterlockedExchange (&g_role, 0);
+
+		const int role = (int)InterlockedCompareExchange (&g_role, 0, 0);
+		const std::string nom = role == 2 ? "invite" : (role == 1 ? "hote" : "aucun");
+
+		g_lockApplyAt = 0;      // application immediate, sans attendre la minuterie
+		fmApplyRoleLock ();
+
+		return "ROLE " + nom + " (" + std::to_string ((int)g_locked.size ())
+		     + " action(s) reservee(s) a l'hote)";
+	}
+
+	if (line == "REFRESH")
+	{
+		int count = 0;
+		EnumWindows (invalidateProc, (LPARAM)&count);
+		return "REFRESHED " + std::to_string (count);
+	}
+
+	if (line == "NOTES")
+	{
+		// Toutes les notes du motif courant, tous canaux confondus.
+		// Reponse : "NOTES <motif> <nombre>" puis "t:l:p:v:canal" et "END <nombre>".
+		const int pattern = currentPattern ();
+		unsigned char* list = noteList (pattern);
+		if (list == nullptr)
+			return "ERR pas de liste de notes pour le motif " + std::to_string (pattern);
+
+		const int count = *(const int*)(list + 0x14);
+		const unsigned char* data = *(const unsigned char* const*)(list + 0x08);
+		if (count < 0 || count > 100000)
+			return "ERR nombre de notes inattendu";
+		if (count > 0 && !isReadable (data, (size_t)count * 24))
+			return "ERR donnees illisibles";
+
+		std::ostringstream out;
+		out << "NOTES " << pattern << " " << count << "\n";
+		for (int k = 0; k < count; ++k)
+		{
+			const unsigned char* n = data + (size_t)k * 24;
+			out << *(const unsigned*)(n + 0x00)
+			    << ":" << *(const unsigned*)(n + 0x08)
+			    << ":" << *(const unsigned*)(n + 0x0C)
+			    << ":" << (unsigned)*(const unsigned char*)(n + 0x15)
+			    << ":" << noteChannelOf (n)
+			    << (k + 1 < count ? " " : "");
+		}
+		out << "\nEND " << count;
+		return out.str ();
+	}
+
+	if (line.rfind ("ADD ", 0) == 0)
+	{
+		if (g_engine == nullptr || g_insertFn == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (4));
+		unsigned channel = 0, time = 0, len = 48, pitch = 60, vel = 100;
+		if (!(ss >> channel >> time >> len >> pitch))
+			return "ERR syntaxe ADD <canal> <temps> <duree> <hauteur> [vel]";
+		if (!(ss >> vel))
+			vel = 100;
+
+		const int pattern = currentPattern ();
+		unsigned char* list = noteList (pattern);
+		if (list == nullptr)
+			return "ERR pas de liste de notes";
+
+		unsigned char note[24];
+		fillNote (note, channel, time, len, pitch, vel);
+
+		int before = *(const int*)(list + 0x14);
+
+		using InsertFn = int (*) (void*, void*);
+		InsertFn fn = (InsertFn)g_insertFn;
+		int idx = fn ((void*)list, note);
+
+		list = noteList (pattern);
+		int after = list ? *(const int*)(list + 0x14) : -1;
+
+		std::ostringstream out;
+		out << "ADDED " << channel << " " << idx << " " << before << " " << after;
+		requestRefresh ();
+		return out.str ();
+	}
+
+	if (line.rfind ("DEL ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (4));
+		unsigned channel = 0, at = 0, pitch = 0;
+		if (!(ss >> channel >> at >> pitch))
+			return "ERR syntaxe DEL <canal> <temps> <hauteur>";
+
+		const int pattern = currentPattern ();
+		unsigned char* list = noteList (pattern);
+		if (list == nullptr)
+			return "ERR pas de liste de notes";
+
+		const int count = *(int*)(list + 0x14);
+		if (count <= 0)
+			return "ERR liste vide";
+
+		unsigned char* data = *(unsigned char**)(list + 0x08);
+		if (!isReadable (data, (size_t)count * 24))
+			return "ERR donnees illisibles";
+
+		int found = -1;
+		for (int k = 0; k < count; k++)
+		{
+			unsigned char* note = data + (size_t)k * 24;
+			if (*(unsigned*)(note + 0x00) == at
+			    && *(unsigned*)(note + 0x0C) == pitch
+			    && (unsigned)noteChannelOf (note) == channel)
+			{
+				found = k;
+				break;
+			}
+		}
+		if (found < 0)
+			return "ERR note introuvable";
+
+		memmove (data + (size_t)found * 24,
+		         data + (size_t)(found + 1) * 24,
+		         (size_t)(count - found - 1) * 24);
+		*(int*)(list + 0x14) = count - 1;
+
+		std::ostringstream out;
+		out << "DELETED " << channel << " " << found << " " << count << " " << (count - 1);
+		requestRefresh ();
+		return out.str ();
+	}
+
+	// Ajout groupe : ADDX <canal> <n> <t>:<l>:<p>:<v> ...
+	// Un seul rafraichissement pour tout le lot : c'est ce qui rend les
+	// gros colle/annulations supportables.
+	if (line.rfind ("ADDX ", 0) == 0)
+	{
+		if (g_engine == nullptr || g_insertFn == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (5));
+		unsigned channel = 0, count = 0;
+		if (!(ss >> channel >> count))
+			return "ERR syntaxe ADDX <canal> <nombre> <t:l:p:v>...";
+
+		const int pattern = currentPattern ();
+		unsigned char* list = noteList (pattern);
+		if (list == nullptr)
+			return "ERR pas de liste de notes";
+
+		using InsertFn = int (*) (void*, void*);
+		InsertFn fn = (InsertFn)g_insertFn;
+
+		const int before = *(const int*)(list + 0x14);
+		unsigned inserted = 0;
+
+		std::string token;
+		while (ss >> token && inserted < count)
+		{
+			unsigned t = 0, l = 48, p = 60, v = 100;
+			if (sscanf_s (token.c_str (), "%u:%u:%u:%u", &t, &l, &p, &v) < 3)
+				continue;
+
+			unsigned char note[24];
+			fillNote (note, channel, t, l, p, v);
+
+			fn ((void*)list, note);
+			inserted++;
+
+			// la liste peut avoir ete reallouee par l'insertion
+			list = noteList (pattern);
+			if (list == nullptr)
+				break;
+		}
+
+		const int after = list ? *(const int*)(list + 0x14) : -1;
+		std::ostringstream out;
+		out << "ADDEDX " << channel << " " << inserted << " " << before << " " << after;
+		requestRefresh ();
+		return out.str ();
+	}
+
+	// Suppression groupee : DELX <canal> <n> <t>:<p> ...
+	// On reconstruit la liste en gardant les notes non visees : O(n) au lieu
+	// de n deplacements memoire. Le canal fait partie de la cible.
+	if (line.rfind ("DELX ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (5));
+		unsigned channel = 0, count = 0;
+		if (!(ss >> channel >> count))
+			return "ERR syntaxe DELX <canal> <nombre> <t:p>...";
+
+		const int pattern = currentPattern ();
+		unsigned char* list = noteList (pattern);
+		if (list == nullptr)
+			return "ERR pas de liste de notes";
+
+		int total = *(int*)(list + 0x14);
+		if (total <= 0)
+			return "ERR liste vide";
+		unsigned char* data = *(unsigned char**)(list + 0x08);
+		if (!isReadable (data, (size_t)total * 24))
+			return "ERR donnees illisibles";
+
+		std::vector<std::pair<unsigned, unsigned>> targets;
+		std::string token;
+		while (ss >> token && targets.size () < count)
+		{
+			unsigned t = 0, p = 0;
+			if (sscanf_s (token.c_str (), "%u:%u", &t, &p) == 2)
+				targets.push_back (std::make_pair (t, p));
+		}
+
+		int kept = 0;
+		for (int k = 0; k < total; k++)
+		{
+			unsigned char* note = data + (size_t)k * 24;
+			const unsigned nt = *(unsigned*)(note + 0x00);
+			const unsigned np = *(unsigned*)(note + 0x0C);
+			const bool sameChannel = (unsigned)noteChannelOf (note) == channel;
+
+			bool kill = false;
+			for (size_t x = 0; x < targets.size (); x++)
+			{
+				if (sameChannel && targets[x].first == nt && targets[x].second == np)
+				{
+					kill = true;
+					targets.erase (targets.begin () + x);
+					break;
+				}
+			}
+			if (kill)
+				continue;
+
+			if (kept != k)
+				memcpy (data + (size_t)kept * 24, note, 24);
+			kept++;
+		}
+
+		*(int*)(list + 0x14) = kept;
+		std::ostringstream out;
+		out << "DELETEDX " << channel << " " << (total - kept) << " " << total << " " << kept;
+		requestRefresh ();
+		return out.str ();
+	}
+
+	// Efface une liste de notes : CLEAR <index>
+	// Longueur d'un clip existant : CLIPSETLEN <position> <longueur> [piste] [motif]
+	if (line.rfind ("CLIPSETLEN ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (11));
+		unsigned pos = 0, len = 0;
+		if (!(ss >> pos >> len))
+			return "ERR syntaxe CLIPSETLEN <position> <longueur> [piste] [motif]";
+		int wantTrack = -1, wantPat = -1;
+		ss >> wantTrack;
+		ss >> wantPat;
+
+		unsigned char* c = getClipContainer ();
+		if (c == nullptr)
+			return "ERR conteneur de clips introuvable";
+
+		const int count = *(int*)(c + 0x14);
+		unsigned char* data = *(unsigned char**)(c + 0x08);
+		if (count <= 0 || !isReadable (data, (size_t)count * 0x58))
+			return "ERR donnees illisibles";
+
+		for (int k = 0; k < count; k++)
+		{
+			unsigned char* r = data + (size_t)k * 0x58;
+			if (*(const unsigned*)r != pos)
+				continue;
+			if (wantTrack >= 1 && (244 - (int)r[0x0C]) != wantTrack)
+				continue;
+			if (wantPat >= 1 && (int)r[0x06] != wantPat)
+				continue;
+			*(unsigned*)(r + 0x08) = len;
+			*(unsigned*)(r + 0x1C) = len;
+			return "CLIPLEN " + std::to_string (pos) + " " + std::to_string (len);
+		}
+		return "ERR clip introuvable";
+	}
+
+	// Vide la playlist : CLIPCLEAR
+	if (line == "CLIPCLEAR")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		unsigned char* c = getClipContainer ();
+		if (c == nullptr)
+			return "ERR conteneur de clips introuvable";
+
+		const int count = *(int*)(c + 0x14);
+		*(int*)(c + 0x14) = 0;
+		requestRefresh ();
+
+		std::ostringstream out;
+		out << "CLIPCLEARED " << count;
+		return out.str ();
+	}
+
+	// Efface les notes d'un canal : CLEAR <canal>
+	if (line.rfind ("CLEAR ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (6));
+		unsigned channel = 0;
+		if (!(ss >> channel))
+			return "ERR syntaxe CLEAR <canal>";
+
+		const int pattern = currentPattern ();
+		unsigned char* list = noteList (pattern);
+		if (list == nullptr)
+			return "ERR pas de liste de notes";
+
+		int total = *(int*)(list + 0x14);
+		if (total <= 0)
+			return std::string ("CLEARED ") + std::to_string (channel) + " 0 0 0";
+
+		unsigned char* data = *(unsigned char**)(list + 0x08);
+		if (!isReadable (data, (size_t)total * 24))
+			return "ERR donnees illisibles";
+
+		int kept = 0;
+		for (int k = 0; k < total; k++)
+		{
+			unsigned char* note = data + (size_t)k * 24;
+			if ((unsigned)noteChannelOf (note) == channel)
+				continue;
+			if (kept != k)
+				memcpy (data + (size_t)kept * 24, note, 24);
+			kept++;
+		}
+		*(int*)(list + 0x14) = kept;
+
+		std::ostringstream out;
+		out << "CLEARED " << channel << " " << (total - kept) << " " << total << " " << kept;
+		requestRefresh ();
+		return out.str ();
+	}
+
+	if (line == "TEMPO")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		const unsigned char* t = (const unsigned char*)g_engine + 0x11D8930;
+		std::ostringstream out;
+		out << "TEMPO " << *(const int*)(t + 0x00)
+		    << " " << *(const double*)(t + 0x08)
+		    << " " << *(const float*)(t + 0x10);
+		return out.str ();
+	}
+
+	if (line.rfind ("TEMPO ", 0) == 0)
+	{
+		// Autorite : ces actions touchent le PROJET, qui appartient a l'hote.
+		if (roleBloque ())
+			return "ERR action reservee a l'hote";
+
+
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		double bpm = atof (line.c_str () + 6);
+		if (bpm < 20.0 || bpm > 999.0)
+			return "ERR tempo hors plage (20..999)";
+
+		unsigned char* t = (unsigned char*)g_engine + 0x11D8930;
+		const int milli = (int)(bpm * 1000.0 + 0.5);
+
+		// La structure +0x11D8930 n'est qu'un cache : l'ecrire ne change rien.
+		// FL passe par un repertoire de commandes : id 0x40000005 = tempo.
+		using DispatchFn = void (*) (int, int, int);
+		DispatchFn dispatch = (DispatchFn)((unsigned char*)g_engine + 0xC46A70);
+		dispatch (0x40000005, milli, 0x3DD);
+
+		std::ostringstream out;
+		out << "TEMPO-SET " << milli
+		    << " (cache: " << *(const int*)(t + 0x00) << ")";
+		return out.str ();
+	}
+
+	if (line == "PLAY" || line == "STOP")
+	{
+		// Autorite : ces actions touchent le PROJET, qui appartient a l'hote.
+		if (roleBloque ())
+			return "ERR action reservee a l'hote";
+
+
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		// FUN_011CA520(int mode, byte flags) — vraie fonction de transport.
+		// mode 1 = lecture, mode 0 = arret.
+		// Ne PAS passer par FUN_00FDD300 (multiplexeur UI) : il prend un
+		// pointeur et fait planter FL hors contexte (verifie le 28/10 a 01h).
+		using TransportFn = int (*) (int, unsigned char);
+		TransportFn transport = (TransportFn)((unsigned char*)g_engine + 0xDCA520);
+
+		const bool play = (line == "PLAY");
+		int rc = transport (play ? 1 : 0, 1);
+
+		char buf[64];
+		sprintf_s (buf, "%s rc=%d", play ? "PLAY" : "STOP", rc);
+		return std::string (buf);
+	}
+
+	if (line == "ISPLAYING")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		// 0x11E09F8 contient un POINTEUR vers l'etat, pas l'etat lui-meme.
+		// (Piege PTR_DAT de Ghidra : rencontrer trois fois ce soir.)
+		const int* slot = *(const int* const*)((const unsigned char*)g_engine + 0x11E09F8);
+		if (slot == nullptr || !isReadable (slot, sizeof (int)))
+			return "ERR etat illisible";
+
+		return std::string ("PLAYING ") + (*slot != 0 ? "1" : "0");
+	}
+
+	if (line == "PATTERN")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		// DAT_015d51a0 : numero du pattern courant (global direct, pas un pointeur)
+		const int current = *(const int*)((const unsigned char*)g_engine + 0x11D51A0);
+		return std::string ("PATTERN ") + std::to_string (current);
+	}
+
+	if (line.rfind ("PATTERN ", 0) == 0)
+	{
+		// Autorite : ces actions touchent le PROJET, qui appartient a l'hote.
+		if (roleBloque ())
+			return "ERR action reservee a l'hote";
+
+
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		int wanted = atoi (line.c_str () + 8);
+		if (wanted < 1 || wanted > 999)
+			return "ERR pattern hors plage (1..999)";
+
+		// FUN_012D8B30(int) : c'est la fonction que FL appelle quand on
+		// selectionne un pattern. Elle prend un simple entier.
+		using PatternFn = void (*) (int);
+		PatternFn setPattern = (PatternFn)((unsigned char*)g_engine + 0xED8B30);
+		setPattern (wanted);
+
+		const int now = *(const int*)((const unsigned char*)g_engine + 0x11D51A0);
+		return std::string ("PATTERN-SET ") + std::to_string (wanted) + " (actuel: " +
+		       std::to_string (now) + ")";
+	}
+
+	if (line == "MOUSE")
+	{
+		if (g_flWindow == nullptr)
+			return "MOUSE -1 -1";
+
+		POINT p;
+		if (!GetCursorPos (&p))
+			return "MOUSE -1 -1";
+
+		POINT c = p;
+		if (!ScreenToClient (g_flWindow, &c))
+			return "MOUSE -1 -1";
+
+		RECT rc;
+		if (!GetClientRect (g_flWindow, &rc))
+			return "MOUSE -1 -1";
+
+		if (c.x < 0 || c.y < 0 || c.x >= rc.right || c.y >= rc.bottom)
+			return "MOUSE -1 -1";
+
+		return "MOUSE " + std::to_string (c.x) + " " + std::to_string (c.y);
+	}
+
+	if (line.rfind ("CURSORF ", 0) == 0)
+	{
+		std::istringstream ss (line.substr (8));
+		int fx = 0, fy = 0;
+		if (!(ss >> fx >> fy))
+			return "ERR syntaxe CURSORF <x 0..1000> <y 0..1000> [etiquette]";
+
+		std::string label;
+		std::getline (ss, label);
+		while (!label.empty () && (label.front () == ' ' || label.front () == '\t'))
+			label.erase (label.begin ());
+		if (label.size () > 48)
+			label = label.substr (0, 48);
+
+		if (g_cursorWnd == nullptr || g_flWindow == nullptr)
+			return "ERR fenetre curseur indisponible";
+
+		RECT rc;
+		if (!GetClientRect (g_flWindow, &rc) || rc.right <= 0 || rc.bottom <= 0)
+			return "ERR fenetre FL indisponible";
+
+		const int x = (int)((long long)fx * rc.right / 1000);
+		const int y = (int)((long long)fy * rc.bottom / 1000);
+
+		if (!label.empty ())
+			strncpy_s (g_remoteLabel, label.c_str (), _TRUNCATE);
+
+		g_remoteX = x;
+		g_remoteY = y;
+
+		POINT p;
+		p.x = x;
+		p.y = y;
+		ClientToScreen (g_flWindow, &p);
+		SetWindowPos (g_cursorWnd, HWND_TOPMOST, p.x - 4, p.y - 4, 160, 64,
+		              SWP_NOACTIVATE | SWP_SHOWWINDOW);
+		InvalidateRect (g_cursorWnd, nullptr, TRUE);
+
+		return "CURSOR-OK " + std::to_string (x) + " " + std::to_string (y);
+	}
+
+	if (line.rfind ("CURSOR ", 0) == 0)
+	{
+		std::istringstream ss (line.substr (7));
+		int x = 0, y = 0;
+		if (!(ss >> x >> y))
+			return "ERR syntaxe CURSOR <x> <y> [etiquette]";
+
+		std::string label;
+		std::getline (ss, label);
+		while (!label.empty () && (label.front () == ' ' || label.front () == '\t'))
+			label.erase (label.begin ());
+		if (label.size () > 48)
+			label = label.substr (0, 48);
+
+		if (g_cursorWnd == nullptr || g_flWindow == nullptr)
+			return "ERR fenetre curseur indisponible";
+
+		if (!label.empty ())
+			strncpy_s (g_remoteLabel, label.c_str (), _TRUNCATE);
+
+		g_remoteX = x;
+		g_remoteY = y;
+
+		POINT p;
+		p.x = x;
+		p.y = y;
+		ClientToScreen (g_flWindow, &p);
+
+		SetWindowPos (g_cursorWnd, HWND_TOPMOST, p.x - 4, p.y - 4, 160, 64,
+		              SWP_NOACTIVATE | SWP_SHOWWINDOW);
+		InvalidateRect (g_cursorWnd, nullptr, TRUE);
+
+		return "CURSOR-OK " + std::to_string (x) + " " + std::to_string (y);
+	}
+
+	if (line == "CURSOR-HIDE")
+	{
+		if (g_cursorWnd != nullptr)
+			ShowWindow (g_cursorWnd, SW_HIDE);
+		return "CURSOR-HIDDEN";
+	}
+
+	// Volume d'une piste du mixeur.
+	// FL stocke le volume en virgule fixe 0..2^30 (2^30 = 1.0).
+	// Le handle est CALCULE, pas dereference : (piste*0x40 + slot)*0x10000 + 0x70001FC0
+	if (line.rfind ("TRACKVOL ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (9));
+		int track = 0;
+		if (!(ss >> track) || track < 0 || track > 125)
+			return "ERR syntaxe TRACKVOL <piste 0..125> [valeur 0..1]";
+
+		const long long handle = ((long long)track * 0x40) * 0x10000LL + 0x70001FC0LL;
+
+		double wanted = -1.0;
+		if (ss >> wanted)
+		{
+			if (wanted < 0.0) wanted = 0.0;
+			if (wanted > 1.0) wanted = 1.0;
+
+			using SetFn = void (*) (long long, int, int, int, int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			const int raw = (int)(wanted * 1073741824.0 + 0.5);
+			setter (handle, raw, 0x3F5, 0, 0, 0, 0);
+		}
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+		const int now = getter (handle, 0x7FFFFFFF, 1);
+		const double value = (double)now * (1.0 / 1073741824.0);
+
+		char buf[128];
+		sprintf_s (buf, "TRACKVOL %d %.6f (brut %d)", track, value, now);
+		return std::string (buf);
+	}
+
+	// Panoramique d'une piste. Meme mecanique que le volume, mais le handle
+	// est decale d'un octet (0x70001FC1) et la valeur va de -1 (gauche) a +1.
+	if (line.rfind ("TRACKPAN ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (9));
+		int track = 0;
+		if (!(ss >> track) || track < 0 || track > 125)
+			return "ERR syntaxe TRACKPAN <piste> [pan -1..1]";
+
+		const long long handle = ((long long)track * 0x40) * 0x10000LL + 0x70001FC1LL;
+
+		double wanted = -99.0;
+		if (ss >> wanted)
+		{
+			if (wanted < -1.0) wanted = -1.0;
+			if (wanted > 1.0) wanted = 1.0;
+
+			using SetFn = void (*) (long long, int, int, int, int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			const int raw = (int)(((wanted + 1.0) / 2.0) * 1073741824.0 + 0.5);
+			setter (handle, raw, 0x3F5, 0, 0, 0, 0);
+		}
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+		const int now = getter (handle, 0x7FFFFFFF, 1);
+		const double value = ((double)now / 1073741824.0) * 2.0 - 1.0;
+
+		char buf[128];
+		sprintf_s (buf, "TRACKPAN %d %.4f (brut %d)", track, value, now);
+		return std::string (buf);
+	}
+
+	// Mute d'une piste.
+	// ATTENTION : FL attend l'INVERSE de l'intuitif — 0 = muet, 1 = actif.
+	// L'etat se lit dans la structure de piste (pas de 0x1478), octet +0x18.
+	if (line.rfind ("TRACKMUTE ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (10));
+		int track = 0;
+		if (!(ss >> track) || track < 0 || track > 125)
+			return "ERR syntaxe TRACKMUTE <piste> [1=muet 0=actif]";
+
+		int wanted = -1;
+		if (ss >> wanted)
+		{
+			using MuteFn = void (*) (int, int);
+			MuteFn mute = (MuteFn)((unsigned char*)g_engine + 0xE7B9B0);
+			mute (track, wanted != 0 ? 0 : 1);   // sens inverse
+		}
+
+		int state = -1;
+		const unsigned char* base =
+			*(const unsigned char* const*)((const unsigned char*)g_engine + 0x11E06A0);
+		if (isReadable (base, (size_t)track * 0x1478 + 0x20))
+		{
+			// L'octet +0x18 vaut 1 quand la piste est ACTIVE, donc muet = 0.
+			const unsigned char active = *(const unsigned char*)(base + (size_t)track * 0x1478 + 0x18);
+			state = active != 0 ? 0 : 1;
+		}
+
+		char buf[96];
+		sprintf_s (buf, "TRACKMUTE %d %d", track, state);
+		return std::string (buf);
+	}
+
+	// Separation stereo : handle +0x70001FC2, meme echelle que le pan (-1..+1).
+	// -1 = mono, 0 = normal, +1 = stereo elargi.
+	if (line.rfind ("TRACKSTEREO ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (12));
+		int track = 0;
+		if (!(ss >> track) || track < 0 || track > 125)
+			return "ERR syntaxe TRACKSTEREO <piste> [-1..1]";
+
+		const long long handle = ((long long)track * 0x40) * 0x10000LL + 0x70001FC2LL;
+
+		double wanted = -99.0;
+		if (ss >> wanted)
+		{
+			if (wanted < -1.0) wanted = -1.0;
+			if (wanted > 1.0) wanted = 1.0;
+
+			using SetFn = void (*) (long long, int, int, int, int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			const int raw = (int)(((wanted + 1.0) / 2.0) * 1073741824.0 + 0.5);
+			setter (handle, raw, 0x3F5, 0, 0, 0, 0);
+		}
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+		const int now = getter (handle, 0x7FFFFFFF, 1);
+		const double value = ((double)now / 1073741824.0) * 2.0 - 1.0;
+
+		char buf[128];
+		sprintf_s (buf, "TRACKSTEREO %d %.4f (brut %d)", track, value, now);
+		return std::string (buf);
+	}
+
+	// Parametre d'un plugin dans une tranche du mixeur.
+	// handle = (piste*0x40 + slot)*0x10000 + index_param + 0x70008000
+	// identifiant 0x3FD, valeur normalisee 0..1 sur 2^30.
+	if (line.rfind ("PARAM ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (6));
+		int track = 0, slot = 0, index = 0;
+		if (!(ss >> track >> slot >> index))
+			return "ERR syntaxe PARAM <piste> <slot> <index> [0..1]";
+		if (track < 0 || track > 125 || slot < 0 || slot > 9 || index < 0 || index > 0x7FFF)
+			return "ERR plage invalide";
+
+		const long long handle =
+			((long long)track * 0x40 + slot) * 0x10000LL + (long long)index + 0x70008000LL;
+
+		double wanted = -1.0;
+		if (ss >> wanted)
+		{
+			if (wanted < 0.0) wanted = 0.0;
+			if (wanted > 1.0) wanted = 1.0;
+
+			using SetFn = void (*) (long long, int, int, int, int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			const int raw = (int)(wanted * 1073741824.0 + 0.5);
+			setter (handle, raw, 0x3FD, 0, 0, 0, 0);
+		}
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+		const int now = getter (handle, 0x7FFFFFFF, 1);
+		const double value = (double)now * (1.0 / 1073741824.0);
+
+		char buf[128];
+		sprintf_s (buf, "PARAM %d %d %d %.6f (brut %d)", track, slot, index, value, now);
+		return std::string (buf);
+	}
+
+	// Ecriture d'un parametre en valeur BRUTE : PARAMRAW <piste> <slot> <index> <brut>
+	// L'interet est de ne faire aucune conversion : on relit une valeur brute
+	// avec PARAMS et on la reecrit telle quelle chez l'autre. Ca evite de
+	// dependre d'une echelle (2^30) qu'on n'a pas encore verifiee sur un effet.
+	if (line.rfind ("PARAMRAW ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (9));
+		int track = 0, slot = 0, index = 0;
+		long long raw = 0;
+		if (!(ss >> track >> slot >> index >> raw))
+			return "ERR syntaxe PARAMRAW <piste> <slot> <index> <brut>";
+		if (track < 0 || track > 125 || slot < 0 || slot > 9 || index < 0 || index > 0x7FFF)
+			return "ERR plage invalide";
+
+		const long long handle =
+			((long long)track * 0x40 + slot) * 0x10000LL + (long long)index + 0x70008000LL;
+
+		using SetFn = void (*) (long long, int, int, int, int, int, int);
+		SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+		setter (handle, (int)raw, 0x3FD, 0, 0, 0, 0);
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+		const int now = getter (handle, 0x7FFFFFFF, 1);
+
+		char buf[96];
+		sprintf_s (buf, "PARAMRAW %d %d %d %d %d", track, slot, index, (int)raw, now);
+		return std::string (buf);
+	}
+
+	// Liste de TOUS les conteneurs : outil de diagnostic.
+	if (line == "CLIPS")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const unsigned long long cls =
+			(unsigned long long)((unsigned char*)g_engine + 0xC54168);
+		unsigned char pattern[8];
+		memcpy (pattern, &cls, 8);
+
+		std::ostringstream out;
+		int containers = 0;
+		int totalClips = 0;
+
+		MEMORY_BASIC_INFORMATION mbi;
+		unsigned char* addr = nullptr;
+		while (VirtualQuery (addr, &mbi, sizeof (mbi)) == (SIZE_T)sizeof (mbi))
+		{
+			unsigned char* base = (unsigned char*)mbi.BaseAddress;
+			const size_t size = mbi.RegionSize;
+			if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 &&
+			    size >= 0x20 && size <= 64u * 1024 * 1024)
+			{
+				for (size_t i = 0; i + 0x20 <= size; i += 8)
+				{
+					if (memcmp (base + i, pattern, 8) != 0)
+						continue;
+					const unsigned char* c = base + i;
+					const int elemSize = *(const int*)(c + 0x10);
+					const int count = *(const int*)(c + 0x14);
+					const int capacity = *(const int*)(c + 0x18);
+					const unsigned char* data = *(const unsigned char* const*)(c + 0x08);
+					if (elemSize != 0x58 || count < 0 || count > 5000 ||
+					    capacity < count || capacity > 200000)
+						continue;
+					if (count > 0 && !isReadable (data, (size_t)count * 0x58))
+						continue;
+
+					containers++;
+					totalClips += count;
+					out << "CONTAINER " << (void*)c << " " << count;
+					for (int k = 0; k < count && k < 32; k++)
+					{
+						const unsigned char* r = data + (size_t)k * 0x58;
+						out << " " << *(const unsigned*)(r + 0x00)
+						    << ":" << *(const unsigned*)(r + 0x08)
+						    << ":" << (unsigned)r[0x06];
+					}
+					out << "\n";
+				}
+			}
+			unsigned char* next = base + size;
+			if (next <= addr) break;
+			addr = next;
+		}
+		out << "ENDCLIPS " << containers << " " << totalClips;
+		return out.str ();
+	}
+
+	// Ajout d'un clip : on clone le dernier enregistrement et on l'insere.
+	if (line.rfind ("CLIPADD ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (8));
+		unsigned pos = 0, len = 384;
+		if (!(ss >> pos))
+			return "ERR syntaxe CLIPADD <position> <longueur> [motif]";
+		ss >> len;
+		int motif = -1;
+		ss >> motif;
+		int track = -1;
+		ss >> track;
+
+		unsigned char* best = getClipContainer ();
+		if (best == nullptr)
+			return "ERR conteneur de clips introuvable";
+		if (g_insertFn == nullptr)
+			return "ERR fonction d'insertion indisponible";
+
+		const int count = *(int*)(best + 0x14);
+		const int capacity = *(int*)(best + 0x18);
+		unsigned char* data = *(unsigned char**)(best + 0x08);
+
+		if (count > 0 && !isReadable (data, (size_t)count * 0x58))
+			return "ERR donnees illisibles";
+		if (count > 0 && data == nullptr)
+			return "ERR donnees illisibles";
+
+		unsigned char record[0x58];
+		if (count > 0)
+		{
+			// le plus sur : recopier un clip existant (mise en page garantie)
+			memcpy (record, data + (size_t)(count - 1) * 0x58, 0x58);
+		}
+		else
+		{
+			// playlist vide : on fabrique l'enregistrement d'apres le format
+			// observe (88 octets, position, motif, couleur, gabarit de notes).
+			memset (record, 0, sizeof (record));
+			const unsigned pat = (motif >= 0 && motif <= 255) ? (unsigned)motif : 1u;
+			*(unsigned*)(record + 0x04) = 0x50005000u | (pat << 16);
+			*(unsigned*)(record + 0x0C) = 499u;
+			*(unsigned*)(record + 0x10) = 0x00400078u;
+			*(unsigned*)(record + 0x14) = 0x80806440u;
+			*(unsigned*)(record + 0x18) = 0xFFFFFFFFu;
+			*(unsigned*)(record + 0x3C) = 0xFFFFFFFFu;
+			*(double*)(record + 0x30) = 1.0;
+		}
+		*(unsigned*)(record + 0x00) = pos;
+		*(unsigned*)(record + 0x08) = len;
+		*(unsigned*)(record + 0x1C) = len;
+		*(unsigned*)(record + 0x20) = (unsigned)(count + 1);
+		if (motif >= 0 && motif <= 255)
+			record[0x06] = (unsigned char)motif;
+
+		// La piste est encodee dans la couleur : piste = 244 - couleur.
+		// Verifie en direct : changer cet octet deplace le clip de piste.
+		if (track >= 1 && track <= 200)
+		{
+			const int color = 244 - track;
+			if (color >= 0 && color <= 255)
+				record[0x0C] = (unsigned char)color;
+		}
+
+		// Insertion par la fonction de FL : elle gere l'agrandissement du
+		// tableau (capacite 0 sur une playlist vide) et le classement par
+		// position. Notre memcpy manuel echouait des que la playlist etait vide.
+		using InsertFn = int (*) (void*, void*);
+		InsertFn fn = (InsertFn)g_insertFn;
+		const int inserted = fn ((void*)best, record);
+
+		(void)capacity;
+
+		g_clipFixPos = pos;
+		g_clipFixLen = len;
+		g_clipFixWait = 3;
+		InterlockedExchange (&g_clipFixPending, 1);
+
+		requestRefresh ();
+
+		std::ostringstream out;
+		out << "CLIPADDED " << (void*)best << " " << pos << " " << len
+		    << " (insere a " << inserted << ", " << count << " -> "
+		    << *(int*)(best + 0x14) << ")";
+		return out.str ();
+	}
+
+	// Ajout d'un clip dans un conteneur DESIGNNE (pour choisir la piste).
+	if (line.rfind ("CLIPADDTO ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (10));
+		std::string addrText;
+		unsigned pos = 0, len = 384;
+		if (!(ss >> addrText >> pos))
+			return "ERR syntaxe CLIPADDTO <adresse> <position> <longueur>";
+		ss >> len;
+
+		unsigned long long addrValue = strtoull (addrText.c_str (), nullptr, 16);
+		unsigned char* c = (unsigned char*)(uintptr_t)addrValue;
+		if (!isReadable (c, 0x20))
+			return "ERR adresse invalide";
+
+		const int count = *(int*)(c + 0x14);
+		const int capacity = *(int*)(c + 0x18);
+		unsigned char* data = *(unsigned char**)(c + 0x08);
+
+		if (count <= 0 || count >= capacity)
+			return "ERR conteneur vide ou plein";
+		if (!isReadable (data, (size_t)(count + 1) * 0x58))
+			return "ERR donnees illisibles";
+
+		unsigned char record[0x58];
+		memcpy (record, data, 0x58);
+		*(unsigned*)(record + 0x00) = pos;
+		*(unsigned*)(record + 0x08) = len;
+		*(unsigned*)(record + 0x1C) = len;
+		*(unsigned*)(record + 0x20) = (unsigned)(count + 1);
+
+		memcpy (data + (size_t)count * 0x58, record, 0x58);
+		*(int*)(c + 0x14) = count + 1;
+
+		requestRefresh ();
+
+		char buf[128];
+		sprintf_s (buf, "CLIPADDED-TO %s %u %u (%d -> %d)", addrText.c_str (), pos, len, count, count + 1);
+		return std::string (buf);
+	}
+
+	// Liste compacte des clips du conteneur principal (celui qu'on modifie).
+	if (line == "CLIPLIST")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+unsigned char* best = getClipContainer ();
+
+		if (best == nullptr)
+			return "ERR conteneur de clips introuvable";
+
+		const int count = *(int*)(best + 0x14);
+		const unsigned char* data = *(const unsigned char* const*)(best + 0x08);
+
+		std::ostringstream out;
+		out << "CLIPLIST " << count;
+		for (int k = 0; k < count && k < 512; k++)
+		{
+			const unsigned char* r = data + (size_t)k * 0x58;
+			out << " " << *(const unsigned*)(r + 0x00)
+			    << ":" << *(const unsigned*)(r + 0x08)
+			    << ":" << (unsigned)r[0x06]
+			    << ":" << (244 - (int)r[0x0C]);
+		}
+		return out.str ();
+	}
+
+	// Suppression d'un clip par sa position.
+	if (line.rfind ("CLIPDEL ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (8));
+		unsigned pos = 0;
+		if (!(ss >> pos))
+			return "ERR syntaxe CLIPDEL <position> [piste] [motif]";
+		int wantTrack = -1, wantPat = -1;
+		ss >> wantTrack;
+		ss >> wantPat;
+
+unsigned char* best = getClipContainer ();
+
+		if (best == nullptr)
+			return "ERR conteneur de clips introuvable";
+
+		const int count = *(int*)(best + 0x14);
+		unsigned char* data = *(unsigned char**)(best + 0x08);
+		if (count <= 0)
+			return "ERR aucun clip";
+
+		int found = -1;
+		for (int k = 0; k < count; k++)
+		{
+			const unsigned char* r = data + (size_t)k * 0x58;
+			if (*(const unsigned*)r != pos)
+				continue;
+			// Sans la piste et le motif, deux clips a la meme position sont
+			// indiscernables : on supprimait parfois le mauvais.
+			if (wantTrack >= 1 && (244 - (int)r[0x0C]) != wantTrack)
+				continue;
+			if (wantPat >= 1 && (int)r[0x06] != wantPat)
+				continue;
+			found = k;
+			break;
+		}
+		if (found < 0)
+			return "ERR clip introuvable a cette position";
+
+		// on decale la fin du tableau vers la gauche
+		if (found < count - 1)
+		{
+			memmove (data + (size_t)found * 0x58,
+			         data + (size_t)(found + 1) * 0x58,
+			         (size_t)(count - found - 1) * 0x58);
+		}
+		*(int*)(best + 0x14) = count - 1;
+
+		requestRefresh ();
+
+		std::ostringstream out;
+		out << "CLIPDELETED " << pos << " (" << count << " -> " << (count - 1) << ")";
+		return out.str ();
+	}
+
+	// Tous les parametres d'un emplacement, en une seule reponse.
+	if (line.rfind ("PARAMS ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (7));
+		int track = 0, slot = 0, count = 16;
+		if (!(ss >> track >> slot))
+			return "ERR syntaxe PARAMS <piste> <slot> [nombre]";
+		ss >> count;
+		if (track < 0 || track > 125 || slot < 0 || slot > 9 || count < 1 || count > 128)
+			return "ERR plage invalide";
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+
+		const long long base =
+			((long long)track * 0x40 + slot) * 0x10000LL + 0x70008000LL;
+
+		int mode = 0;
+		ss >> mode;
+
+		std::ostringstream out;
+		out << "PARAMS " << track << " " << slot << " " << count;
+		for (int k = 0; k < count; k++)
+		{
+			int raw;
+			if (mode == 1)      raw = getter (base + k, 0x3FD, 1);
+			else if (mode == 2) raw = getter (base + k, 0x3FD, 0);
+			else                raw = getter (base + k, 0x7FFFFFFF, 1);
+			out << " " << raw;
+		}
+		return out.str ();
+	}
+
+	// Tous les effets du mixeur en UNE reponse :
+	//   FXALL <n> <piste>.<slot>:<nom>|<piste>.<slot>:<nom>|...
+	// Le nom peut contenir des espaces : les elements sont separes par '|'.
+	if (line == "FXALL")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::string body;
+		int n = 0;
+		for (int t = 0; t <= 16; t++)
+		{
+			if (mixerTrack (t) == nullptr)
+				continue;
+			for (int s = 0; s < 10; s++)
+			{
+				unsigned char* sl = mixerSlot (t, s);
+				if (sl == nullptr)
+					continue;
+				const std::string nom = slotName (sl);
+				if (nom.empty ())
+					continue;
+				if (n > 0)
+					body += "|";
+				body += std::to_string (t) + "." + std::to_string (s) + ":" + nom;
+				n++;
+			}
+		}
+		std::ostringstream out;
+		out << "FXALL " << n;
+		if (n > 0)
+			out << " " << body;
+		return out.str ();
+	}
+
+	// Detail d'un slot : nom, DLL, preset .fst.
+	//   FX <piste> <slot>  ->  "FX <piste> <slot> <nom> | <dll> | <preset>"
+	if (line.rfind ("FX ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (3));
+		int track = -1, slot = -1;
+		if (!(ss >> track >> slot))
+			return "ERR syntaxe FX <piste> <slot>";
+
+		unsigned char* sl = mixerSlot (track, slot);
+		if (sl == nullptr)
+			return "ERR slot introuvable";
+
+		const std::string nom = slotName (sl);
+		if (nom.empty ())
+			return "FXEMPTY " + std::to_string (track) + " " + std::to_string (slot);
+
+		return "FX " + std::to_string (track) + " " + std::to_string (slot) + " " + nom
+		     + " | " + widePtr (sl, 0x88, 260)
+		     + " | " + widePtr (sl, 0xE8, 260);
+	}
+
+	// Tout le mixage d'une piste en UNE reponse : volume, pan, stereo, mute.
+	if (line.rfind ("MIX ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (4));
+		int track = 0;
+		if (!(ss >> track) || track < 0 || track > 125)
+			return "ERR syntaxe MIX <piste>";
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+
+		const long long base = ((long long)track * 0x40) * 0x10000LL;
+		const int vol = getter (base + 0x70001FC0LL, 0x7FFFFFFF, 1);
+		const int pan = getter (base + 0x70001FC1LL, 0x7FFFFFFF, 1);
+		const int sep = getter (base + 0x70001FC2LL, 0x7FFFFFFF, 1);
+
+		int mute = -1;
+		if (track >= 1)
+		{
+			const unsigned char* tracks =
+				*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E06A0);
+			if (isReadable (tracks, (size_t)track * 0x1478 + 0x20))
+				mute = (*(const unsigned char*)(tracks + (size_t)track * 0x1478 + 0x18) != 0) ? 0 : 1;
+		}
+
+		char buf[128];
+		sprintf_s (buf, "MIX %d %d %d %d %d", track, vol, pan, sep, mute);
+		return std::string (buf);
+	}
+
+	// TOUT l'etat en UNE reponse : tempo, lecture, pattern, et le mixage des
+	// 8 premieres pistes. Chaque aller-retour coute ~30 ms (minuterie de FL),
+	// donc une dizaine de requetes par cycle faisait 400 ms de latence.
+	// Tout ce qui change vite, en UNE requete : etat + notes du motif courant.
+	// Deux requetes coutaient deux fois le delai de la minuterie (~15 ms) ;
+	// le cycle de synchronisation tombe donc de 31 ms a ~15 ms.
+	if (line == "POLL")
+	{
+		const std::string etat = executeCommand ("STATUS");
+		if (etat.rfind ("ERR", 0) == 0)
+			return etat;
+
+		const std::string notes = executeCommand ("NOTES");
+		std::string entete = "NOTES 0 0";
+		std::string jetons;
+		if (notes.rfind ("NOTES ", 0) == 0)
+		{
+			const size_t fin = notes.find ('\n');
+			entete = (fin == std::string::npos) ? notes : notes.substr (0, fin);
+			if (fin != std::string::npos)
+			{
+				const size_t fin2 = notes.find ("\nEND");
+				if (fin2 != std::string::npos && fin2 > fin)
+					jetons = notes.substr (fin + 1, fin2 - fin - 1);
+			}
+		}
+
+		std::ostringstream out;
+		out << etat << "\n" << entete;
+		if (!jetons.empty ())
+			out << " " << jetons;
+		out << "\nEND 1";
+		return out.str ();
+	}
+
+	if (line == "STATUS")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const int tempoMilli = *(const int*)((unsigned char*)g_engine + 0x11D8930);
+		const int playing = *(const int*)(*(const char* const*)((unsigned char*)g_engine + 0x11E09F8));
+		const int pattern = *(const int*)((unsigned char*)g_engine + 0x11D51A0);
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+		const unsigned char* tracks =
+			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E06A0);
+
+		std::ostringstream out;
+		out << "STATUS " << tempoMilli << " " << (playing ? 1 : 0) << " " << pattern;
+
+		// master (piste 0) : volume, pan, stereo. Pas de mute.
+		{
+			const int mv = getter (0x70001FC0LL, 0x7FFFFFFF, 1);
+			const int mp = getter (0x70001FC1LL, 0x7FFFFFFF, 1);
+			const int ms = getter (0x70001FC2LL, 0x7FFFFFFF, 1);
+			out << " " << mv << ":" << mp << ":" << ms << ":-1";
+		}
+
+		for (int track = 1; track <= FM_MIX_TRACKS; track++)
+		{
+			const long long base = ((long long)track * 0x40) * 0x10000LL;
+			const int vol = getter (base + 0x70001FC0LL, 0x7FFFFFFF, 1);
+			const int pan = getter (base + 0x70001FC1LL, 0x7FFFFFFF, 1);
+			const int sep = getter (base + 0x70001FC2LL, 0x7FFFFFFF, 1);
+
+			int mute = -1;
+			if (isReadable (tracks, (size_t)track * 0x1478 + 0x20))
+				mute = (*(const unsigned char*)(tracks + (size_t)track * 0x1478 + 0x18) != 0) ? 0 : 1;
+
+			out << " " << vol << ":" << pan << ":" << sep << ":" << mute;
+		}
+
+		// Position de la souris et taille de la zone cliente : le destinataire
+		// convertit en proportion, donc une resolution differente ne decale plus
+		// le curseur. Inclus ici pour eviter 25 requetes par seconde.
+		int mx = -1, my = -1, mw = 0, mh = 0;
+		if (g_flWindow != nullptr)
+		{
+			RECT rc;
+			if (GetClientRect (g_flWindow, &rc))
+			{
+				mw = rc.right;
+				mh = rc.bottom;
+				POINT p;
+				if (GetCursorPos (&p))
+				{
+					POINT c = p;
+					if (ScreenToClient (g_flWindow, &c) &&
+					    c.x >= 0 && c.y >= 0 && c.x < rc.right && c.y < rc.bottom)
+					{
+						mx = c.x;
+						my = c.y;
+					}
+				}
+			}
+		}
+		out << " " << mx << " " << my << " " << mw << " " << mh;
+		out << " " << (int)(*(const double*)((unsigned char*)g_engine + 0x156EC88));
+		return out.str ();
+	}
+
+	// Position de lecture : SONGPOS (lecture) ou SONGPOS <valeur> (ecriture)
+	// Setter reel : FUN_011E7A10(valeur, drapeaux), appele par le binding
+	// setSongPos via un callback differe.
+	// La lecture courante est un double a FLEngine+0x156EC88.
+	if (line == "SONGPOS")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const double current = *(const double*)((unsigned char*)g_engine + 0x156EC88);
+		char buf[96];
+		sprintf_s (buf, "SONGPOS %.3f", current);
+		return std::string (buf);
+	}
+
+	if (line.rfind ("SONGPOS ", 0) == 0)
+	{
+		// Autorite : ces actions touchent le PROJET, qui appartient a l'hote.
+		if (roleBloque ())
+			return "ERR action reservee a l'hote";
+
+
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (8));
+		double value = 0.0;
+		if (!(ss >> value) || value < 0.0)
+			return "ERR syntaxe SONGPOS <position>";
+
+		using SetPosFn = void (*) (double, unsigned char);
+		SetPosFn setPos = (SetPosFn)((unsigned char*)g_engine + 0xDE7A10);
+		setPos (value, 0);
+
+		char buf[96];
+		sprintf_s (buf, "SONGPOS %.3f", value);
+		return std::string (buf);
+	}
+
+	// Nom d'un canal : pointeur UTF-16 a +0x50.
+	// Verifie sur les canaux "Sampler" et "Sampler #2".
+	auto channelName = [] (const unsigned char* channel) -> std::string
+	{
+		std::string out;
+		if (!isReadable (channel + 0x50, 8))
+			return out;
+
+		const unsigned short* text =
+			*(const unsigned short* const*)(channel + 0x50);
+		if (text == nullptr || !isReadable (text, 2))
+			return out;
+
+		for (int i = 0; i < 128; i++)
+		{
+			if (!isReadable (text + i, 2))
+				break;
+			const unsigned short code = text[i];
+			if (code == 0)
+				break;
+			if (code == '|' || code == '\n' || code == '\r')
+				out += ' ';
+			else if (code < 0x80)
+				out += (char)code;
+			else if (code < 0x800)
+			{
+				out += (char)(0xC0 | (code >> 6));
+				out += (char)(0x80 | (code & 0x3F));
+			}
+			else
+			{
+				out += (char)(0xE0 | (code >> 12));
+				out += (char)(0x80 | ((code >> 6) & 0x3F));
+				out += (char)(0x80 | (code & 0x3F));
+			}
+		}
+		return out;
+	};
+
+	// Liste des canaux du channel rack et de leur tranche de mixage.
+	//   chemin : p1 = *(FLEngine+0x11E0128) ; conteneur = *p1
+	//            tableau = *(conteneur+8) ; nombre = *(conteneur+0x10)
+	//   canal  : +0x794 = index, +0x258 = tranche assignee (source de verite,
+	//            verifie : ecrire dedans change bien le champ TRACK de FL)
+	if (line == "CHANNELS")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const unsigned char* p1 =
+			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E0128);
+		if (!isReadable (p1, 8))
+			return "ERR channel rack introuvable";
+		const unsigned char* container = *(const unsigned char* const*)p1;
+		if (!isReadable (container, 0x18))
+			return "ERR conteneur canaux introuvable";
+
+		const int count = *(const int*)(container + 0x10);
+		const unsigned char* array = *(const unsigned char* const*)(container + 8);
+		if (count < 0 || count > 2000 || (count > 0 && !isReadable (array, (size_t)count * 8)))
+			return "ERR liste de canaux illisible";
+
+		std::ostringstream out;
+		out << "CHANNELS " << count;
+		for (int i = 0; i < count; i++)
+		{
+			const unsigned char* ch = *(const unsigned char* const*)(array + (size_t)i * 8);
+			if (ch == nullptr || !isReadable (ch, 0x800))
+				continue;
+			out << " " << *(const int*)(ch + 0x794)
+			    << ":" << *(const int*)(ch + 0x258)
+			    << ":" << channelName (ch);
+		}
+		return out.str ();
+	}
+
+	// Assignation d'un canal a une tranche : CHANNELTRACK <index> [tranche]
+	if (line.rfind ("CHANNELTRACK ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (13));
+		int wanted = 0;
+		if (!(ss >> wanted))
+			return "ERR syntaxe CHANNELTRACK <index> [tranche]";
+
+		const unsigned char* p1 =
+			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E0128);
+		if (!isReadable (p1, 8))
+			return "ERR channel rack introuvable";
+		const unsigned char* container = *(const unsigned char* const*)p1;
+		if (!isReadable (container, 0x18))
+			return "ERR conteneur canaux introuvable";
+
+		const int count = *(const int*)(container + 0x10);
+		const unsigned char* array = *(const unsigned char* const*)(container + 8);
+		if (count <= 0 || count > 2000 || !isReadable (array, (size_t)count * 8))
+			return "ERR liste de canaux illisible";
+
+		unsigned char* found = nullptr;
+		for (int i = 0; i < count; i++)
+		{
+			unsigned char* ch = *(unsigned char* const*)(array + (size_t)i * 8);
+			if (ch == nullptr || !isReadable (ch, 0x800))
+				continue;
+			if (*(int*)(ch + 0x794) == wanted)
+			{
+				found = ch;
+				break;
+			}
+		}
+		if (found == nullptr)
+			return "ERR canal introuvable";
+
+		int track = -1;
+		if (ss >> track)
+		{
+			if (track < 0 || track > 125)
+				return "ERR tranche hors plage";
+			*(int*)(found + 0x258) = track;
+			requestRefresh ();
+		}
+		else
+		{
+			track = *(int*)(found + 0x258);
+		}
+
+		std::ostringstream out;
+		out << "CHANNELTRACK " << wanted << " " << track;
+		return out.str ();
+	}
+
+	// Reglages d'un canal du channel rack.
+	//   volume : identifiant index << 16      , brut 0..12800
+	//   pan    : identifiant (index << 16) + 1, brut 0..12800, centre 6400
+	// Lecture par le repartiteur FUN_01046A70(id, 0, 2) ; ecriture par
+	// FUN_01051D60 comme les tranches du mixeur (propriete 0x3FD).
+	if (line.rfind ("CHANNELVOL ", 0) == 0 || line.rfind ("CHANNELPAN ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const bool isPan = (line.rfind ("CHANNELPAN ", 0) == 0);
+		std::istringstream ss (line.substr (isPan ? 11 : 11));
+		int index = -1;
+		if (!(ss >> index) || index < 0 || index > 255)
+			return "ERR syntaxe CHANNELVOL|CHANNELPAN <index> [valeur]";
+
+		const long long handle = ((long long)index << 16) + (isPan ? 1 : 0);
+
+		double wanted = -999.0;
+		if (ss >> wanted)
+		{
+			if (isPan)
+			{
+				if (wanted < -1.0) wanted = -1.0;
+				if (wanted > 1.0) wanted = 1.0;
+			}
+			else
+			{
+				if (wanted < 0.0) wanted = 0.0;
+				if (wanted > 1.0) wanted = 1.0;
+			}
+
+			// L'ECRITURE attend l'echelle 2^30 (propriete 0x3FD), alors que la
+			// LECTURE renvoie 0..12800. Deux echelles differentes : ecrire
+			// 7680 au lieu de 0.6*2^30 mettait le canal a zero, en silence.
+			const double normalise = isPan ? (wanted + 1.0) * 0.5 : wanted;
+			const int raw = (int)(normalise * 1073741824.0 + 0.5);
+
+			using SetFn = void (*) (long long, int, int, int, int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			setter (handle, raw, 0x3FD, 0, 0, 0, 0);
+			requestRefresh ();
+		}
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn read = (GetFn)((unsigned char*)g_engine + 0xC46A70);
+		const int raw = read (handle, 0, 2);
+
+		const double value = isPan ? ((double)raw / 6400.0 - 1.0)
+		                           : ((double)raw / 12800.0);
+
+		char buf[128];
+		sprintf_s (buf, "%s %d %.6f (%d)", isPan ? "CHANNELPAN" : "CHANNELVOL",
+		           index, value, raw);
+		return std::string (buf);
+	}
+
+	// Volume et panoramique de TOUS les canaux, en une seule requete.
+	// Format : CHANNELMIX <n> <index>:<volume>:<pan> ...
+	if (line == "CHANNELMIX")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const unsigned char* p1 =
+			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E0128);
+		if (!isReadable (p1, 8))
+			return "ERR channel rack introuvable";
+		const unsigned char* container = *(const unsigned char* const*)p1;
+		if (!isReadable (container, 0x18))
+			return "ERR conteneur canaux introuvable";
+
+		const int count = *(const int*)(container + 0x10);
+		const unsigned char* array = *(const unsigned char* const*)(container + 8);
+		if (count < 0 || count > 2000 || (count > 0 && !isReadable (array, (size_t)count * 8)))
+			return "ERR liste de canaux illisible";
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn read = (GetFn)((unsigned char*)g_engine + 0xC46A70);
+
+		std::ostringstream out;
+		out << "CHANNELMIX " << count;
+		for (int i = 0; i < count; i++)
+		{
+			const unsigned char* ch = *(const unsigned char* const*)(array + (size_t)i * 8);
+			if (ch == nullptr || !isReadable (ch, 0x800))
+				continue;
+
+			const int index = *(const int*)(ch + 0x794);
+			const long long base = (long long)index << 16;
+			const int rawVol = read (base, 0, 2);
+			const int rawPan = read (base + 1, 0, 2);
+
+			const int rawMute = read (base + 7, 0, 2);
+
+			out << " " << index
+			    << ":" << ((double)rawVol / 12800.0)
+			    << ":" << ((double)rawPan / 6400.0 - 1.0)
+			    << ":" << (rawMute ? 1 : 0);
+		}
+		return out.str ();
+	}
+
+	// Sourdine d'un canal : identifiant (index << 16) + 7.
+	// Lecture : 1 = actif, 0 = muet. Ecriture : valeur brute passee telle
+	// quelle au setter, le temps de determiner son echelle.
+	if (line.rfind ("CHANNELMUTE ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (12));
+		int index = -1;
+		if (!(ss >> index) || index < 0 || index > 255)
+			return "ERR syntaxe CHANNELMUTE <index> [brut]";
+
+		const long long handle = ((long long)index << 16) + 7;
+
+		int voulu = -1;
+		if (ss >> voulu)
+		{
+			// L'ecriture attend l'echelle 2^30 : 0 = muet, 2^30 = actif.
+			using SetFn = void (*) (long long, int, int, int, int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			setter (handle, voulu ? 1073741824 : 0, 0x3FD, 0, 0, 0, 0);
+			requestRefresh ();
+		}
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn read = (GetFn)((unsigned char*)g_engine + 0xC46A70);
+		const int now = read (handle, 0, 2);
+
+		char buf[96];
+		sprintf_s (buf, "CHANNELMUTE %d %d (%d)", index, now ? 1 : 0, now);
+		return std::string (buf);
+	}
+
+	// Cree un canal avec un VRAI plugin dedans, comme le fait le navigateur de FL.
+	//
+	// La sequence exacte vient de FUN_01098830 (le code du navigateur) :
+	//   canal = FUN_011F53D0(*(void**)FLEngine+0x11E0FF8, 0)
+	//   (*(vtable + 0x150))(canal, chemin_en_chaine_Delphi, 0, drapeaux, 0, 0)
+	//
+	// C'est la methode +0x150 qui instancie le plugin ; FUN_010010F0, appelee
+	// seule, ne faisait que lire le nom du preset (verifie : le canal prenait le
+	// bon nom mais restait un sampler vide).
+	// Verifie le 28/10 a 20h45 : apres cet appel, l'interface de FabFilter One
+	// s'ouvre vraiment, et le module du VST est charge dans FL.
+	// Canal vide (Sampler), pour garder les positions du rack alignees quand
+	// l'instrument de l'autre poste n'existe pas ici.
+	if (line == "NEWCHANNEL")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		unsigned char* base = (unsigned char*)g_engine;
+		void** selfSlot = (void**)(base + 0x11E0FF8);
+		if (!isReadable (selfSlot, 8))
+			return "ERR contexte de creation illisible";
+		void* self = *selfSlot;
+
+		using CreateFn = void* (*) (void*, unsigned char);
+		CreateFn create = (CreateFn)(base + 0xDF53D0);
+		void* channel = create (self, 0);
+		if (channel == nullptr || !isReadable (channel, 8))
+			return "ERR creation du canal";
+
+		const int index = *(int*)((unsigned char*)channel + 0x794);
+		requestRefresh ();
+		return "NEWCHANNEL OK " + std::to_string (index);
+	}
+
+	if (line.rfind ("LOADPLUGIN ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const std::string chemin = line.substr (11);
+		if (chemin.size () < 8 || chemin.size () > 500)
+			return "ERR syntaxe LOADPLUGIN <chemin .fst absolu>";
+
+		unsigned char* base = (unsigned char*)g_engine;
+
+		using ToDelphi = void* (*) (void*, const char*);
+		ToDelphi toDelphi = (ToDelphi)(base + 0x1C6E0);
+
+		void* preset = nullptr;
+		toDelphi (&preset, chemin.c_str ());
+		if (preset == nullptr)
+			return "ERR chaine chemin";
+
+		// Le navigateur passe un "self" non nul : le global +0x11E0FF8.
+		void** selfSlot = (void**)(base + 0x11E0FF8);
+		if (!isReadable (selfSlot, 8))
+			return "ERR contexte de creation illisible";
+		void* self = *selfSlot;
+
+		using CreateFn = void* (*) (void*, unsigned char);
+		CreateFn create = (CreateFn)(base + 0xDF53D0);
+		void* channel = create (self, 0);
+		if (channel == nullptr || !isReadable (channel, 8))
+			return "ERR creation du canal";
+
+		const int index = *(int*)((unsigned char*)channel + 0x794);
+
+		void** vtable = *(void***)channel;
+		if (vtable == nullptr || !isReadable (vtable + 0x150 / 8, 8))
+			return "ERR table de methodes illisible";
+		void* method = vtable[0x150 / 8];
+
+		// Drapeaux : ceux que le navigateur construit (debordements compris).
+		unsigned flags = *(const unsigned short*)(base + 0xC98B54);
+		using OptFn = char (*) (int);
+		OptFn option = (OptFn)(base + 0x4188F0);
+		if (option (0x12) != 0)
+			flags |= 0x40;
+
+		using LoadMethod = void (*) (void*, void*, int, int, void*, void*);
+		LoadMethod load = (LoadMethod)method;
+		load (channel, preset, 0, (int)flags, nullptr, nullptr);
+
+		requestRefresh ();
+		return "LOADPLUGIN OK (canal " + std::to_string (index) + " " + std::to_string (flags) + ")";
+	}
+
+	// Canal en cours d'edition du piano roll (CURCHANNEL) et selection
+	// (SELECTCHANNEL <index>). C'est ce canal qui determine OU les notes sont
+	// ecrites : la liste de notes n'existe pas par canal dans le rack.
+	if (line == "CURCHANNEL" || line.rfind ("SELECTCHANNEL ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		unsigned char* base = (unsigned char*)g_engine;
+
+		if (line.rfind ("SELECTCHANNEL ", 0) == 0)
+		{
+			std::istringstream ss (line.substr (14));
+			int index = -1;
+			if (!(ss >> index) || index < 0 || index > 255)
+				return "ERR syntaxe SELECTCHANNEL <index>";
+
+			using SelFn = void (*) (int);
+			SelFn select = (SelFn)(base + 0xDE84E0);
+			select (index);
+			requestRefresh ();
+		}
+
+		using GetSel = int (*) (int, int, int);
+		GetSel getSel = (GetSel)(base + 0xDE82C0);
+		const int now = getSel (0, 0, 0);
+
+		char buf[96];
+		sprintf_s (buf, "CURCHANNEL %d", now);
+		return std::string (buf);
+	}
+
+	return "ERR commande inconnue";
+}
+
+// Appelee sur le thread principal de FL uniquement.
+// Conteneur de clips avec CACHE : un balayage memoire complet coute des
+// centaines de millisecondes et bloque le thread principal de FL. On garde donc
+// l'adresse tant qu'elle reste valide, et on ne rebalaye qu'en cas d'echec.
+static unsigned char* g_clipCache = nullptr;
+
+static bool validClipContainer (unsigned char* c)
+{
+	if (c == nullptr || g_engine == nullptr)
+		return false;
+	if (!isReadable (c, 0x20))
+		return false;
+	const unsigned long long cls =
+		(unsigned long long)((unsigned char*)g_engine + 0xC54168);
+	if (*(const unsigned long long*)c != cls)
+		return false;
+	if (*(const int*)(c + 0x10) != 0x58)
+		return false;
+	const int cnt = *(const int*)(c + 0x14);
+	const int cap = *(const int*)(c + 0x18);
+	if (cnt < 0 || cnt > 5000 || cap < cnt || cap > 200000)
+		return false;
+	return true;
+}
+
+static unsigned char* getClipContainer ()
+{
+	if (validClipContainer (g_clipCache))
+		return g_clipCache;
+
+	g_clipCache = nullptr;
+
+	const unsigned long long cls =
+		(unsigned long long)((unsigned char*)g_engine + 0xC54168);
+	unsigned char pattern[8];
+	memcpy (pattern, &cls, 8);
+
+	unsigned char* best = nullptr;
+	int bestCount = -1;
+
+	MEMORY_BASIC_INFORMATION mbi;
+	unsigned char* addr = nullptr;
+	while (VirtualQuery (addr, &mbi, sizeof (mbi)) == (SIZE_T)sizeof (mbi))
+	{
+		unsigned char* base = (unsigned char*)mbi.BaseAddress;
+		const size_t size = mbi.RegionSize;
+		if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 &&
+		    size >= 0x20 && size <= 64u * 1024 * 1024)
+		{
+			for (size_t i = 0; i + 0x20 <= size; i += 8)
+			{
+				if (memcmp (base + i, pattern, 8) != 0)
+					continue;
+				unsigned char* cand = base + i;
+				const int es = *(const int*)(cand + 0x10);
+				const int cnt = *(const int*)(cand + 0x14);
+				const int cap = *(const int*)(cand + 0x18);
+				const unsigned char* d = *(const unsigned char* const*)(cand + 0x08);
+				if (es != 0x58 || cnt < 0 || cnt > 5000 || cap < cnt || cap > 200000)
+					continue;
+				if (cnt > 0 && !isReadable (d, (size_t)cnt * 0x58))
+					continue;
+				if (cnt > bestCount)
+				{
+					bestCount = cnt;
+					best = cand;
+				}
+			}
+		}
+		unsigned char* next = base + size;
+		if (next <= addr) break;
+		addr = next;
+	}
+
+	if (best != nullptr)
+		g_clipCache = best;
+	return best;
+}
+
+// Reecrit la longueur d'un clip existant, identifie par sa position.
+static void applyClipLength (unsigned pos, unsigned len)
+{
+	if (g_engine == nullptr)
+		return;
+
+	const unsigned long long cls =
+		(unsigned long long)((unsigned char*)g_engine + 0xC54168);
+	unsigned char pattern[8];
+	memcpy (pattern, &cls, 8);
+
+	MEMORY_BASIC_INFORMATION mbi;
+	unsigned char* addr = nullptr;
+	while (VirtualQuery (addr, &mbi, sizeof (mbi)) == (SIZE_T)sizeof (mbi))
+	{
+		unsigned char* base = (unsigned char*)mbi.BaseAddress;
+		const size_t size = mbi.RegionSize;
+		if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 &&
+		    size >= 0x20 && size <= 64u * 1024 * 1024)
+		{
+			for (size_t i = 0; i + 0x28 <= size; i += 8)
+			{
+				if (memcmp (base + i, pattern, 8) != 0)
+					continue;
+				unsigned char* cand = base + i;
+				const int es = *(const int*)(cand + 0x10);
+				const int cnt = *(const int*)(cand + 0x14);
+				const int cap = *(const int*)(cand + 0x18);
+				unsigned char* d = *(unsigned char**)(cand + 0x08);
+				if (es != 0x58 || cnt <= 0 || cnt > 5000 || cap < cnt || cap > 200000)
+					continue;
+				if (!isReadable (d, (size_t)cnt * 0x58))
+					continue;
+				for (int k = 0; k < cnt; k++)
+				{
+					unsigned char* r = d + (size_t)k * 0x58;
+					if (*(unsigned*)r == pos)
+					{
+						*(unsigned*)(r + 0x08) = len;
+						*(unsigned*)(r + 0x1C) = len;
+						return;
+					}
+				}
+			}
+		}
+		unsigned char* next = base + size;
+		if (next <= addr) break;
+		addr = next;
+	}
+}
+
+static void processPending ()
+{
+	std::vector<Request*> work;
+	{
+		std::lock_guard<std::mutex> lock (g_mtx);
+		work.swap (g_pending);
+	}
+	for (Request* r : work)
+	{
+		r->reply = executeCommand (r->cmd);
+		r->done = true;
+	}
+}
+
+static DWORD WINAPI serverThread (LPVOID)
+{
+	InterlockedExchange (&g_serverAlive, 1);
+
+	WSADATA wsa;
+	if (WSAStartup (MAKEWORD (2, 2), &wsa) != 0)
+	{
+		logLine ("serveur          : WSAStartup echec");
+		InterlockedExchange (&g_serverAlive, 0);
+		return 0;
+	}
+
+	SOCKET srv = socket (AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (srv == INVALID_SOCKET)
+	{
+		logLine ("serveur          : socket echec");
+		WSACleanup ();
+		InterlockedExchange (&g_serverAlive, 0);
+		return 0;
+	}
+	g_srv = srv;
+
+	int reuse = 1;
+	setsockopt (srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof (reuse));
+
+	sockaddr_in addr;
+	memset (&addr, 0, sizeof (addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons (47831);
+	addr.sin_addr.s_addr = inet_addr ("127.0.0.1");
+
+	if (bind (srv, (sockaddr*)&addr, sizeof (addr)) != 0)
+	{
+		logLine ("serveur          : bind echec sur 47831");
+		closesocket (srv);
+		WSACleanup ();
+		g_srv = INVALID_SOCKET;
+		InterlockedExchange (&g_serverAlive, 0);
+		return 0;
+	}
+
+	listen (srv, SOMAXCONN);
+	logLine ("serveur TCP      : 127.0.0.1:47831 pret");
+
+	while (InterlockedCompareExchange (&g_stopServer, 0, 0) == 0)
+	{
+		// select avec delai : permet de verifier le drapeau d'arret au lieu
+		// de rester bloque dans accept() pendant que FL decharge le DLL.
+		fd_set rd;
+		FD_ZERO (&rd);
+		FD_SET (srv, &rd);
+		timeval tv;
+		tv.tv_sec = 0;
+		tv.tv_usec = 100000;
+		if (select (0, &rd, nullptr, nullptr, &tv) <= 0)
+			continue;
+
+		SOCKET c = accept (srv, nullptr, nullptr);
+		if (c == INVALID_SOCKET)
+		{
+			// Une erreur transitoire (client qui coupe net) ne doit pas tuer
+			// le serveur : sinon plus personne ne peut se connecter jusqu'au
+			// redemarrage de FL.
+			if (InterlockedCompareExchange (&g_stopServer, 0, 0) != 0)
+				break;
+			logLine ("serveur TCP      : accept en echec, on continue");
+			Sleep (100);
+			continue;
+		}
+
+		// recv avec delai : meme raison, pour ne pas bloquer a l'arret
+		DWORD timeoutMs = 200;
+		setsockopt (c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof (timeoutMs));
+
+		// Un client qui meurt sans fermer laisse un socket "established" que
+		// recv voit expirer sans fin. Sans ce compteur, le serveur restait
+		// bloque et refusait toute nouvelle connexion.
+		DWORD dernierOctet = GetTickCount ();
+
+		for (;;)
+		{
+			if (InterlockedCompareExchange (&g_stopServer, 0, 0) != 0)
+				break;
+
+			char buf[1024];
+			int n = recv (c, buf, sizeof (buf) - 1, 0);
+			if (n == SOCKET_ERROR)
+			{
+				if (WSAGetLastError () == WSAETIMEDOUT)
+				{
+					if (GetTickCount () - dernierOctet > 20000)
+					{
+						logLine ("serveur TCP      : client muet, deconnexion");
+						break;
+					}
+					continue;
+				}
+				break;
+			}
+			if (n <= 0)
+				break;
+			buf[n] = 0;
+
+			std::string line (buf);
+			while (!line.empty () && (line.back () == '\n' || line.back () == '\r'))
+				line.pop_back ();
+			if (line.empty ())
+				continue;
+
+			Request r;
+			r.cmd = line;
+			r.done = false;
+			{
+				std::lock_guard<std::mutex> lock (g_mtx);
+				g_pending.push_back (&r);
+			}
+
+			// On previent le thread principal tout de suite au lieu d'attendre
+			// le prochain tick de minuterie : c'est la moitie du gain de latence.
+			if (g_wakeWnd != nullptr)
+				PostMessageA (g_wakeWnd, WM_APP + 1, 0, 0);
+
+			// Certaines commandes sont lentes : le mixeur redessine son interface,
+			// et ADDCHANNEL scanne la base de plugins sur disque (jusqu'a 6 s).
+			// On patiente jusqu'a 12 s, en revenant des que la reponse est prete.
+			for (int i = 0; i < 10000 && !r.done; ++i)
+				Sleep (1);
+
+			std::string out = r.done ? r.reply : std::string ("TIMEOUT");
+			out += "\n";
+			send (c, out.c_str (), (int)out.size (), 0);
+		}
+		closesocket (c);
+
+		// l'agent est parti : la fenetre le dit
+		fmgui::setRole (0);
+		fmgui::setStatus ("Aucune session");
+	}
+
+	closesocket (srv);
+	WSACleanup ();
+	g_srv = INVALID_SOCKET;
+	InterlockedExchange (&g_serverAlive, 0);
+	return 0;
+}
+
+//------------------------------------------------------------------------
+class BridgeProcessor : public SingleComponentEffect
+{
+public:
+	static FUnknown* createInstance (void*)
+	{
+		return static_cast<IAudioProcessor*> (new BridgeProcessor ());
+	}
+
+	tresult PLUGIN_API initialize (FUnknown* context) SMTG_OVERRIDE
+	{
+		tresult result = SingleComponentEffect::initialize (context);
+		if (result != kResultOk)
+			return result;
+
+		// FL peut recharger l'effet SANS decharger le DLL : les variables
+		// globales survivent. Sans cette remise a zero, l'ancien drapeau
+		// d'arret tue le nouveau serveur des sa creation.
+		InterlockedExchange (&g_stopServer, 0);
+
+		// Sans cela, Windows arrondit Sleep() et SetTimer() a 15,6 ms : chaque
+		// commande attendait un tic complet. 1 ms rend les 6 ms effectifs.
+		timeBeginPeriod (1);
+		if (g_srv != INVALID_SOCKET)
+		{
+			closesocket (g_srv);
+			g_srv = INVALID_SOCKET;
+		}
+		if (g_timerId != 0)
+		{
+			KillTimer (nullptr, g_timerId);
+			destroyWakeWindow ();
+			g_timerId = 0;
+		}
+
+		addAudioInput (USTRING ("Input"), SpeakerArr::kStereo);
+		addAudioOutput (USTRING ("Output"), SpeakerArr::kStereo);
+
+		HMODULE engine = GetModuleHandleA ("FLEngine_x64.dll");
+		HMODULE python = GetModuleHandleA ("python312.dll");
+		// Affecte tout de suite : les accesseurs de notes s'appuient dessus.
+		g_engine = engine;
+
+		logLine ("=== FruityMulti charge dans FL ===");
+		logLine ("process pid      = %lu", (unsigned long)GetCurrentProcessId ());
+		logLine ("FLEngine base    = %p", (void*)engine);
+		logLine ("python312 base   = %p", (void*)python);
+
+		// Resolution par signature : la fonction d'insertion de note.
+		// 45 octets dont 8 jokers (operandes des deux appels relatifs).
+		static const char* kInsertNoteSig =
+			"57 56 53 48 83 EC 20 48 89 CB 48 89 D6 48 89 D9 48 8D 53 1C 44 8B 06 "
+			"E8 ?? ?? ?? ?? 48 89 D9 8B 53 1C 41 B8 01 00 00 00 E8 ?? ?? ?? ??";
+
+		void* insertNote = findSignature (engine, kInsertNoteSig);
+		void* expected = engine ? (void*)((const char*)engine + 0xC60570) : nullptr;
+
+		logLine ("insert note fn   = %p", insertNote);
+		logLine ("attendu (RVA)    = %p", expected);
+		const bool signatureOk = (insertNote && insertNote == expected);
+		logLine ("signature        : %s", signatureOk ? "OK" : "ECHEC");
+
+		if (!signatureOk)
+		{
+			logLine ("*** VERSION DE FL NON RECONNUE ***");
+			logLine ("ce plugin a ete compile pour FL 26.1.7.5654");
+			logLine ("les deux PCs doivent avoir la MEME version de FL");
+			logLine ("le plugin se desactive pour ne pas lire au hasard");
+			InterlockedExchange (&g_disabled, 1);
+		}
+
+		// Lecture de la liste de notes du motif courant.
+		// Le 28/10 a 20h15 : la table FLEngine+0x153FCE0 est un tableau de
+		// MOTIFS (0xC0 octets chacun, numero a partir de 1), la liste de notes
+		// est a +0x28, et chaque note porte son CANAL en +0x06.
+		// note (24 o) : +0x00 temps, +0x06 canal, +0x08 duree, +0x0C hauteur,
+		//               +0x15 velocite
+		{
+			const int pattern = currentPattern ();
+			const unsigned char* list = noteList (pattern);
+			if (list != nullptr)
+			{
+				const int count = *(const int*)(list + 0x14);
+				const unsigned char* data = *(const unsigned char* const*)(list + 0x08);
+				logLine ("motif courant    : %d", pattern);
+				logLine ("liste de notes   : %p   notes = %d", (void*)list, count);
+				if (g_container == nullptr)
+					g_container = (void*)list;
+
+				if (count > 0 && isReadable (data, (size_t)count * 24))
+				{
+					for (int k = 0; k < count && k < 8; ++k)
+					{
+						const unsigned char* n = data + (size_t)k * 24;
+						logLine ("    note[%d] temps=%u canal=%d duree=%u hauteur=%u vel=%u",
+						         k, *(const unsigned*)(n + 0x00), noteChannelOf (n),
+						         *(const unsigned*)(n + 0x08),
+						         *(const unsigned*)(n + 0x0C),
+						         (unsigned)*(const unsigned char*)(n + 0x15));
+					}
+				}
+			}
+			else
+			{
+				logLine ("motif courant    : %d (aucune liste)", pattern);
+			}
+		}
+
+		// Preparation de l'ecriture : thread principal + minuterie.
+		// Un timer cree depuis ce thread delivre ses tops sur ce meme thread,
+		// a condition que celui-ci pompe les messages — c'est le cas du thread
+		// principal de FL.
+		HWND flWindow = findFlMainWindow ();
+		g_flMainThreadId =
+			flWindow ? GetWindowThreadProcessId (flWindow, nullptr) : GetCurrentThreadId ();
+
+		logLine ("fenetre FL       = %p  thread principal = %lu",
+		         (void*)flWindow, (unsigned long)g_flMainThreadId);
+		logLine ("thread courant   = %lu", (unsigned long)GetCurrentThreadId ());
+		logLine ("conteneur de test= %p", g_container);
+
+		g_timerId = SetTimer (nullptr, 0, 6, fmTimerProc);
+		logLine ("minuterie        = %llu", (unsigned long long)g_timerId);
+
+		g_engine = engine;
+		g_insertFn = insertNote;
+		InterlockedExchange (&g_serverWanted, 1);
+		g_flWindow = flWindow;
+
+		// reveil immediat du thread principal par message
+		if (kUseWakeWindow)
+			createWakeWindow ();
+
+		if (kShowToolbar)
+		{
+			HANDLE bar = CreateThread (nullptr, 0, barThread, nullptr, 0, nullptr);
+			if (bar != nullptr)
+				g_barThread = bar;
+		}
+
+		HANDLE cursor = CreateThread (nullptr, 0, cursorThread, nullptr, 0, nullptr);
+		if (cursor != nullptr)
+			g_cursorThread = cursor;   // conserve pour attendre son arret
+
+		HANDLE thread = CreateThread (nullptr, 0, serverThread, nullptr, 0, nullptr);
+		if (thread != nullptr)
+			CloseHandle (thread);
+		else
+			logLine ("serveur          : CreateThread echec");
+
+		return kResultOk;
+	}
+
+	// Fenetre du plugin : c'est elle qui heberge / rejoint une session.
+	IPlugView* PLUGIN_API createView (FIDString /*name*/) SMTG_OVERRIDE
+	{
+		return fmCreateView ();
+	}
+	tresult PLUGIN_API process (ProcessData& data) SMTG_OVERRIDE
+	{
+		// Effet transparent : on RECOPIE l'entree vers la sortie.
+		// Ne rien faire coupe le son quand FL fournit des tampons separes.
+		if (data.numSamples <= 0 || data.numInputs == 0 || data.numOutputs == 0)
+			return kResultOk;
+
+		const int32 samples = data.numSamples;
+		const int32 outChannels = data.outputs[0].numChannels;
+		const int32 inChannels = data.inputs[0].numChannels;
+
+		for (int32 ch = 0; ch < outChannels; ++ch)
+		{
+			float* out = data.outputs[0].channelBuffers32[ch];
+			if (out == nullptr)
+				continue;
+
+			float* in = (ch < inChannels) ? data.inputs[0].channelBuffers32[ch] : nullptr;
+			if (in != nullptr)
+			{
+				if (in != out)
+					memcpy (out, in, (size_t)samples * sizeof (float));
+			}
+			else
+			{
+				memset (out, 0, (size_t)samples * sizeof (float));
+			}
+		}
+
+		return kResultOk;
+	}
+
+	// Nettoyage obligatoire : sans lui, FL decharge le DLL alors que notre
+	// minuterie et notre thread serveur tournent encore -> plantage.
+	tresult PLUGIN_API terminate () SMTG_OVERRIDE
+	{
+		if (g_timerId != 0)
+		{
+			KillTimer (nullptr, g_timerId);
+			destroyWakeWindow ();
+			g_timerId = 0;
+		}
+
+		InterlockedExchange (&g_serverWanted, 0);
+		InterlockedExchange (&g_stopServer, 1);
+
+		// Le thread du curseur doit s'arreter AVANT le dechargement du DLL,
+		// sinon son code disparait sous ses pieds -> plantage de FL.
+		if (g_cursorWnd != nullptr)
+			PostMessageA (g_cursorWnd, WM_CLOSE, 0, 0);
+		if (g_barThreadId != 0)
+		PostThreadMessageA ((DWORD)g_barThreadId, WM_QUIT, 0, 0);
+	if (g_barThread != nullptr)
+	{
+		WaitForSingleObject (g_barThread, 2000);
+		CloseHandle (g_barThread);
+		g_barThread = nullptr;
+	}	
+
+	if (g_cursorThreadId != 0)
+			PostThreadMessageA ((DWORD)g_cursorThreadId, WM_QUIT, 0, 0);
+
+		// Meme regle que pour le serveur : attendre la fin effective du thread
+		// du curseur avant que FL ne libere le DLL.
+		if (g_cursorThread != nullptr)
+		{
+			WaitForSingleObject (g_cursorThread, 2000);
+			CloseHandle (g_cursorThread);
+			g_cursorThread = nullptr;
+		}
+
+		if (g_srv != INVALID_SOCKET)
+		{
+			closesocket (g_srv);
+			g_srv = INVALID_SOCKET;
+		}
+
+		// Attendre que le thread serveur soit REELLEMENT termine. Sans cette
+		// attente, FL decharge le DLL et le thread continue dans du code libere.
+		if (g_serverThread != nullptr)
+		{
+			WaitForSingleObject (g_serverThread, 2000);
+			CloseHandle (g_serverThread);
+			g_serverThread = nullptr;
+		}
+
+		// La file contient des pointeurs vers la PILE du thread serveur. S'il en
+		// restait une seule apres sa mort, le thread principal lirait de la
+		// memoire liberee — plantage qui n'apparait qu'apres plusieurs cycles.
+		{
+			std::lock_guard<std::mutex> lock (g_mtx);
+			for (Request* r : g_pending)
+			{
+				if (r != nullptr)
+				{
+					r->done = true;
+					r->reply = "ARRET";
+				}
+			}
+			g_pending.clear ();
+		}
+
+		// Etat remis a zero pour la prochaine instance dans le meme processus.
+		g_clipCache = nullptr;
+		InterlockedExchange (&g_disabled, 0);
+
+		timeEndPeriod (1);
+
+		logLine ("=== FruityMulti decharge ===");
+		return SingleComponentEffect::terminate ();
+	}
+};
+
+} // namespace FruityMulti
+
+BEGIN_FACTORY_DEF ("FruityMulti", "https://example.invalid", "mailto:none@example.invalid",
+                   numberOfClasses)
+
+DEF_CLASS (FruityMultiBridgeUID, Steinberg::PClassInfo::kManyInstances, kVstAudioEffectClass,
+           "FruityMulti Bridge", Steinberg::Vst::kDistributable, Steinberg::Vst::PlugType::kFx,
+           "1.0.0", kVstVersionString, FruityMulti::BridgeProcessor::createInstance, nullptr)
+
+END_FACTORY
