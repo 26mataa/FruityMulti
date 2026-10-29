@@ -25,7 +25,7 @@ from collections import Counter
 # Le depot public qui heberge les versions. L'agent y lit la derniere release
 # et telecharge le plugin + lui-meme. A incrementer a chaque publication.
 DEPOT = "26mataa/FruityMulti"
-AGENT_VERSION = 26
+AGENT_VERSION = 27
 ADRESSE_RELEASES = f"https://github.com/{DEPOT}/releases/latest"
 
 PLUGIN_HOST = "127.0.0.1"
@@ -785,6 +785,8 @@ class Sync:
         self.clip_lengths = None
         self.clips_key = None
         self.last_clipsync = 0.0
+        self.nb_canaux_hote = None   # taille du rack de l hote
+        self.averti_canaux = False
         self.position = None
         self.channels_state = None
         self.peer_channels = None
@@ -1086,6 +1088,7 @@ class Sync:
                 # index veuillent dire la meme chose des deux cotes.
                 wanted = [(int(i), int(t), str(n))
                           for i, t, n in message.get("channels", [])]
+                self.nb_canaux_hote = len(wanted)
                 local = self.plugin.channels() or []
                 print(f"[rack] l'hote a {len(wanted)} canal(aux), "
                       f"j'en ai {len(local)}")
@@ -1691,6 +1694,18 @@ class Sync:
                 print(f"[sync] {sent} piste(s) de mixage envoyee(s)")
 
         for channel in set(list(current.keys()) + list(self.snapshot.keys())):
+            # Un canal qui n'existe pas chez l'hote ne doit pas partir :
+            # le plugin de l'autre poste le refuserait (et FL plantait avant
+            # ce garde-fou).
+            if (not self.is_host and self.nb_canaux_hote is not None
+                    and channel >= self.nb_canaux_hote):
+                if not self.averti_canaux:
+                    self.averti_canaux = True
+                    print(f"[rack] ton canal {channel + 1} n'existe pas chez "
+                          f"l'hote ({self.nb_canaux_hote} canal(aux)) : ses "
+                          f"notes ne seront pas envoyees")
+                continue
+
             old = self.snapshot.get(channel, [])
             new = current.get(channel, [])
 

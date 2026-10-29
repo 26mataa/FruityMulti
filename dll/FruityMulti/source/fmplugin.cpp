@@ -859,6 +859,28 @@ static unsigned char* noteList (int pattern)
 	return list;
 }
 
+// Nombre de canaux du channel rack, ou -1 si illisible.
+// Sert a refuser une note dont le canal n'existe pas : ecrire un canal
+// inexistant dans FL le fait planter.
+static int channelCount ()
+{
+	if (g_engine == nullptr)
+		return -1;
+
+	const unsigned char* p1 =
+		*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E0128);
+	if (!isReadable (p1, 8))
+		return -1;
+	const unsigned char* container = *(const unsigned char* const*)p1;
+	if (!isReadable (container, 0x18))
+		return -1;
+
+	const int count = *(const int*)(container + 0x10);
+	if (count < 0 || count > 2000)
+		return -1;
+	return count;
+}
+
 static int noteChannelOf (const unsigned char* note)
 {
 	return (int)*(const unsigned short*)(note + 0x06);
@@ -1004,7 +1026,7 @@ static std::string executeCommand (const std::string& line)
 		return "STATE OK";
 	}
 	if (line == "VERSION")
-		return "VERSION 26-fenetre";
+		return "VERSION 27-fenetre";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -1167,6 +1189,15 @@ static std::string executeCommand (const std::string& line)
 		unsigned channel = 0, count = 0;
 		if (!(ss >> channel >> count))
 			return "ERR syntaxe ADDX <canal> <nombre> <t:l:p:v>...";
+
+		const int total = channelCount ();
+		if (total >= 0 && (int)channel >= total)
+		{
+			std::ostringstream err;
+			err << "ERR canal " << channel << " hors du rack (" << total
+			    << " canal(aux) sur ce poste)";
+			return err.str ();
+		}
 
 		const int pattern = currentPattern ();
 		unsigned char* list = noteList (pattern);
