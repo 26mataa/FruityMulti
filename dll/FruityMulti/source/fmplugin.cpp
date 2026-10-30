@@ -204,11 +204,18 @@ static unsigned long guardedSet7 (void (*fn) (long long, int, int, int, int, int
 // 0x02 = Â« pas de dialogue, aucune action annexe Â» (pas de remise a zero du
 // nom / de la couleur / de l'icone, pas de menage de tranche de mixeur).
 // L'ancien (index, 1, 2) n'existe nulle part chez FL.
+//
+// 47-d : avant de supprimer, on ouvre une etape d'historique comme FL
+// (FUN_01019360, cree un TUndoEvent_RemovedChannels). Sans elle, le Ctrl+Z
+// suivant annule l'ajout d'un canal disparu et FL plante (POUR-CLAUDE, 13.15).
 static unsigned long guardedDeleteChannel (void (*fn) (unsigned, int, unsigned long long),
-                                           unsigned index)
+                                           void (*ouvrirEtape) (void*, void*, unsigned),
+                                           void* historique, void* nom, unsigned index)
 {
 	__try
 	{
+		if (ouvrirEtape != nullptr)
+			ouvrirEtape (historique, nom, index);
 		fn (index, 0, 0x02);
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER)
@@ -1192,7 +1199,7 @@ static std::string executeCommand (const std::string& line)
 	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
 	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 47-c";
+		return "VERSION 47-d";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -3588,8 +3595,28 @@ unsigned char* best = getClipContainer ();
 
 			using DeleteFn = void (*) (unsigned, int, unsigned long long);
 			DeleteFn supprimer = (DeleteFn)((unsigned char*)g_engine + 0xC04A60);
-			const unsigned long faute =
-				guardedDeleteChannel (supprimer, (unsigned)index);
+
+			// La liste des etapes (RVA 0x11E1C78) et le nom affiche dans
+			// l'historique de FL. Â« sanshisto Â» garde l'ancien appel pour comparer.
+			using OuvrirEtapeFn = void (*) (void*, void*, unsigned);
+			OuvrirEtapeFn ouvrirEtape = nullptr;
+			void* historique = nullptr;
+			void* nomEtape = nullptr;
+			if (line.find ("sanshisto") == std::string::npos)
+			{
+				void** global = *(void***)((unsigned char*)g_engine + 0x11E1C78);
+				if (!isReadable (global, 8) || *global == nullptr)
+					return "ERR historique illisible";
+				historique = *global;
+				using ToDelphi = void* (*) (void*, const char*);
+				((ToDelphi)((unsigned char*)g_engine + 0x1C6E0)) (&nomEtape, "Delete channel");
+				if (nomEtape == nullptr)
+					return "ERR chaine nom";
+				ouvrirEtape = (OuvrirEtapeFn)((unsigned char*)g_engine + 0xC19360);
+			}
+
+			const unsigned long faute = guardedDeleteChannel (
+				supprimer, ouvrirEtape, historique, nomEtape, (unsigned)index);
 
 			if (faute != 0)
 			{

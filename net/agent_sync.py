@@ -68,9 +68,9 @@ PLUGIN_ENVELOPPE = "Fruity Wrapper"   # VST et VST3 : le vrai nom est dans l'eta
 VARIABLE_USINE = "%FLStudioFactoryData%"
 VARIABLE_UTILISATEUR = "%FLStudioUserData%"
 VARIABLE_PARTAGE = "%ILSharedData%"      # Documents\Image-Line : kits de l'utilisateur
-# DELCHANNEL ne sauvegarde pas le canal comme le fait FL : annuler ensuite son
-# insertion plante FL (POUR-CLAUDE, 13.15). Le canal reste chez l'autre.
-SUPPRESSION_RECUE = False
+# Depuis le plugin 47-d, DELCHANNEL ouvre son etape d'historique comme FL : un
+# Ctrl+Z rend le canal et ses notes au lieu de planter (POUR-CLAUDE, 13.15).
+SUPPRESSION_RECUE = True
 SAUVEGARDES_GARDEES = 10
 
 
