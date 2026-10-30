@@ -29,6 +29,11 @@ void setPeer (const char* nom);       // "" = personne en face
 void setErreur (const char* texte);
 void soumettreEtat (const char* texte);
 
+// L'hote propose son projet : la fenetre pose la question a l'invite.
+// poste = "-" retire la question. prendreChoix rend "oui", "non" ou "-".
+void setDemande (const char* poste);
+std::string prendreChoix ();
+
 int  role ();
 bool agentLance ();
 
@@ -36,6 +41,6 @@ bool agentLance ();
 void agentParti ();
 
 // Version du plugin, telle qu'annoncee par la commande VERSION.
-constexpr int kVersionPlugin = 30;
+constexpr int kVersionPlugin = 46;
 
 } // namespace fmgui

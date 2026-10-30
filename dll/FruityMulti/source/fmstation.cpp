@@ -1108,6 +1108,52 @@ struct Station::Impl
 	}
 
 	// --- volet bleu entre les deux etats ----------------------------------------
+	// --- question de l'agent : par-dessus tout, tant qu'on n'a pas repondu ------
+	Mat matriceDemande () const { return rotation (-2, V (340, 200)); }
+
+	// 0 = charger, 1 = quitter, -1 = rien
+	int boutonSous (ImVec2 p) const
+	{
+		if (p.x < 0)
+			return -1;
+		const ImVec2 local = inverse (matriceDemande ()) (p);
+		const float x = local.x / S, y = local.y / S;
+		if (y < 250 || y >= 284)
+			return -1;
+		if (x >= 138 && x < 300)
+			return 0;
+		return (x >= 312 && x < 530) ? 1 : -1;
+	}
+
+	void dessinerDemande ()
+	{
+		dl->AddRectFilled (V (-40, -40), V (720, 460), alpha (ENCRE, 0.62f));
+
+		const int m = marque ();
+		dl->AddRectFilled (V (124, 100), V (556, 304), ENCRE);
+		dl->AddRectFilled (V (116, 92), V (548, 296), PAPIER);
+		dl->AddRect (V (116, 92), V (548, 296), ENCRE, 0.0f, 0, F (2.0f));
+
+		texte (f.monoGras, 11, 138, 110, BLEU, "EN ONDES / PROJET DE L'HÔTE");
+		texte (f.titre, 34, 138, 128, ENCRE, "CHARGER SON PROJET ?");
+		texte (f.monoGras, 12, 138, 170, ORANGE,
+		       tronquer (f.monoGras, F (12), majuscules (e.demande), F (390)));
+		texte (f.texte, 14, 138, 192, ENCRE,
+		       "Ton projet actuel est sauvegardé, puis remplacé par le sien. "
+		       "Sans ça, tu quittes la session.", 392);
+
+		const bool surOui = survol == 0, surNon = survol == 1;
+		dl->AddRectFilled (V (138, 250), V (300, 284), surOui ? ENCRE : BLEU);
+		texte (f.titre, 20, 219 - largeur (f.titre, 20, "CHARGER") / 2, 256, PAPIER, "CHARGER");
+		if (surNon)
+			dl->AddRectFilled (V (312, 250), V (530, 284), ENCRE);
+		dl->AddRect (V (312, 250), V (530, 284), ENCRE, 0.0f, 0, F (2.0f));
+		texte (f.titre, 20, 421 - largeur (f.titre, 20, "QUITTER LA SESSION") / 2, 256,
+		       surNon ? PAPIER : ENCRE, "QUITTER LA SESSION");
+
+		transformer (dl, m, matriceDemande ());
+	}
+
 	void dessinerVolet ()
 	{
 		const float p = t - tVolet;
@@ -1195,12 +1241,27 @@ void Station::image (ImDrawList* dl, const Polices& p, float echelle, float dt, 
 	s.majPrec = e.maj;
 
 	// --- souris ---------------------------------------------------------------------
-	s.survol = s.ligneSous (s.souris);
+	const bool question = !e.demande.empty ();
+	s.survol = question ? s.boutonSous (s.souris) : s.ligneSous (s.souris);
 	const bool bouge = s.souris.x != s.sourisPrec.x || s.souris.y != s.sourisPrec.y;
-	if (bouge && s.survol >= 0)
+	if (!question && bouge && s.survol >= 0)
 		s.choisir (s.survol);
 	s.sourisPrec = s.souris;
-	if (s.clicAttendu)
+	if (question)
+	{
+		// Le menu dessous ne repond plus. Pas d'Entree pour CHARGER : l'invite
+		// vient de valider son code, un appui de trop remplacerait son projet.
+		if (s.clicAttendu)
+		{
+			s.clicAttendu = false;
+			const int b = s.boutonSous (s.clic);
+			if (b == 0)
+				s.demander (Action::ProjetOui);
+			else if (b == 1)
+				s.demander (Action::ProjetNon);
+		}
+	}
+	else if (s.clicAttendu)
 	{
 		// la ligne sous l'APPUI : un « souris sortie » arrive parfois entre
 		// l'appui et l'image, et le clic se perdait
@@ -1231,6 +1292,8 @@ void Station::image (ImDrawList* dl, const Polices& p, float echelle, float dt, 
 	s.dessinerEtiquette ();
 	s.dessinerBandeau ();
 	s.dessinerVolet ();
+	if (question)
+		s.dessinerDemande ();
 
 	transformer (dl, apresFond, s.secousse ());   // le fond ne bouge pas
 	dl->PopClipRect ();
@@ -1250,6 +1313,12 @@ void Station::bouton (bool appuye)
 bool Station::touche (int vk, bool ctrl)
 {
 	Impl& s = *d;
+	if (!s.e.demande.empty ())
+	{
+		if (vk == VK_ESCAPE)
+			s.demander (Action::ProjetNon);
+		return true;
+	}
 	switch (vk)
 	{
 	case VK_UP:
@@ -1289,6 +1358,8 @@ bool Station::touche (int vk, bool ctrl)
 bool Station::caractere (unsigned c)
 {
 	Impl& s = *d;
+	if (!s.e.demande.empty ())
+		return true;
 	if (c < 32 || c > 126)
 		return false;
 	const char ch = (char)toupper ((int)c);
@@ -1317,7 +1388,7 @@ bool Station::caractere (unsigned c)
 void Station::coller (const std::string& texte)
 {
 	Impl& s = *d;
-	if (s.enOndes)
+	if (s.enOndes || !s.e.demande.empty ())
 		return;
 	// coller un code doit marcher depuis n'importe quelle ligne
 	for (int i = 0; i < (int)s.lignes.size (); ++i)

@@ -1,4 +1,4 @@
-// FruityMulti - plugin VST3 "cheval de Troie".
+﻿// FruityMulti - plugin VST3 "cheval de Troie".
 //
 // Objectif de cette premiere version : prouver que notre code s'execute bien
 // a l'interieur du processus de FL Studio, sans injecteur externe.
@@ -38,7 +38,7 @@
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
-// UID du plugin (doit rester stable d'une version a l'autre) — scope global,
+// UID du plugin (doit rester stable d'une version a l'autre) â€” scope global,
 // car les macros de fabrique l'utilisent hors de tout namespace.
 static DECLARE_UID (FruityMultiBridgeUID, 0x8F3A1C21, 0x4B7E4C11, 0xA9D23E5B, 0x7C6D8E9F);
 static constexpr size_t numberOfClasses = 1;
@@ -81,7 +81,7 @@ static void logLine (const char* fmt, ...)
 
 //------------------------------------------------------------------------
 // Recherche d'une signature d'octets dans l'image d'un module.
-// Format : "57 56 53 48 ?? ?? 20" — "??" = joker.
+// Format : "57 56 53 48 ?? ?? 20" â€” "??" = joker.
 // C'est ce qui remplace les adresses fixes : le code peut bouger, le motif reste.
 static void* findSignature (HMODULE module, const char* sig)
 {
@@ -169,6 +169,111 @@ static bool isReadable (const void* p, size_t n)
 	const unsigned char* start = (const unsigned char*)p;
 	const unsigned char* regionEnd = (const unsigned char*)mbi.BaseAddress + mbi.RegionSize;
 	return (start + n) <= regionEnd;
+}
+
+// Appels proteges au moteur de FL.
+//
+// Une faute d'acces dans le moteur ne doit pas emporter le thread principal :
+// quand c'est le cas, plus aucune commande ne rend de reponse et l'agent reste
+// bloque sans le dire (constate le 30/10 sur les ecritures de proprietes).
+static unsigned long guardedSet7 (void (*fn) (long long, int, int, int, int, int, int),
+                                  long long handle, int valeur, int mode)
+{
+	__try
+	{
+		fn (handle, valeur, mode, 0, 0, 0, 0);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return GetExceptionCode ();
+	}
+	return 0;
+}
+
+// Suppression d'un canal par la fonction de FL elle-meme (RVA 0xC04A60).
+//
+// Signature reelle : void FUN_01004a60 (unsigned index, char transaction,
+//                                          unsigned long long drapeaux)
+//
+// 46-p : on s'aligne sur ce que fait FL. Le releve des 38 sites d'appel
+// (re/ghidra/sites_del.md, re/tools/drapeaux_suppression.py) montre que FL
+// appelle TOUJOURS (index, 0, <octet>) :
+//   transaction = 0 partout ;
+//   drapeaux = 0x00 (majorite), 0x01, 0x02 (famille d'interface 0xD1xxxx),
+//              0x06 (Couper, FUN_0101eb30), 0x0E (rack, FUN_0101f730 / 0xC20E00).
+// 0x02 = Â« pas de dialogue, aucune action annexe Â» (pas de remise a zero du
+// nom / de la couleur / de l'icone, pas de menage de tranche de mixeur).
+// L'ancien (index, 1, 2) n'existe nulle part chez FL.
+static unsigned long guardedDeleteChannel (void (*fn) (unsigned, int, unsigned long long),
+                                           unsigned index)
+{
+	__try
+	{
+		fn (index, 0, 0x02);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return GetExceptionCode ();
+	}
+	return 0;
+}
+
+// Canal entier <-> fichier .fst, avec les fonctions du Ctrl+Z de FL.
+//   ecriture  : FUN_00f54570 (chemin, 0x20, canal, 6), via FUN_010159e0 ;
+//   insertion : FUN_01004230 (index, 1, 1) ;
+//   lecture   : FUN_00f54760 (chemin, 0x20, canal, 0).
+// Les deux premiers appels sont ceux de FUN_01020e00, l'annulation de Delete.
+using ChannelFileFn = int (*) (void*, unsigned, void*, unsigned char);
+
+static int guardedSaveChannel (ChannelFileFn ecrire, void* chemin, void* channel,
+                               unsigned long* faute)
+{
+	__try
+	{
+		return ecrire (chemin, 0x20, channel, 0x06);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		*faute = GetExceptionCode ();
+	}
+	return -1;
+}
+
+// Bascule PAT/SONG : FUN_00fdd300 (15, 1, drapeau, 15, 0), l'appel exact de
+// transport.setLoopMode. FL l'applique juste apres, pas pendant l'appel.
+static unsigned long guardedToggleLoopMode (unsigned char* base)
+{
+	__try
+	{
+		if (((char (*) ())(base + 0xDD1470)) () == 0)
+			return 1;
+		const unsigned char drapeau = ((unsigned char (*) ())(base + 0xBDD2B0)) ();
+		((int (*) (int, int, unsigned char, int, int))(base + 0xBDD300)) (15, 1, drapeau, 15, 0);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return GetExceptionCode ();
+	}
+	return 0;
+}
+
+static void* guardedLoadChannel (void* (*inserer) (int, int, int), ChannelFileFn lire,
+                                 void* existant, int index, void* chemin, int* rc,
+                                 unsigned long* faute)
+{
+	void* channel = existant;
+	__try
+	{
+		if (channel == nullptr)
+			channel = inserer (index, 1, 1);
+		if (channel != nullptr)
+			*rc = lire (chemin, 0x20, channel, 0);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		*faute = GetExceptionCode ();
+	}
+	return channel;
 }
 
 //------------------------------------------------------------------------
@@ -281,7 +386,7 @@ static void destroyWakeWindow ()
 // valeurs de l'hote. Les ordres venus de l'hote, eux, passent : l'agent les
 // prefixe par FORCE.
 //
-// Note du 28/10 au soir : griser les menus de FL est IMPOSSIBLE par Win32 —
+// Note du 28/10 au soir : griser les menus de FL est IMPOSSIBLE par Win32 â€”
 // FL n'a aucun menu Win32 (GetMenu renvoie 0, et aucun enfant n'en a). La
 // fonction fmApplyRoleLock ci-dessous ne trouve donc rien a griser ; elle est
 // conservee car elle ne coute rien et redeviendrait utile si FL changeait.
@@ -407,6 +512,34 @@ static volatile LONG g_serverAlive = 0;
 static volatile LONG g_serverStarting = 0;
 static HANDLE g_serverThread = nullptr;
 
+// Chargement de projet demande par LOADPROJECT.
+//
+// Il n'est PAS execute dans la commande : quand le projet est remplace, FL
+// decharge notre plugin, donc revenir dans une pile de commande apres coup
+// signifie revenir dans du code libere (plantage verifie le 30/10 : violation
+// d'acces dans FruityMultiBridge.vst3, offset 0x18baa).
+//
+// La commande se contente donc de poser le chemin ; la minuterie du thread
+// principal execute le chargement a la periode suivante, hors de toute requete.
+static char g_loadPath[400] = { 0 };
+static volatile LONG g_loadPending = 0;
+static void doLoadProject ();
+
+// Pose par terminate() quand l instance du plugin est detruite. Permet de savoir,
+// au retour du chargeur, si on doit relancer nos threads ou si le projet a
+// remplace l instance (auquel cas il ne faut plus rien toucher).
+static volatile LONG g_instanceDead = 0;
+
+// Dernier resultat du chargeur de projet : -2 jamais charge, -1 en cours,
+// sinon le code rendu par FL (0 = charge, autre = echec).
+//
+// Cette valeur doit SURVIVRE au remplacement de l instance : un chargement
+// reussi detruit le plugin, et c est la NOUVELLE instance qui doit lire le
+// resultat. D ou une variable statique du module, et le module est epingle
+// donc jamais demappe.
+static volatile LONG g_loadStatus = -2;
+
+
 // Relance le serveur s'il est tombe. FL peut appeler terminate() dans
 // plusieurs situations sans nous rendre la main ; plutot que de deviner
 // lesquelles, on surveille et on repare.
@@ -428,6 +561,13 @@ static void ensureServer ()
 
 static VOID CALLBACK fmTimerProc (HWND, UINT, UINT_PTR, DWORD)
 {
+	// Chargement de projet demande : on l'execute ici, hors de toute commande.
+	if (InterlockedExchange (&g_loadPending, 0) != 0)
+	{
+		doLoadProject ();
+		return;   // apres un chargement, plus rien de sur a toucher
+	}
+
 	// S'execute sur le thread principal de FL : c'est ici, et seulement ici,
 	// qu'on a le droit de toucher au modele.
 	processPending ();
@@ -459,8 +599,8 @@ static VOID CALLBACK fmTimerProc (HWND, UINT, UINT_PTR, DWORD)
 // Serveur TCP local.
 //
 // Le thread reseau ne touche JAMAIS au modele de FL : il depose une requete
-// dans une file, et c'est la minuterie — qui s'execute sur le thread principal
-// de FL — qui la traite. C'est la regle d'or : tout appel dans FL vient du
+// dans une file, et c'est la minuterie â€” qui s'execute sur le thread principal
+// de FL â€” qui la traite. C'est la regle d'or : tout appel dans FL vient du
 // thread principal.
 // ---------------------------------------------------------------------
 
@@ -517,7 +657,7 @@ static void requestRefresh ()
 //
 // FL ne repeint pas quand on modifie le modele en memoire : il ne le fait
 // que sur un vrai changement de pattern. On reproduit donc ce que fait
-// l'utilisateur a la main — passer a un autre pattern puis revenir — en
+// l'utilisateur a la main â€” passer a un autre pattern puis revenir â€” en
 // deux appels immediats.
 static void forceRefresh ()
 {
@@ -1004,15 +1144,15 @@ static std::string executeCommand (const std::string& line)
 	}
 
 	// Plugin desactive (FL d'une autre version) : la fenetre doit pouvoir le
-	// dire, donc STATE et VERSION restent permis.
+	// dire, donc ce qui ne parle qu'a la fenetre reste permis.
 	if (InterlockedCompareExchange (&g_disabled, 0, 0) != 0
-	    && line.rfind ("STATE", 0) != 0 && line != "VERSION")
+	    && line.rfind ("STATE", 0) != 0 && line != "VERSION" && line != "CHOIX")
 		return "ERR version de FL non reconnue par le plugin";
 
 	if (line == "PING")
 		return "OK";
 
-	// L'agent annonce son etat a la fenetre : "STATE en attente…"
+	// L'agent annonce son etat a la fenetre : "STATE en attenteâ€¦"
 	if (line.rfind ("STATE", 0) == 0)
 	{
 		std::string quoi = line.size () > 6 ? line.substr (6) : std::string ();
@@ -1033,16 +1173,26 @@ static std::string executeCommand (const std::string& line)
 		{
 			fmgui::setErreur (quoi.substr (7).c_str ());
 		}
+		else if (quoi.rfind ("DEMANDE ", 0) == 0)
+		{
+			fmgui::setDemande (quoi.substr (8).c_str ());
+		}
 		else
 		{
 			fmgui::setStatus (quoi.c_str ());
 		}
 		return "STATE OK";
 	}
+	// Reponse a la question posee par STATE DEMANDE : oui, non, ou "-" tant que
+	// l'utilisateur n'a pas choisi. Lire efface la reponse.
+	if (line == "CHOIX")
+		return "CHOIX " + fmgui::prendreChoix ();
+
 	// Identifiant de build : permet de savoir quelle version tourne
-	// chez chacun, sans ambiguite.
+	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
+	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 30-relais";
+		return "VERSION 47-c";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -1077,11 +1227,454 @@ static std::string executeCommand (const std::string& line)
 		return "REFRESHED " + std::to_string (count);
 	}
 
-	if (line == "NOTES")
+	// Sonde memoire, pour le reverse : PEEK <rva_hex> [longueur]
+	//
+	// L'adresse est une RVA (base du module exclue) : elle ne change pas d'un
+	// lancement a l'autre, contrairement a l'adresse absolue. Lecture seule, et
+	// refusee si la zone n'est pas lisible : on ne touche jamais a la memoire.
+	//
+	// Reponse sur UNE ligne : "PEEK <adresse absolue> <longueur> <hexa>".
+	if (line.rfind ("PEEK ", 0) == 0)
 	{
-		// Toutes les notes du motif courant, tous canaux confondus.
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		unsigned long long rva = 0;
+		int len = 64;
+		if (sscanf_s (line.c_str () + 5, "%llx %d", &rva, &len) < 1)
+			return "ERR syntaxe PEEK <rva_hex> [longueur]";
+		if (len < 1 || len > 1024)
+			return "ERR longueur 1..1024";
+
+		const unsigned char* p = (const unsigned char*)g_engine + (size_t)rva;
+		if (!isReadable (p, (size_t)len))
+			return "ERR zone illisible";
+
+		std::ostringstream out;
+		out << "PEEK " << (const void*)p << " " << len << " ";
+		char buf[4];
+		for (int i = 0; i < len; ++i)
+		{
+			sprintf_s (buf, "%02x", p[i]);
+			out << buf;
+		}
+		return out.str ();
+	}
+
+	// Suit un pointeur : PEEKPTR <rva_hex>
+	if (line.rfind ("PEEKPTR ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		unsigned long long rva = 0;
+		if (sscanf_s (line.c_str () + 8, "%llx", &rva) != 1)
+			return "ERR syntaxe PEEKPTR <rva_hex>";
+
+		const unsigned char* slot = (const unsigned char*)g_engine + (size_t)rva;
+		if (!isReadable (slot, 8))
+			return "ERR zone illisible";
+
+		const unsigned char* cible = *(const unsigned char* const*)slot;
+		std::ostringstream out;
+		out << "PEEKPTR " << (const void*)cible;
+		if (cible == nullptr || !isReadable (cible, 32))
+			return out.str () + " (non lisible)";
+
+		out << " ";
+		char buf[4];
+		for (int i = 0; i < 32; ++i)
+		{
+			sprintf_s (buf, "%02x", cible[i]);
+			out << buf;
+		}
+		return out.str ();
+	}
+
+	// Sonde de propriete : essayer les deux fonctions d'ecriture de FL.
+	//
+	//   RAWSET      <mode_hex> <handle_hex> <brut>   -> FLEngine+0xC51D60 (7 args)
+	//   RAWDISPATCH <mode_hex> <handle_hex> <brut>   -> FLEngine+0xC46A70 (3 args)
+	//   RAWGET      <mode_hex> <handle_hex>          -> FLEngine+0xC51340 (lecture)
+	//
+	// Constat du 30/10 : 0xC51D60 ne rend jamais la main et n'applique rien ;
+	// 0xC46A70 ecrit correctement. C'est ce qui a fait router toutes les
+	// ecritures de proprietes par le repartiteur.
+	if (line.rfind ("RAWSET ", 0) == 0 || line.rfind ("RAWDISPATCH ", 0) == 0
+	    || line.rfind ("RAWGET ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const bool isSet = (line.rfind ("RAWSET ", 0) == 0);
+		const bool isDispatch = (line.rfind ("RAWDISPATCH ", 0) == 0);
+		const size_t saut = isSet ? 7 : (isDispatch ? 12 : 7);
+
+		unsigned mode = 0;
+		unsigned long long handle = 0;
+		int brut = 0;
+		const int lus = sscanf_s (line.c_str () + saut, "%x %llx %d",
+		                          &mode, &handle, &brut);
+
+		if (isSet || isDispatch)
+		{
+			if (lus < 3)
+				return "ERR syntaxe RAWSET|RAWDISPATCH <mode_hex> <handle_hex> <brut>";
+
+			const unsigned long long debut = GetTickCount64 ();
+			unsigned long faute = 0;
+
+			if (isSet)
+			{
+				using Set7Fn = void (*) (long long, int, int, int, int, int, int);
+				Set7Fn fn = (Set7Fn)((unsigned char*)g_engine + 0xC51D60);
+				faute = guardedSet7 (fn, (long long)handle, brut, (int)mode);
+			}
+			else
+			{
+				using DispatchFn = int (*) (int, int, int);
+				DispatchFn fn = (DispatchFn)((unsigned char*)g_engine + 0xC46A70);
+				fn ((int)handle, brut, (int)mode);
+			}
+
+			const unsigned long long duree = GetTickCount64 () - debut;
+			std::ostringstream out;
+			out << (isSet ? "RAWSET" : "RAWDISPATCH") << " mode=0x" << std::hex << mode
+			    << std::dec << " handle=0x" << std::hex << handle << std::dec
+			    << " brut=" << brut << " ms=" << duree;
+			if (faute != 0)
+				out << " FAUTE=0x" << std::hex << faute << std::dec;
+			else
+				out << " rendu";
+			requestRefresh ();
+			return out.str ();
+		}
+
+		if (lus < 2)
+			return "ERR syntaxe RAWGET <mode_hex> <handle_hex>";
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+		const int valeur = getter ((long long)handle, 0x7FFFFFFF, 1);
+
+		std::ostringstream out;
+		out << "RAWGET mode=0x" << std::hex << mode << std::dec
+		    << " handle=0x" << std::hex << handle << std::dec
+		    << " brut=" << valeur;
+		return out.str ();
+	}
+
+	// Liste des motifs qui existent.
+	//
+	// Un motif existe si le pointeur de liste a +0x28 n'est pas nul. Les trous
+	// sont normaux : verifie le 30/10, les motifs 1, 2, 3 et 5 existaient et le
+	// 4 non (il a ete cree en selectionnant directement le motif 5). Il n'y a
+	// donc pas de "nombre de motifs" a lire : c'est le nombre d'entrees non
+	// nulles de la table.
+	//
+	// Chemin du projet courant.
+	//
+	//   PROJECTPATH  ->  PROJECTPATH <chemin absolu>   ou   PROJECTPATH -
+	//
+	// Adresse obtenue en decompilant le gestionnaire Â« Enregistrer Â»
+	// (FUN_011d0f40, RVA 0xDD0F40) : il passe DAT_016bca50 comme chemin aux
+	// trois branches d'enregistrement. C'est donc la variable du projet courant.
+	if (line == "PROJECTPATH")
+	{
+		// DESACTIVEE le 30/10 : elle repondait Â« - Â» meme sur un projet
+		// enregistre et nomme (verifie sur C:\Temp\Project_1\Project_1.flp,
+		// 47130 o sur disque, globale 0x12BCA50 = 0). Cette globale n'est pas
+		// le chemin du projet : c'est un parametre transitoire de la commande
+		// d'enregistrement. On repond ERR pour que personne ne s'y fie.
+		// Utiliser SAVEPROJECT, qui ecrit a un chemin choisi par l'appelant.
+		return "ERR PROJECTPATH non fiable : utiliser SAVEPROJECT";
+
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const void* const* slot =
+			(const void* const*)((const unsigned char*)g_engine + 0x12BCA50);
+		if (!isReadable (slot, 8))
+			return "ERR chemin illisible";
+
+		const wchar_t* p = (const wchar_t*)*slot;
+		if (p == nullptr)
+			return "PROJECTPATH -";
+
+		std::wstring w;
+		for (int k = 0; k < 400; ++k)
+		{
+			if (!isReadable (p + k, sizeof (wchar_t)))
+				break;
+			if (p[k] == 0)
+				break;
+			w.push_back (p[k]);
+		}
+		if (w.empty ())
+			return "PROJECTPATH -";
+
+		char buf[2048] = { 0 };
+		const int n = WideCharToMultiByte (CP_UTF8, 0, w.c_str (), (int)w.size (),
+		                                   buf, (int)sizeof (buf) - 1, nullptr, nullptr);
+		return "PROJECTPATH " + std::string (buf, n > 0 ? (size_t)n : 0);
+	}
+
+	// Ecrit le projet courant dans un fichier donne.
+	//
+	//   SAVEPROJECT <chemin absolu>
+	//
+	// Recopie exactement ce que fait Â« Enregistrer Â», decompile dans
+	// FUN_011d0f40 (RVA 0xDD0F40) :
+	//
+	//   FUN_00f54570(DAT_016bca50, 0x30, DAT_016bca60, DAT_011d10bc)  Enregistrer
+	//   FUN_00f54570(DAT_016bca50, 0x40, DAT_016bca60, DAT_011d10bc)  Enregistrer sous
+	//                  chemin       mode   projet        options
+	//
+	// On relit les deux globales a l'execution plutot que de les coder en dur :
+	// elles appartiennent a FL, pas a nous. L'octet d'options vaut 0x00 : FL
+	// ecrit Â« <chemin>~ Â» puis le renomme en Â« <chemin> Â». On n'y touche pas.
+	//
+	// Contrairement a LOADPROJECT, ceci ne remplace PAS le projet : le plugin
+	// survit, donc la commande peut repondre.
+	if (line.rfind ("SAVEPROJECT ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const std::string chemin = line.substr (12);
+		if (chemin.size () < 5 || chemin.size () > 380)
+			return "ERR syntaxe SAVEPROJECT <chemin absolu>";
+
+		using ToDelphi = void* (*) (void*, const char*);
+		ToDelphi toDelphi = (ToDelphi)((unsigned char*)g_engine + 0x1C6E0);
+
+		// Le chemin est utilise TEL QUEL, en UTF-8 : FL le convertit lui-meme
+		// (FLEngine + 0x1C6E0). Verifie le 30/10 : Â« C:\Temp\Ã©\x.flp Â» passe en
+		// UTF-8 brut (rc=0, fichier cree) et echoue si on le convertit en ANSI.
+		// Avec options 0, FL ecrit Â« <chemin>~ Â» puis le renomme en Â« <chemin> Â».
+		void* chaine = nullptr;
+		toDelphi (&chaine, chemin.c_str ());
+		if (chaine == nullptr)
+			return "ERR chaine chemin";
+
+		// globales de FL, relues a chaque appel
+		const unsigned long long projet =
+			*(const unsigned long long*)((const unsigned char*)g_engine + 0x12BCA60);
+		unsigned char options = 0;
+		const unsigned char* optSlot =
+			(const unsigned char*)g_engine + 0xDD10BC;
+		if (isReadable (optSlot, 1))
+			options = *optSlot;   // 0x00 chez FL : ajoute .flp, ecrit, puis renomme
+
+		// Arguments REELS de FL, captures en interceptant cet ecrivain pendant un
+		// Ctrl+S le 30/10 a 15h : mode = 0, projet = 0, options = 0x20.
+		// Avec eux le fichier fait 47182 o, exactement la taille de celui que FL
+		// ecrit lui-meme. Avec 0x40 / options 0 on n'obtenait qu'un squelette de
+		// 1122 o, que FL refusait ensuite de recharger (rc=5).
+		using SaveFn = int (*) (void*, int, unsigned long long, unsigned char);
+		SaveFn save = (SaveFn)((unsigned char*)g_engine + 0xB54570);
+		const int rc = save (chaine, 0, projet, 0x20);
+
+		if (rc != 0)
+			return "ERR SAVEPROJECT code " + std::to_string (rc);
+
+		// Taille du fichier ecrit. En WIDE : avec une API ANSI, un chemin
+		// accentue renvoyait 0 alors que le fichier existait (verifie le 30/10).
+		WIN32_FILE_ATTRIBUTE_DATA infos;
+		unsigned long long octets = 0;
+		std::wstring large;
+		{
+			const int n = MultiByteToWideChar (CP_UTF8, 0, chemin.c_str (),
+			                                   (int)chemin.size (), nullptr, 0);
+			if (n > 0)
+			{
+				large.resize ((size_t)n);
+				MultiByteToWideChar (CP_UTF8, 0, chemin.c_str (), (int)chemin.size (),
+				                     &large[0], n);
+			}
+		}
+		if (!large.empty ()
+		    && GetFileAttributesExW (large.c_str (), GetFileExInfoStandard, &infos))
+			octets = ((unsigned long long)infos.nFileSizeHigh << 32) | infos.nFileSizeLow;
+
+		return "SAVEPROJECT OK " + std::to_string (octets);
+	}
+
+	// Sonde d'enregistrement : SAVEPROBESAVE <mode_hex> <options> <chemin>
+	//
+	// Sert a essayer les combinaisons sans recompiler. Le mode vient du
+	// gestionnaire de FL (0x30 = Enregistrer, 0x40 = Enregistrer sous,
+	// 0x20 = autre branche), les options de DAT_011d10bc (bit 0 : chemin tel
+	// quel au lieu de Â« + .flp Â» puis renommage).
+	if (line.rfind ("SAVEPROBESAVE ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		unsigned mode = 0;
+		int options = -1;
+		char chemin[400] = { 0 };
+		if (sscanf_s (line.c_str () + 14, "%x %d %399[^\n]", &mode, &options, chemin) < 3)
+			return "ERR syntaxe SAVEPROBESAVE <mode_hex> <options> <chemin>";
+
+		using ToDelphi = void* (*) (void*, const char*);
+		ToDelphi toDelphi = (ToDelphi)((unsigned char*)g_engine + 0x1C6E0);
+		std::string base (chemin);
+		if (options < 0)
+		{
+			const unsigned char* o = (const unsigned char*)g_engine + 0xDD10BC;
+			options = isReadable (o, 1) ? (int)*o : 0;
+		}
+
+		void* chaine = nullptr;
+		toDelphi (&chaine, base.c_str ());
+		if (chaine == nullptr)
+			return "ERR chaine chemin";
+
+		const unsigned long long projet =
+			*(const unsigned long long*)((const unsigned char*)g_engine + 0x12BCA60);
+
+		using SaveFn = int (*) (void*, int, unsigned long long, unsigned char);
+		SaveFn save = (SaveFn)((unsigned char*)g_engine + 0xB54570);
+		const int rc = save (chaine, (int)mode, projet, (unsigned char)options);
+
+		char buf[64];
+		sprintf_s (buf, "SAVEPROBESAVE mode=0x%X options=%d rc=%d", mode, options, rc);
+		return std::string (buf);
+	}
+
+	// Charge un projet .flp, exactement comme Â« Fichier > Ouvrir Â».
+	//
+	//   LOADPROJECT <chemin absolu>
+	//
+	// Sequence obtenue en decompilant FUN_00f54760 (RVA 0xB54760), confirmee par
+	// la chaine Â« Loading FLP file: Â» qu'elle construit :
+	//   flux  = FUN_00513540(classe de flux, 1, chemin, 0x20)
+	//   projet= FUN_00f51fd0(flux, ...)
+	//
+	// Le chemin est converti en chaine Delphi par la meme fonction que pour les
+	// presets de plugin (RVA 0x1C6E0).
+	//
+	// ATTENTION : le projet courant est REMPLACE, donc notre propre instance de
+	// plugin disparait avec lui. La commande ne peut donc pas repondre : la
+	// connexion tombe, c'est le signe que le chargement a demarre.
+	if (line.rfind ("LOADPROJECT ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		const std::string chemin = line.substr (12);
+		if (chemin.size () < 5 || chemin.size () > 380)
+			return "ERR syntaxe LOADPROJECT <chemin .flp absolu>";
+
+		// On ne charge PAS ici : le projet remplace decharge ce plugin, donc
+		// revenir dans cette fonction apres coup revient dans du code libere.
+		// On pose le chemin, la minuterie fait le travail au tick suivant.
+		strncpy_s (g_loadPath, chemin.c_str (), _TRUNCATE);
+		InterlockedExchange (&g_loadStatus, -1);   // Â« en cours Â»
+		InterlockedExchange (&g_loadPending, 1);
+		return "LOADPROJECT planifie (" + std::to_string (chemin.size ()) + " o)";
+	}
+
+	// Etat du dernier chargement de projet.
+	//
+	//   LOADSTATUS  ->  LOADSTATUS <-2| -1|0|rc>
+	//
+	// -2 : aucun chargement demande depuis le demarrage de FL
+	// -1 : en cours (ou bloque : si ca reste -1, le chargeur n a pas rendu)
+	//  0 : charge
+	//  >0 : echec, code rendu par FL (voir docs/POUR-CLAUDE.md)
+	//
+	// La valeur est statique et le DLL est epingle : elle survit au remplacement
+	// de l instance, donc la nouvelle instance lit bien le rc du chargement qui
+	// l a fait naitre.
+	if (line == "LOADSTATUS")
+	{
+		const int etat = (int)InterlockedCompareExchange (&g_loadStatus, 0, 0);
+		return "LOADSTATUS " + std::to_string (etat);
+	}
+
+	// Reponse : "PATTERNS <n>" puis " <motif>:<notes>:<capacite>" par motif.
+	if (line == "PATTERNS")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		int n = 0;
+		std::ostringstream detail;
+		for (int i = 1; i <= 999; ++i)
+		{
+			unsigned char** slot = (unsigned char**)((unsigned char*)g_engine
+			                                         + 0x153FCE0 + (size_t)i * 0xC0 + 0x28);
+			if (!isReadable (slot, 8))
+				break;
+			if (*slot == nullptr)
+				continue;
+			unsigned char* list = noteList (i);
+			if (list == nullptr)
+				continue;
+			detail << " " << i << ":" << *(const int*)(list + 0x14)
+			       << ":" << *(const int*)(list + 0x18);
+			++n;
+		}
+		return "PATTERNS " + std::to_string (n) + detail.str ();
+	}
+
+	// Nom d'un motif.
+	//
+	// La fiche de motif (0xC0 octets) porte a +0x00 un pointeur vers une chaine
+	// UTF-16 terminee par zero. Verifie le 30/10 : "TEST 1" pour le motif 1,
+	// "batterie" pour le 2, chaine vide pour un motif jamais renomme.
+	//
+	// Reponse : "PATTERNNAME <motif> <nom>"
+	if (line.rfind ("PATTERNNAME ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		int pattern = 0;
+		if (sscanf_s (line.c_str () + 12, "%d", &pattern) != 1
+		    || pattern < 1 || pattern > 999)
+			return "ERR syntaxe PATTERNNAME <motif>";
+
+		const unsigned char* rec =
+			(const unsigned char*)g_engine + 0x153FCE0 + (size_t)pattern * 0xC0;
+		if (!isReadable (rec, 0xC0))
+			return "ERR motif hors table";
+
+		const wchar_t* nom = *(const wchar_t* const*)rec;
+		if (nom == nullptr)
+			return "PATTERNNAME " + std::to_string (pattern);
+
+		// Lecture bornee : on ne fait jamais confiance a une chaine non relue.
+		std::wstring w;
+		for (int k = 0; k < 200; ++k)
+		{
+			if (!isReadable (nom + k, sizeof (wchar_t)))
+				break;
+			const wchar_t c = nom[k];
+			if (c == 0)
+				break;
+			w.push_back (c);
+		}
+
+		char buf[1200] = { 0 };
+		const int n = WideCharToMultiByte (CP_UTF8, 0, w.c_str (), (int)w.size (),
+		                                   buf, (int)sizeof (buf) - 1, nullptr, nullptr);
+		std::string utf8 (buf, n > 0 ? (size_t)n : 0);
+		return "PATTERNNAME " + std::to_string (pattern) + " " + utf8;
+	}
+
+	if (line == "NOTES" || line.rfind ("NOTES ", 0) == 0)
+	{
+		// Toutes les notes d'un motif, tous canaux confondus.
+		// "NOTES" = motif courant ; "NOTES <n>" = motif n, meme s'il n'est pas
+		// affiche. C'est ce qui permet de synchroniser TOUS les motifs de
+		// l'hote, pas seulement celui qu'il regarde.
 		// Reponse : "NOTES <motif> <nombre>" puis "t:l:p:v:canal" et "END <nombre>".
-		const int pattern = currentPattern ();
+		const int pattern = (line == "NOTES")
+			? currentPattern ()
+			: (int)strtol (line.c_str () + 6, nullptr, 10);
 		unsigned char* list = noteList (pattern);
 		if (list == nullptr)
 			return "ERR pas de liste de notes pour le motif " + std::to_string (pattern);
@@ -1255,6 +1848,69 @@ static std::string executeCommand (const std::string& line)
 	// Suppression groupee : DELX <canal> <n> <t>:<p> ...
 	// On reconstruit la liste en gardant les notes non visees : O(n) au lieu
 	// de n deplacements memoire. Le canal fait partie de la cible.
+	// Insertion dans un motif DONNE, sans changer le motif courant.
+	//
+	// ADDX ecrit toujours dans currentPattern(). Pour remplir tous les motifs de
+	// l'hote chez l'invite il faut viser une liste precise : la fonction
+	// d'insertion prend le pointeur de liste en premier argument, donc on peut
+	// la nourrir directement avec celle du motif vise.
+	//
+	// Reponse : "ADDEDTO <motif> <canal> <inserees> <avant> <apres>"
+	if (line.rfind ("ADDXTO ", 0) == 0)
+	{
+		if (g_engine == nullptr || g_insertFn == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (7));
+		unsigned channel = 0, pattern = 0, count = 0;
+		if (!(ss >> channel >> pattern >> count))
+			return "ERR syntaxe ADDXTO <canal> <motif> <nombre> <t:l:p:v>...";
+
+		const int total = channelCount ();
+		if (total >= 0 && (int)channel >= total)
+		{
+			std::ostringstream err;
+			err << "ERR canal " << channel << " hors du rack (" << total
+			    << " canal(aux) sur ce poste)";
+			return err.str ();
+		}
+
+		unsigned char* list = noteList ((int)pattern);
+		if (list == nullptr)
+			return "ERR motif " + std::to_string (pattern) + " absent";
+
+		using InsertFn = int (*) (void*, void*);
+		InsertFn fn = (InsertFn)g_insertFn;
+
+		const int before = *(const int*)(list + 0x14);
+		unsigned inserted = 0;
+
+		std::string token;
+		while (ss >> token && inserted < count)
+		{
+			unsigned t = 0, l = 48, p = 60, v = 100;
+			if (sscanf_s (token.c_str (), "%u:%u:%u:%u", &t, &l, &p, &v) < 3)
+				continue;
+
+			unsigned char note[24];
+			fillNote (note, channel, t, l, p, v);
+
+			fn ((void*)list, note);
+			inserted++;
+
+			list = noteList ((int)pattern);
+			if (list == nullptr)
+				break;
+		}
+
+		const int after = list ? *(const int*)(list + 0x14) : -1;
+		std::ostringstream out;
+		out << "ADDEDTO " << pattern << " " << channel << " " << inserted
+		    << " " << before << " " << after;
+		requestRefresh ();
+		return out.str ();
+	}
+
 	if (line.rfind ("DELX ", 0) == 0)
 	{
 		if (g_engine == nullptr)
@@ -1420,6 +2076,118 @@ static std::string executeCommand (const std::string& line)
 		return out.str ();
 	}
 
+	// Memes operations, mais sur un motif DONNE (pas forcement le courant).
+	//
+	// CLEAR et DELX ne savent viser que currentPattern(). Pour aligner un
+	// invite sur TOUS les motifs de l'hote, il faut pouvoir effacer et
+	// supprimer dans une liste precise sans deplacer la vue de l'utilisateur.
+	if (line.rfind ("CLEARTO ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (8));
+		unsigned channel = 0, pattern = 0;
+		if (!(ss >> channel >> pattern))
+			return "ERR syntaxe CLEARTO <canal> <motif>";
+
+		unsigned char* list = noteList ((int)pattern);
+		if (list == nullptr)
+			return "ERR motif " + std::to_string (pattern) + " absent";
+
+		const int total = *(int*)(list + 0x14);
+		if (total <= 0)
+			return "CLEAREDTO " + std::to_string (pattern) + " "
+			       + std::to_string (channel) + " 0 0 0";
+
+		unsigned char* data = *(unsigned char**)(list + 0x08);
+		if (!isReadable (data, (size_t)total * 24))
+			return "ERR donnees illisibles";
+
+		int kept = 0;
+		for (int k = 0; k < total; k++)
+		{
+			unsigned char* note = data + (size_t)k * 24;
+			if ((unsigned)noteChannelOf (note) == channel)
+				continue;
+			if (kept != k)
+				memcpy (data + (size_t)kept * 24, note, 24);
+			kept++;
+		}
+		*(int*)(list + 0x14) = kept;
+		requestRefresh ();
+
+		std::ostringstream out;
+		out << "CLEAREDTO " << pattern << " " << channel << " " << (total - kept)
+		    << " " << total << " " << kept;
+		return out.str ();
+	}
+
+	if (line.rfind ("DELXTO ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		std::istringstream ss (line.substr (7));
+		unsigned channel = 0, pattern = 0, count = 0;
+		if (!(ss >> channel >> pattern >> count))
+			return "ERR syntaxe DELXTO <canal> <motif> <nombre> <t:p>...";
+
+		unsigned char* list = noteList ((int)pattern);
+		if (list == nullptr)
+			return "ERR motif " + std::to_string (pattern) + " absent";
+
+		int total = *(int*)(list + 0x14);
+		if (total <= 0)
+			return "ERR liste vide";
+		unsigned char* data = *(unsigned char**)(list + 0x08);
+		if (!isReadable (data, (size_t)total * 24))
+			return "ERR donnees illisibles";
+
+		std::vector<std::pair<unsigned, unsigned>> targets;
+		std::string token;
+		while (ss >> token && targets.size () < count)
+		{
+			unsigned t = 0, p = 0;
+			if (sscanf_s (token.c_str (), "%u:%u", &t, &p) == 2)
+				targets.push_back (std::make_pair (t, p));
+		}
+
+		int kept = 0;
+		for (int k = 0; k < total; k++)
+		{
+			unsigned char* note = data + (size_t)k * 24;
+			const unsigned nt = *(unsigned*)(note + 0x00);
+			const unsigned np = *(unsigned*)(note + 0x0C);
+			const bool sameChannel = (unsigned)noteChannelOf (note) == channel;
+
+			bool kill = false;
+			for (size_t x = 0; x < targets.size (); x++)
+			{
+				if (sameChannel && targets[x].first == nt && targets[x].second == np)
+				{
+					kill = true;
+					targets.erase (targets.begin () + x);
+					break;
+				}
+			}
+			if (kill)
+				continue;
+
+			if (kept != k)
+				memcpy (data + (size_t)kept * 24, note, 24);
+			kept++;
+		}
+
+		*(int*)(list + 0x14) = kept;
+		requestRefresh ();
+
+		std::ostringstream out;
+		out << "DELETEDXTO " << pattern << " " << channel << " "
+		    << (total - kept) << " " << total << " " << kept;
+		return out.str ();
+	}
+
 	if (line == "TEMPO")
 	{
 		if (g_engine == nullptr)
@@ -1461,6 +2229,36 @@ static std::string executeCommand (const std::string& line)
 		return out.str ();
 	}
 
+	// Mode de lecture : 0 = PAT, 1 = SONG.
+	//   SONGMODE          lit le mode
+	//   SONGMODE <0|1>    bascule s'il le faut
+	if (line == "SONGMODE" || line.rfind ("SONGMODE ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		unsigned char* base = (unsigned char*)g_engine;
+		const int* mode = *(const int* const*)(base + 0x11E0EF0);
+		if (!isReadable (mode, 4))
+			return "ERR mode illisible";
+		if (line == "SONGMODE")
+			return "SONGMODE " + std::to_string (*mode);
+
+		if (roleBloque ())
+			return "ERR action reservee a l'hote";
+
+		int voulu = -1;
+		if (sscanf_s (line.c_str () + 9, "%d", &voulu) != 1 || voulu < 0 || voulu > 1)
+			return "ERR syntaxe SONGMODE <0|1>";
+		if (*mode != voulu)
+		{
+			const unsigned long faute = guardedToggleLoopMode (base);
+			if (faute != 0)
+				return "ERR SONGMODE faute " + std::to_string (faute);
+		}
+		return "SONGMODE OK " + std::to_string (voulu);
+	}
+
 	if (line == "PLAY" || line == "STOP")
 	{
 		// Autorite : ces actions touchent le PROJET, qui appartient a l'hote.
@@ -1471,7 +2269,7 @@ static std::string executeCommand (const std::string& line)
 		if (g_engine == nullptr)
 			return "ERR pas d'adresse";
 
-		// FUN_011CA520(int mode, byte flags) — vraie fonction de transport.
+		// FUN_011CA520(int mode, byte flags) â€” vraie fonction de transport.
 		// mode 1 = lecture, mode 0 = arret.
 		// Ne PAS passer par FUN_00FDD300 (multiplexeur UI) : il prend un
 		// pointeur et fait planter FL hors contexte (verifie le 28/10 a 01h).
@@ -1661,10 +2459,10 @@ static std::string executeCommand (const std::string& line)
 			if (wanted < 0.0) wanted = 0.0;
 			if (wanted > 1.0) wanted = 1.0;
 
-			using SetFn = void (*) (long long, int, int, int, int, int, int);
-			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			using SetFn = int (*) (int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
 			const int raw = (int)(wanted * 1073741824.0 + 0.5);
-			setter (handle, raw, 0x3F5, 0, 0, 0, 0);
+			setter ((int)handle, raw, 0x3F5);
 		}
 
 		using GetFn = int (*) (long long, int, int);
@@ -1697,10 +2495,10 @@ static std::string executeCommand (const std::string& line)
 			if (wanted < -1.0) wanted = -1.0;
 			if (wanted > 1.0) wanted = 1.0;
 
-			using SetFn = void (*) (long long, int, int, int, int, int, int);
-			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			using SetFn = int (*) (int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
 			const int raw = (int)(((wanted + 1.0) / 2.0) * 1073741824.0 + 0.5);
-			setter (handle, raw, 0x3F5, 0, 0, 0, 0);
+			setter ((int)handle, raw, 0x3F5);
 		}
 
 		using GetFn = int (*) (long long, int, int);
@@ -1714,7 +2512,7 @@ static std::string executeCommand (const std::string& line)
 	}
 
 	// Mute d'une piste.
-	// ATTENTION : FL attend l'INVERSE de l'intuitif — 0 = muet, 1 = actif.
+	// ATTENTION : FL attend l'INVERSE de l'intuitif â€” 0 = muet, 1 = actif.
 	// L'etat se lit dans la structure de piste (pas de 0x1478), octet +0x18.
 	if (line.rfind ("TRACKMUTE ", 0) == 0)
 	{
@@ -1769,10 +2567,10 @@ static std::string executeCommand (const std::string& line)
 			if (wanted < -1.0) wanted = -1.0;
 			if (wanted > 1.0) wanted = 1.0;
 
-			using SetFn = void (*) (long long, int, int, int, int, int, int);
-			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			using SetFn = int (*) (int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
 			const int raw = (int)(((wanted + 1.0) / 2.0) * 1073741824.0 + 0.5);
-			setter (handle, raw, 0x3F5, 0, 0, 0, 0);
+			setter ((int)handle, raw, 0x3F5);
 		}
 
 		using GetFn = int (*) (long long, int, int);
@@ -1809,10 +2607,10 @@ static std::string executeCommand (const std::string& line)
 			if (wanted < 0.0) wanted = 0.0;
 			if (wanted > 1.0) wanted = 1.0;
 
-			using SetFn = void (*) (long long, int, int, int, int, int, int);
-			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
+			using SetFn = int (*) (int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
 			const int raw = (int)(wanted * 1073741824.0 + 0.5);
-			setter (handle, raw, 0x3FD, 0, 0, 0, 0);
+			setter ((int)handle, raw, 0x3FD);
 		}
 
 		using GetFn = int (*) (long long, int, int);
@@ -1845,9 +2643,9 @@ static std::string executeCommand (const std::string& line)
 		const long long handle =
 			((long long)track * 0x40 + slot) * 0x10000LL + (long long)index + 0x70008000LL;
 
-		using SetFn = void (*) (long long, int, int, int, int, int, int);
-		SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
-		setter (handle, (int)raw, 0x3FD, 0, 0, 0, 0);
+		using SetFn = int (*) (int, int, int);
+		SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
+		setter ((int)handle, (int)raw, 0x3FD);
 
 		using GetFn = int (*) (long long, int, int);
 		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
@@ -2253,13 +3051,10 @@ unsigned char* best = getClipContainer ();
 		const int sep = getter (base + 0x70001FC2LL, 0x7FFFFFFF, 1);
 
 		int mute = -1;
-		if (track >= 1)
-		{
-			const unsigned char* tracks =
-				*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E06A0);
-			if (isReadable (tracks, (size_t)track * 0x1478 + 0x20))
-				mute = (*(const unsigned char*)(tracks + (size_t)track * 0x1478 + 0x18) != 0) ? 0 : 1;
-		}
+		const unsigned char* tracks =
+			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E06A0);
+		if (isReadable (tracks, (size_t)track * 0x1478 + 0x20))
+			mute = (*(const unsigned char*)(tracks + (size_t)track * 0x1478 + 0x18) != 0) ? 0 : 1;
 
 		char buf[128];
 		sprintf_s (buf, "MIX %d %d %d %d %d", track, vol, pan, sep, mute);
@@ -2318,12 +3113,15 @@ unsigned char* best = getClipContainer ();
 		std::ostringstream out;
 		out << "STATUS " << tempoMilli << " " << (playing ? 1 : 0) << " " << pattern;
 
-		// master (piste 0) : volume, pan, stereo. Pas de mute.
+		// master (piste 0) : son mute est au meme endroit que celui des pistes.
 		{
 			const int mv = getter (0x70001FC0LL, 0x7FFFFFFF, 1);
 			const int mp = getter (0x70001FC1LL, 0x7FFFFFFF, 1);
 			const int ms = getter (0x70001FC2LL, 0x7FFFFFFF, 1);
-			out << " " << mv << ":" << mp << ":" << ms << ":-1";
+			int mute = -1;
+			if (isReadable (tracks, 0x20))
+				mute = (*(const unsigned char*)(tracks + 0x18) != 0) ? 0 : 1;
+			out << " " << mv << ":" << mp << ":" << ms << ":" << mute;
 		}
 
 		for (int track = 1; track <= FM_MIX_TRACKS; track++)
@@ -2366,6 +3164,16 @@ unsigned char* best = getClipContainer ();
 		}
 		out << " " << mx << " " << my << " " << mw << " " << mh;
 		out << " " << (int)(*(const double*)((unsigned char*)g_engine + 0x156EC88));
+
+		// Bouton de souris tenu : tant que l'utilisateur tient une note, l'agent
+		// ne doit ni l'envoyer ni la reecrire. Le clic droit efface des notes.
+		const bool tenu = (GetAsyncKeyState (VK_LBUTTON) & 0x8000) != 0
+		               || (GetAsyncKeyState (VK_RBUTTON) & 0x8000) != 0;
+		out << " " << (tenu ? 1 : 0);
+
+		// Mode de lecture : 0 = PAT, 1 = SONG.
+		const int* modeLecture = *(const int* const*)((unsigned char*)g_engine + 0x11E0EF0);
+		out << " " << (isReadable (modeLecture, 4) ? *modeLecture : -1);
 		return out.str ();
 	}
 
@@ -2579,9 +3387,9 @@ unsigned char* best = getClipContainer ();
 			const double normalise = isPan ? (wanted + 1.0) * 0.5 : wanted;
 			const int raw = (int)(normalise * 1073741824.0 + 0.5);
 
-			using SetFn = void (*) (long long, int, int, int, int, int, int);
-			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
-			setter (handle, raw, 0x3FD, 0, 0, 0, 0);
+			using SetFn = int (*) (int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
+			setter ((int)handle, raw, 0x3FD);
 			requestRefresh ();
 		}
 
@@ -2663,9 +3471,9 @@ unsigned char* best = getClipContainer ();
 		if (ss >> voulu)
 		{
 			// L'ecriture attend l'echelle 2^30 : 0 = muet, 2^30 = actif.
-			using SetFn = void (*) (long long, int, int, int, int, int, int);
-			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC51D60);
-			setter (handle, voulu ? 1073741824 : 0, 0x3FD, 0, 0, 0, 0);
+			using SetFn = int (*) (int, int, int);
+			SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
+			setter ((int)handle, voulu ? 1073741824 : 0, 0x3FD);
 			requestRefresh ();
 		}
 
@@ -2691,6 +3499,342 @@ unsigned char* best = getClipContainer ();
 	// s'ouvre vraiment, et le module du VST est charge dans FL.
 	// Canal vide (Sampler), pour garder les positions du rack alignees quand
 	// l'instrument de l'autre poste n'existe pas ici.
+	// Supprime un canal du rack.
+	//
+	//   DELCHANNEL <index> [brut]
+	//
+	// 46-o : on ne refait plus le travail de FL a la main. On appelle sa propre
+	// suppression de canal, FUN_01004a60 (RVA 0xC04A60), exactement comme son
+	// interface le fait (voir FUN_01004a60 : elle construit un contexte par
+	// FUN_010049f0 puis appelle FUN_01004820).
+	//
+	// Ce qu'elle fait, MESURE en direct le 30/10 sur FL 26.1.7 (v46-o) :
+	//   - enregistre l'operation dans l'historique (Â« Delete channel <nom> Â») ;
+	//   - detache puis LIBERE l'objet canal ;
+	//   - retire l'entree de la liste maitresse ;
+	//   - renumerote +0x794 des canaux restants (mesure : 1 -> 0) ;
+	//   - RETIRE les notes du canal et RENUMEROTE celles des canaux suivants
+	//     dans tous les motifs (mesure : 3 notes -> 2, canal 1 -> canal 0) ;
+	//   - reconstruit le rack (FUN_01185ED0) et NOTE les vues (FUN_00fdf060).
+	//     C'est cette notification-la qui remet a jour les objets d'affichage
+	//     dont le +0x18 pointait le canal supprime : l'oubli qui faisait
+	//     planter FL des le premier rafraichissement (0xED7D36, lecture a
+	//     [RAX+0x38c] avec RAX nul apres le getter FUN_00fe8bf0).
+	//
+	// Donc : plus de notes a renumeroter nous-memes (ce serait un double
+	// decalage), plus de liste a decaler, plus de canal a laisser fuir.
+	//
+	// Â« brut Â» garde l'ancien chemin (decalage + renumerotation a la main) :
+	// il sert de temoin pour comparer, et de repli sans recompiler.
+	if (line.rfind ("DELCHANNEL ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		int index = -1;
+		if (sscanf_s (line.c_str () + 11, "%d", &index) != 1)
+			return "ERR syntaxe DELCHANNEL <index>";
+
+		const bool manuel = (line.find ("brut") != std::string::npos);
+
+		// LISTE MAITRESSE (RVA 0x11E2218), PAS celle que lit CHANNELS (0x11E0128).
+		// Verifie le 30/10 : decrementer la liste de 0x11E0128 ne sert a rien,
+		// la reconstruction (0xD85ED0) la repeuple depuis la maitresse â€” le
+		// canal supprime revenait aussitot.
+		const unsigned char* pm =
+			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E2218);
+		if (!isReadable (pm, 8))
+			return "ERR liste maitresse illisible";
+		unsigned char* conteneur = *(unsigned char* const*)pm;
+		if (!isReadable (conteneur, 0x18))
+			return "ERR conteneur illisible";
+
+		const int n = *(const int*)(conteneur + 0x10);
+		if (index < 0 || index >= n)
+			return "ERR index " + std::to_string (index) + " hors rack ("
+			       + std::to_string (n) + " canal(aux))";
+
+		void** tab = *(void***)(conteneur + 0x08);
+		if (!isReadable (tab, (size_t)n * 8))
+			return "ERR tableau illisible";
+
+		// ---- chemin par defaut (46-o) : c'est FL qui supprime -------------
+		if (!manuel)
+		{
+			// Comptage en LECTURE SEULE, uniquement pour rendre la meme
+			// reponse qu'avant (l'agent lit ces trois nombres par position).
+			int notesSupprimees = 0;
+			int notesDecalees = 0;
+			for (int pat = 1; pat <= 999; ++pat)
+			{
+				unsigned char* list = noteList (pat);
+				if (list == nullptr)
+					continue;
+				const int total = *(const int*)(list + 0x14);
+				if (total <= 0)
+					continue;
+				const unsigned char* data = *(const unsigned char**)(list + 0x08);
+				if (!isReadable (data, (size_t)total * 24))
+					continue;
+				for (int k = 0; k < total; ++k)
+				{
+					const int ch = noteChannelOf (data + (size_t)k * 24);
+					if (ch == index)
+						notesSupprimees++;
+					else if (ch > index)
+						notesDecalees++;
+				}
+			}
+
+			using DeleteFn = void (*) (unsigned, int, unsigned long long);
+			DeleteFn supprimer = (DeleteFn)((unsigned char*)g_engine + 0xC04A60);
+			const unsigned long faute =
+				guardedDeleteChannel (supprimer, (unsigned)index);
+
+			if (faute != 0)
+			{
+				std::ostringstream err;
+				err << "ERR suppression refusee : FAUTE=0x"
+				    << std::hex << faute << std::dec;
+				return err.str ();
+			}
+
+			requestRefresh ();
+
+			// FL garantit qu'il reste au moins un canal : s'il n'en restait
+			// qu'un, la suppression en recree un. On relit donc le compte
+			// reel au lieu d'annoncer n-1.
+			const int reste = isReadable (conteneur, 0x18)
+				? *(const int*)(conteneur + 0x10) : (n - 1);
+
+			std::ostringstream out;
+			out << "DELCHANNEL OK " << index << " (" << n << " -> " << reste
+			    << ", " << notesSupprimees << " note(s) retiree(s), "
+			    << notesDecalees << " decalee(s))";
+			return out.str ();
+		}
+
+		// ---- chemin Â« brut Â» : l'ancien travail a la main -----------------
+		// Garde comme temoin (il laisse les objets d'affichage perimes, donc
+		// il plante au rafraichissement : c'est ce qu'on a corrige).
+		for (int k = index; k < n - 1; ++k)
+			tab[k] = tab[k + 1];
+		tab[n - 1] = nullptr;
+		*(int*)(conteneur + 0x10) = n - 1;
+
+		// RENUMEROTATION. Chaque canal porte son propre numero a +0x794, et
+		// c'est lui qui sert a fabriquer l'identifiant de mixeur (numero << 16).
+		// Sans cette boucle, le canal restant garde son ancien numero : verifie
+		// le 30/10, CHANNELS affichait encore Â« 2 Â» et CHANNELMIX rendait des
+		// valeurs absurdes (pan -1.00016) parce que le handle visait le mauvais
+		// emplacement.
+		for (int k = index; k < n - 1; ++k)
+		{
+			unsigned char* ch = (unsigned char*)tab[k];
+			if (ch == nullptr || !isReadable (ch + 0x794, 4))
+				continue;
+			*(int*)(ch + 0x794) = k;
+		}
+
+		// RENUMEROTATION DES NOTES, dans TOUS les motifs.
+		//
+		// Chaque note porte son canal a +0x06 (voir fillNote). Sans cette passe :
+		//   - les notes des canaux suivants visent le mauvais instrument ;
+		//   - celles du canal supprime restent orphelines sur un canal qui
+		//     n'existe plus.
+		int notesSupprimees = 0;
+		int notesDecalees = 0;
+		for (int pat = 1; pat <= 999; ++pat)
+		{
+			unsigned char* list = noteList (pat);
+			if (list == nullptr)
+				continue;
+			const int total = *(const int*)(list + 0x14);
+			if (total <= 0)
+				continue;
+			unsigned char* data = *(unsigned char**)(list + 0x08);
+			if (!isReadable (data, (size_t)total * 24))
+				continue;
+
+			int kept = 0;
+			for (int k = 0; k < total; ++k)
+			{
+				unsigned char* note = data + (size_t)k * 24;
+				const unsigned ch = (unsigned)noteChannelOf (note);
+				if ((int)ch == index)
+				{
+					notesSupprimees++;
+					continue;
+				}
+				if ((int)ch > index)
+				{
+					*(unsigned short*)(note + 0x06) = (unsigned short)(ch - 1);
+					notesDecalees++;
+				}
+				if (kept != k)
+					memcpy (data + (size_t)kept * 24, note, 24);
+				kept++;
+			}
+			*(int*)(list + 0x14) = kept;
+		}
+
+		// reconstruction des listes de FL
+		using RebuildFn = void (*) ();
+		RebuildFn rebuild = (RebuildFn)((unsigned char*)g_engine + 0xD85ED0);
+		rebuild ();
+
+		requestRefresh ();
+		return "DELCHANNEL OK " + std::to_string (index) + " (" + std::to_string (n)
+		       + " -> " + std::to_string (n - 1) + ", " + std::to_string (notesSupprimees)
+		       + " note(s) retiree(s), " + std::to_string (notesDecalees)
+		       + " decalee(s))";
+	}
+
+	// Copie un canal entier (sample, plugin, reglages) dans un fichier .fst.
+	//   SAVECHANNEL <index> <chemin absolu>
+	if (line.rfind ("SAVECHANNEL ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		int index = -1;
+		int lu = 0;
+		if (sscanf_s (line.c_str () + 12, "%d %n", &index, &lu) != 1 || lu == 0)
+			return "ERR syntaxe SAVECHANNEL <index> <chemin>";
+		const std::string chemin = line.substr (12 + (size_t)lu);
+		if (chemin.size () < 8 || chemin.size () > 500)
+			return "ERR syntaxe SAVECHANNEL <index> <chemin>";
+
+		unsigned char* base = (unsigned char*)g_engine;
+
+		const unsigned char* pm = *(const unsigned char* const*)(base + 0x11E2218);
+		if (!isReadable (pm, 8))
+			return "ERR liste maitresse illisible";
+		unsigned char* conteneur = *(unsigned char* const*)pm;
+		if (!isReadable (conteneur, 0x18))
+			return "ERR conteneur illisible";
+
+		const int n = *(const int*)(conteneur + 0x10);
+		if (index < 0 || index >= n)
+			return "ERR index " + std::to_string (index) + " hors rack ("
+			       + std::to_string (n) + " canal(aux))";
+
+		void** tab = *(void***)(conteneur + 0x08);
+		if (!isReadable (tab, (size_t)n * 8) || !isReadable (tab[index], 0x800))
+			return "ERR canal illisible";
+
+		using ToDelphi = void* (*) (void*, const char*);
+		void* nomFichier = nullptr;
+		((ToDelphi)(base + 0x1C6E0)) (&nomFichier, chemin.c_str ());
+		if (nomFichier == nullptr)
+			return "ERR chaine chemin";
+
+		unsigned long faute = 0;
+		const int rc = guardedSaveChannel ((ChannelFileFn)(base + 0xB54570), nomFichier,
+		                                   tab[index], &faute);
+		if (faute != 0)
+		{
+			char code[16];
+			sprintf_s (code, "0x%08lX", faute);
+			return std::string ("ERR SAVECHANNEL faute ") + code;
+		}
+		if (rc != 0)
+			return "ERR SAVECHANNEL code " + std::to_string (rc);
+		return "SAVECHANNEL OK " + std::to_string (index);
+	}
+
+	// Recree un canal depuis un fichier .fst de SAVECHANNEL.
+	//   LOADCHANNEL <index> <chemin absolu>[|<nom>]
+	// Le canal est insere a <index> (ramene a la fin du rack s'il depasse).
+	//   REPLACECHANNEL <index> <chemin absolu>[|<nom>]
+	// Le meme contenu, dans le canal <index> : ses notes ne bougent pas.
+	const bool remplaceCanal = line.rfind ("REPLACECHANNEL ", 0) == 0;
+	if (remplaceCanal || line.rfind ("LOADCHANNEL ", 0) == 0)
+	{
+		const size_t debut = remplaceCanal ? 15 : 12;
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		int index = -1;
+		int lu = 0;
+		if (sscanf_s (line.c_str () + debut, "%d %n", &index, &lu) != 1 || lu == 0 || index < 0)
+			return "ERR syntaxe LOADCHANNEL <index> <chemin>[|<nom>]";
+		std::string chemin = line.substr (debut + (size_t)lu);
+		std::string nom;
+		const size_t barre = chemin.find ('|');
+		if (barre != std::string::npos)
+		{
+			nom = chemin.substr (barre + 1);
+			chemin.resize (barre);
+		}
+		if (chemin.size () < 8 || chemin.size () > 500)
+			return "ERR syntaxe LOADCHANNEL <index> <chemin>[|<nom>]";
+
+		unsigned char* base = (unsigned char*)g_engine;
+
+		const unsigned char* pm = *(const unsigned char* const*)(base + 0x11E2218);
+		if (!isReadable (pm, 8))
+			return "ERR liste maitresse illisible";
+		const unsigned char* conteneur = *(const unsigned char* const*)pm;
+		if (!isReadable (conteneur, 0x18))
+			return "ERR conteneur illisible";
+		const int n = *(const int*)(conteneur + 0x10);
+		void* existant = nullptr;
+		if (remplaceCanal)
+		{
+			if (index >= n)
+				return "ERR index " + std::to_string (index) + " hors rack ("
+				       + std::to_string (n) + " canal(aux))";
+			void** tab = *(void***)(conteneur + 0x08);
+			if (!isReadable (tab, (size_t)n * 8) || !isReadable (tab[index], 0x800))
+				return "ERR canal illisible";
+			existant = tab[index];
+		}
+		else if (index > n)
+			index = n;
+
+		using ToDelphi = void* (*) (void*, const char*);
+		ToDelphi toDelphi = (ToDelphi)(base + 0x1C6E0);
+		void* nomFichier = nullptr;
+		toDelphi (&nomFichier, chemin.c_str ());
+		if (nomFichier == nullptr)
+			return "ERR chaine chemin";
+
+		using InsertFn = void* (*) (int, int, int);
+		int rc = 0;
+		unsigned long faute = 0;
+		unsigned char* channel = (unsigned char*)guardedLoadChannel (
+			(InsertFn)(base + 0xC04230), (ChannelFileFn)(base + 0xB54760), existant, index,
+			nomFichier, &rc, &faute);
+		if (faute != 0)
+		{
+			char code[16];
+			sprintf_s (code, "0x%08lX", faute);
+			return std::string ("ERR LOADCHANNEL faute ") + code;
+		}
+		if (channel == nullptr || !isReadable (channel, 0x800))
+			return "ERR creation du canal";
+		if (rc != 0)
+			return "ERR LOADCHANNEL code " + std::to_string (rc);
+
+		if (!nom.empty ())
+		{
+			void* nomCanal = nullptr;
+			toDelphi (&nomCanal, nom.c_str ());
+			void** vtable = *(void***)channel;
+			if (nomCanal != nullptr && isReadable (vtable + 0x70 / 8, 8))
+				((void (*) (void*, void*))vtable[0x70 / 8]) (channel, nomCanal);
+		}
+
+		// Fin de l'annulation de FL : FUN_00e39560 sur son objet global.
+		void* const* vue = *(void* const* const*)(base + 0x11E35C8);
+		if (isReadable (vue, 8) && *vue != nullptr)
+			((void (*) (void*))(base + 0xA39560)) (*vue);
+
+		requestRefresh ();
+		return "LOADCHANNEL OK " + std::to_string (*(const int*)(channel + 0x794));
+	}
+
 	if (line == "NEWCHANNEL")
 	{
 		if (g_engine == nullptr)
@@ -2931,6 +4075,194 @@ static void applyClipLength (unsigned pos, unsigned len)
 	}
 }
 
+// Arrete tout ce que ce plugin fait tourner en dehors du thread de FL.
+//
+// Indispensable avant un chargement de projet : le projet remplace decharge
+// notre DLL, et si un seul de nos threads vit encore a ce moment-la, son code
+// disparait sous ses pieds. C'est le plantage Â« FruityMultiBridge.vst3_unloaded Â»
+// observe trois fois le 30/10 (offsets 0x18baa, 0x1569b, 0x156f6).
+// Rend false si un thread n'a pas pu etre arrete : dans ce cas il ne faut PAS
+// appeler le chargeur. Sinon on lui passe un thread encore vivant qui attend une
+// reponse du thread principal â€” celui-la meme qui va entrer dans le chargeur.
+// C'est l'incident du 30/10 14h49 : Â« arret : serveur -> 258 Â» (WAIT_TIMEOUT)
+// suivi d'un chargement qui n'a jamais rendu la main.
+static bool arreterNosThreads ()
+{
+	bool calme = true;
+	if (g_timerId != 0)
+	{
+		KillTimer (nullptr, g_timerId);
+		destroyWakeWindow ();
+		g_timerId = 0;
+		logLine ("arret : minuterie coupee");
+	}
+
+	InterlockedExchange (&g_serverWanted, 0);
+	InterlockedExchange (&g_stopServer, 1);
+
+	if (g_srv != INVALID_SOCKET)
+	{
+		closesocket (g_srv);
+		g_srv = INVALID_SOCKET;
+	}
+	if (g_cursorWnd != nullptr)
+		PostMessageA (g_cursorWnd, WM_CLOSE, 0, 0);
+	if (g_barThreadId != 0)
+		PostThreadMessageA ((DWORD)g_barThreadId, WM_QUIT, 0, 0);
+	if (g_cursorThreadId != 0)
+		PostThreadMessageA ((DWORD)g_cursorThreadId, WM_QUIT, 0, 0);
+
+	if (g_serverThread != nullptr)
+	{
+		const DWORD r = WaitForSingleObject (g_serverThread, 1500);
+		logLine ("arret : serveur -> %lu", (unsigned long)r);
+		if (r == WAIT_TIMEOUT)
+			calme = false;
+		CloseHandle (g_serverThread);
+		g_serverThread = nullptr;
+	}
+	if (g_cursorThread != nullptr)
+	{
+		const DWORD r = WaitForSingleObject (g_cursorThread, 1500);
+		logLine ("arret : curseur -> %lu", (unsigned long)r);
+		if (r == WAIT_TIMEOUT)
+			calme = false;
+		CloseHandle (g_cursorThread);
+		g_cursorThread = nullptr;
+	}
+	if (g_barThread != nullptr)
+	{
+		const DWORD r = WaitForSingleObject (g_barThread, 1500);
+		logLine ("arret : barre -> %lu", (unsigned long)r);
+		if (r == WAIT_TIMEOUT)
+			calme = false;
+		CloseHandle (g_barThread);
+		g_barThread = nullptr;
+	}
+	logLine ("arret : threads arretes : %s", calme ? "oui" : "NON");
+	return calme;
+}
+
+// Relance ce que arreterNosThreads() a coupe.
+//
+// Sert uniquement quand un chargement de projet a ECHOUE : l'instance existe
+// encore, il faut lui rendre sa minuterie et son serveur. Quand le chargement
+// a reussi, terminate() a detruit l'instance et on ne relance rien.
+static void demarrerNosThreads ()
+{
+	if (kShowToolbar && g_barThread == nullptr)
+	{
+		HANDLE bar = CreateThread (nullptr, 0, barThread, nullptr, 0, nullptr);
+		if (bar != nullptr)
+			g_barThread = bar;
+	}
+	if (g_cursorThread == nullptr)
+	{
+		HANDLE cursor = CreateThread (nullptr, 0, cursorThread, nullptr, 0, nullptr);
+		if (cursor != nullptr)
+			g_cursorThread = cursor;
+	}
+	if (g_serverThread == nullptr)
+	{
+		HANDLE thread = CreateThread (nullptr, 0, serverThread, nullptr, 0, nullptr);
+		if (thread != nullptr)
+			g_serverThread = thread;
+		else
+			logLine ("relance          : CreateThread serveur echec");
+	}
+}
+
+// Charge le projet pose par LOADPROJECT.
+//
+// Tourne sur le thread principal de FL, depuis la minuterie : aucune commande
+// n'attend de reponse, donc le remplacement du projet peut decharger ce plugin
+// sans que la pile d'appel revienne dans du code libere.
+static void doLoadProject ()
+{
+	if (g_engine == nullptr)
+		return;
+
+	// EPINGLE le DLL dans le processus, avant tout le reste.
+	//
+	// Charger un projet detruit notre plugin : FL appelle terminate() PUIS
+	// decharge le DLL, alors que notre pile d'appel y est encore (mesure du
+	// 30/10 : Â« decharge Â» 12 ms apres l'appel au chargeur). Sans epinglage,
+	// le retour de fonction atterrit dans du code demappe â€” c'est la faute
+	// Â« FruityMultiBridge.vst3_unloaded Â» vue trois fois.
+	//
+	// GET_MODULE_HANDLE_EX_FLAG_PIN : le module reste charge jusqu'a la fin du
+	// processus. Cout : quelques Mo qui ne sont pas rendus. Prix acceptable
+	// pour que le chargement d'un projet ne tue pas FL.
+	HMODULE soi = nullptr;
+	GetModuleHandleExA (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+	                    | GET_MODULE_HANDLE_EX_FLAG_PIN,
+	                    (LPCSTR)(const void*)&doLoadProject, &soi);
+	logLine ("chargement : DLL epingle -> %p", (void*)soi);
+
+	// TOUT doit etre arrete avant : le chargement remplace le projet, donc FL
+	// decharge ce DLL juste apres. Un seul thread survivant = faute dans du
+	// code demappe.
+	logLine ("chargement : arret des threads avant LOADPROJECT");
+	if (!arreterNosThreads ())
+	{
+		// Un thread n'a pas voulu mourir (typiquement le serveur qui traite une
+		// commande). Charger maintenant lui passerait un thread vivant qui attend
+		// le thread principal, lequel entre dans le chargeur : blocage garanti.
+		InterlockedExchange (&g_loadStatus, -3);
+		logLine ("chargement : ANNULE (thread encore vivant) -> on relance");
+		InterlockedExchange (&g_stopServer, 0);
+		InterlockedExchange (&g_serverWanted, 1);
+		g_timerId = SetTimer (nullptr, 0, 6, fmTimerProc);
+		demarrerNosThreads ();
+		return;
+	}
+	logLine ("chargement : appel du chargeur de FL");
+
+	using ToDelphi = void* (*) (void*, const char*);
+	ToDelphi toDelphi = (ToDelphi)((unsigned char*)g_engine + 0x1C6E0);
+	void* chaine = nullptr;
+	toDelphi (&chaine, g_loadPath);
+
+	int rc = -1;
+	if (chaine != nullptr)
+	{
+		using LoadFn = int (*) (void*, int, int, int);
+		LoadFn load = (LoadFn)((unsigned char*)g_engine + 0xB54760);
+		rc = load (chaine, 0, 0, 0);
+	}
+
+	// Le resultat est publie AVANT toute autre chose : c est ce que la nouvelle
+	// instance (si le chargement a reussi) doit lire via LOADSTATUS.
+	InterlockedExchange (&g_loadStatus, rc);
+
+	// On arrive ici dans deux cas tres differents :
+	//  - le chargement a echoue (fichier refuse, chemin invalide) : l'instance
+	//    existe encore, il FAUT relancer minuterie et serveur, sinon le plugin
+	//    reste muet pour de bon ;
+	//  - le chargement a reussi : FL a appele terminate(), l'instance est
+	//    detruite et on ne doit surtout plus rien relancer.
+	//
+	// Le drapeau g_instanceDead, pose par terminate(), tranche entre les deux.
+	//
+	// En pratique on se fie au CODE : rc=0 = projet charge, donc la nouvelle
+	// instance a deja sa minuterie et son serveur (journal du 30/10 15h10 :
+	// Â« decharge Â» puis Â« charge dans FL Â»). Le drapeau seul ne suffisait pas :
+	// initialize() de la nouvelle instance le remet a 0, et on relancait des
+	// threads sur l'ancienne instance morte.
+	if (rc != 0 && InterlockedCompareExchange (&g_instanceDead, 0, 0) == 0)
+	{
+		logLine ("chargement : rc=%d -> relance des threads", rc);
+		InterlockedExchange (&g_stopServer, 0);
+		InterlockedExchange (&g_serverWanted, 1);
+		g_timerId = SetTimer (nullptr, 0, 6, fmTimerProc);
+		demarrerNosThreads ();
+	}
+	else
+	{
+		logLine ("chargement : rc=%d, instance detruite -> rien a relancer", rc);
+	}
+}
+
 static void processPending ()
 {
 	std::vector<std::shared_ptr<Request>> work;
@@ -3140,6 +4472,7 @@ public:
 		// globales survivent. Sans cette remise a zero, l'ancien drapeau
 		// d'arret tue le nouveau serveur des sa creation.
 		InterlockedExchange (&g_stopServer, 0);
+		InterlockedExchange (&g_instanceDead, 0);
 
 		// Sans cela, Windows arrondit Sleep() et SetTimer() a 15,6 ms : chaque
 		// commande attendait un tic complet. 1 ms rend les 6 ms effectifs.
@@ -3231,7 +4564,7 @@ public:
 
 		// Preparation de l'ecriture : thread principal + minuterie.
 		// Un timer cree depuis ce thread delivre ses tops sur ce meme thread,
-		// a condition que celui-ci pompe les messages — c'est le cas du thread
+		// a condition que celui-ci pompe les messages â€” c'est le cas du thread
 		// principal de FL.
 		HWND flWindow = findFlMainWindow ();
 		g_flMainThreadId =
@@ -3267,7 +4600,11 @@ public:
 
 		HANDLE thread = CreateThread (nullptr, 0, serverThread, nullptr, 0, nullptr);
 		if (thread != nullptr)
-			CloseHandle (thread);
+			// On GARDE le handle : sans lui, terminate() ne peut pas attendre ce
+			// thread, et FL decharge le DLL pendant qu'il tourne encore. C'est
+			// exactement le plantage observe le 30/10 a 13h35 (faute dans
+			// FruityMultiBridge.vst3_unloaded).
+			g_serverThread = thread;
 		else
 			logLine ("serveur          : CreateThread echec");
 
@@ -3315,6 +4652,7 @@ public:
 	// minuterie et notre thread serveur tournent encore -> plantage.
 	tresult PLUGIN_API terminate () SMTG_OVERRIDE
 	{
+		InterlockedExchange (&g_instanceDead, 1);
 		if (g_timerId != 0)
 		{
 			KillTimer (nullptr, g_timerId);

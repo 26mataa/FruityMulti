@@ -17,24 +17,57 @@ connexion ouverte et on serialise les commandes.
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import os
+import re
 import socket
 import sys
 import threading
 import time
+import zlib
 from collections import Counter
 
 # --- Mises a jour -----------------------------------------------------------
 # Le depot public qui heberge les versions. L'agent y lit la derniere release
 # et telecharge le plugin + lui-meme. A incrementer a chaque publication.
 DEPOT = "26mataa/FruityMulti"
-AGENT_VERSION = 30
+AGENT_VERSION = 47
 ADRESSE_RELEASES = f"https://github.com/{DEPOT}/releases/latest"
 
 PLUGIN_HOST = "127.0.0.1"
 PLUGIN_PORT = 47831
 POLL = 0.005
+
+# Echange du projet : l'invite charge le .flp de l'hote a la connexion.
+MORCEAU_PROJET = 128 * 1024        # deux morceaux tiennent dans une trame
+TAILLE_PROJET_MAX = 64 * 1024 * 1024
+TAILLE_PROJET_MIN = 4096           # en dessous : pas un vrai projet (voir plus bas)
+DELAI_SAUVEGARDE = 60.0            # gros projet : FL peut mettre du temps
+DELAI_CHOIX = 120.0                # l'invite a deux minutes pour repondre
+DELAI_COUPURE = 15.0               # apres LOADPROJECT, le plugin tombe vite
+DELAI_RETOUR_PLUGIN = 300.0        # Zenology et consorts : des dizaines de s
+DELAI_STABILITE = 60.0
+DELAI_VEILLE = 5.0                 # le plugin coupe un client muet a 20 s
+DELAI_ECHO_TRANSPORT = 1.0
+TOUCHENT_NOTES = ("add", "del", "pattern", "reset", "delchannels", "racklist",
+                  "canal_debut", "canal_morceau")
+# Un canal part en entier : son .fst (reglages du plugin) et son sample.
+TAILLE_CANAL_MAX = 8 * 1024 * 1024
+TAILLE_SAMPLE_MAX = 4 * 1024 * 1024   # le relais passe 3 Mo en 47 s, les notes attendent
+EVT_SAMPLE = 0xC4
+EVT_TYPE_CANAL = 0x15
+EVT_NOM_PLUGIN = 0xC9
+EVT_NOUVEAU_PLUGIN = 0xD4
+EVT_ETAT_PLUGIN = 0xD5
+PLUGIN_ENVELOPPE = "Fruity Wrapper"   # VST et VST3 : le vrai nom est dans l'etat
+VARIABLE_USINE = "%FLStudioFactoryData%"
+VARIABLE_UTILISATEUR = "%FLStudioUserData%"
+# DELCHANNEL ne sauvegarde pas le canal comme le fait FL : annuler ensuite son
+# insertion plante FL (POUR-CLAUDE, 13.15). Le canal reste chez l'autre.
+SUPPRESSION_RECUE = False
+SAUVEGARDES_GARDEES = 10
 
 
 # --------------------------------------------------------------------------
@@ -52,15 +85,43 @@ DOSSIERS_VST2 = [r"C:\Program Files\VstPlugins",
                  r"C:\VST", r"C:\VSTPlugins"]
 
 
+def _racines_image_line():
+    """Documents n'est pas toujours dans le profil (OneDrive) : FL note le vrai
+    dossier dans le registre, et Windows connait le sien."""
+    racines = []
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Image-Line\Shared\Paths") as cle:
+            racines.append(winreg.QueryValueEx(cle, "Shared data")[0])
+    except (ImportError, OSError):
+        pass
+    try:
+        import ctypes
+        tampon = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, tampon) == 0:
+            racines.append(os.path.join(tampon.value, "Image-Line"))
+    except (AttributeError, OSError):
+        pass
+    racines.append(os.path.expanduser("~\\Documents\\Image-Line"))
+    return racines
+
+
 def _dossiers_fl():
-    doc = os.path.expanduser("~\\Documents")
-    bases = [os.path.join(doc, "Image-Line", "FL Studio", "Presets",
-                          "Plugin database"),
-             os.path.join(doc, "Image-Line", "FL Studio 21", "Presets",
-                          "Plugin database"),
-             os.path.join(doc, "Image-Line", "FL Studio 20", "Presets",
-                          "Plugin database")]
-    return [b for b in bases if os.path.isdir(b)]
+    bases = []
+    for racine in _racines_image_line():
+        for version in ("FL Studio", "FL Studio 21", "FL Studio 20"):
+            base = os.path.join(racine, version, "Presets", "Plugin database")
+            connus = [os.path.normcase(b) for b in bases]
+            if os.path.isdir(base) and os.path.normcase(base) not in connus:
+                bases.append(base)
+    return bases
+
+
+def _sous_arbres(base, arbre):
+    """FL range ses plugins dans <arbre>, ceux que l'utilisateur a installes
+    dans Installed\\<arbre>."""
+    return [os.path.join(base, arbre), os.path.join(base, "Installed", arbre)]
 
 
 def scan_plugins():
@@ -68,13 +129,11 @@ def scan_plugins():
     fl, vst3, vst2 = set(), set(), set()
 
     for base in _dossiers_fl():
-        generateurs = os.path.join(base, "Generators")
-        if not os.path.isdir(generateurs):
-            continue
-        for _racine, _dossiers, fichiers in os.walk(generateurs):
-            for fichier in fichiers:
-                if fichier.lower().endswith(".fst"):
-                    fl.add(os.path.splitext(fichier)[0])
+        for generateurs in _sous_arbres(base, "Generators"):
+            for _racine, _dossiers, fichiers in os.walk(generateurs):
+                for fichier in fichiers:
+                    if fichier.lower().endswith(".fst"):
+                        fl.add(os.path.splitext(fichier)[0])
 
     for dossier in DOSSIERS_VST3:
         if not os.path.isdir(dossier):
@@ -121,6 +180,26 @@ def dossier_local():
     except OSError:
         pass
     return dossier
+
+
+def sous_dossier_local(nom):
+    dossier = os.path.join(dossier_local(), nom)
+    try:
+        os.makedirs(dossier, exist_ok=True)
+    except OSError:
+        pass
+    return dossier
+
+
+def garder_recentes(dossier, nombre):
+    """Ne garde que les `nombre` fichiers les plus recents du dossier."""
+    try:
+        fichiers = [os.path.join(dossier, nom) for nom in os.listdir(dossier)]
+        fichiers.sort(key=os.path.getmtime, reverse=True)
+        for chemin in fichiers[nombre:]:
+            os.remove(chemin)
+    except OSError:
+        pass
 
 
 def ecrire_compat(commun, ici_seul, autre_seul):
@@ -174,6 +253,12 @@ def copier_presse_papier(texte):
 
 
 # --------------------------------------------------------------------------
+def nom_generique(nom):
+    """Un canal cree par NEWCHANNEL n'a pas de nom ; ceux de FL, "Sampler"."""
+    cle = (nom or "").strip().lower()
+    return not cle or cle.startswith("sampler")
+
+
 def meme_nom(a, b):
     """Deux noms de canal designent-ils le meme instrument ?
 
@@ -201,16 +286,79 @@ class Plugin:
 
     def __init__(self, host=PLUGIN_HOST, port=PLUGIN_PORT):
         self._presets = None
+        self.host = host
+        self.port = port
         self.sock = socket.create_connection((host, port), timeout=5.0)
         self.sock.settimeout(5.0)
         self.buf = b""
         self.lock = threading.Lock()
+        self.veille = None
+
+    def veiller(self):
+        """Le plugin coupe un client muet au bout de 20 s, et personne ne lui
+        parle tant que l'invite n'est pas la."""
+        if self.veille is not None:
+            return
+        arret = threading.Event()
+
+        def boucle():
+            while not arret.wait(DELAI_VEILLE):
+                try:
+                    self.ping()
+                except (OSError, IndexError):
+                    # une reponse en retard decalerait toutes les suivantes
+                    try:
+                        self.reconnecter()
+                    except OSError:
+                        pass
+
+        fil = threading.Thread(target=boucle, daemon=True)
+        self.veille = (arret, fil)
+        fil.start()
+
+    def fin_veille(self):
+        if self.veille is None:
+            return
+        arret, fil = self.veille
+        self.veille = None
+        arret.set()
+        fil.join()
+
+    def reconnecter(self):
+        """Connexion neuve sur le meme objet : plugin recharge, ou reponse en
+        retard qui decalerait toutes les suivantes."""
+        with self.lock:
+            self.close()
+            self.buf = b""
+            self.sock = socket.create_connection((self.host, self.port),
+                                                 timeout=5.0)
+            self.sock.settimeout(5.0)
 
     def close(self):
         try:
             self.sock.close()
         except OSError:
             pass
+
+    def attendre_fermeture(self, delai):
+        """Vrai quand le plugin coupe la connexion. Sans RIEN envoyer : sa
+        minuterie est deja arretee, une commande ne recevrait jamais de reponse
+        et son thread serveur resterait bloque dessus."""
+        limite = time.monotonic() + delai
+        with self.lock:
+            self.sock.settimeout(0.2)
+            try:
+                while time.monotonic() < limite:
+                    try:
+                        if not self.sock.recv(4096):
+                            return True
+                    except TimeoutError:
+                        pass
+            except OSError:
+                return True
+            finally:
+                self.sock.settimeout(5.0)
+        return False
 
     def _readline(self):
         while b"\n" not in self.buf:
@@ -222,31 +370,59 @@ class Plugin:
         self.buf = rest
         return line.decode("utf-8", "replace").strip()
 
-    def cmd(self, text):
+    def cmd(self, text, delai=None):
         with self.lock:
-            # UTF-8 : un simple tiret cadratin suffisait a faire planter
-            # l'agent, qui parlait ASCII.
-            self.sock.sendall((text + "\n").encode("utf-8"))
-            first = self._readline()
-            lines = [first]
-            # Reponses multilignes : NOTES <motif> <n> ... END <n>
-            if text.strip() == "POLL":
-                while True:
-                    nxt = self._readline()
-                    lines.append(nxt)
-                    if nxt.startswith("END"):
-                        break
-            elif first.startswith("LIST") or first.startswith("NOTES "):
-                while True:
-                    nxt = self._readline()
-                    lines.append(nxt)
-                    if nxt.startswith("END"):
-                        break
-            return lines
+            if delai is not None:
+                self.sock.settimeout(delai)
+            try:
+                # UTF-8 : un simple tiret cadratin suffisait a faire planter
+                # l'agent, qui parlait ASCII.
+                self.sock.sendall((text + "\n").encode("utf-8"))
+                first = self._readline()
+                lines = [first]
+                # Reponses multilignes : NOTES <motif> <n> ... END <n>
+                if text.strip() == "POLL":
+                    while True:
+                        nxt = self._readline()
+                        lines.append(nxt)
+                        if nxt.startswith("END"):
+                            break
+                elif first.startswith("LIST") or first.startswith("NOTES "):
+                    while True:
+                        nxt = self._readline()
+                        lines.append(nxt)
+                        if nxt.startswith("END"):
+                            break
+                return lines
+            finally:
+                if delai is not None:
+                    self.sock.settimeout(5.0)
 
     # -- raccourcis --------------------------------------------------------
     def ping(self):
         return self.cmd("PING")[0] == "OK"
+
+    def sauver_projet(self, chemin):
+        """Ecrit le projet ouvert dans `chemin`. None si c'est fait, sinon la
+        raison.
+
+        Le "OK" du plugin ne suffit pas : de mauvais arguments ont longtemps
+        produit un squelette de 1122 octets, en-tete valide, que FL refuse de
+        recharger. Le projet de l'invite ne repose que sur ce fichier."""
+        reponse = self.cmd(f"SAVEPROJECT {chemin}", delai=DELAI_SAUVEGARDE)[0]
+        if not reponse.startswith("SAVEPROJECT OK"):
+            return reponse
+        try:
+            with open(chemin, "rb") as fichier:
+                entete = fichier.read(4)
+            taille = os.path.getsize(chemin)
+        except OSError as exc:
+            return f"fichier illisible ({exc})"
+        if entete != b"FLhd":
+            return "ce n'est pas un projet FL"
+        if taille < TAILLE_PROJET_MIN:
+            return f"fichier incomplet ({taille} octets)"
+        return None
 
     def state(self):
         """Notes du motif courant, groupees par canal.
@@ -453,7 +629,7 @@ class Plugin:
                 "vol": int(mvol) / 1073741824.0,
                 "pan": (int(mpan) / 1073741824.0) * 2.0 - 1.0,
                 "stereo": (int(msep) / 1073741824.0) * 2.0 - 1.0,
-                "mute": -1,
+                "mute": int(mmute),
             }
             for index, token in enumerate(parts[5:5 + 16], start=1):
                 vol, pan, sep, mute = token.split(":")
@@ -473,6 +649,8 @@ class Plugin:
                 "mix": mix,
                 "mouse": (mx, my, mw, mh),
                 "position": position,
+                "clic": len(parts) > 26 and parts[26] == "1",
+                "mode": int(parts[27]) if len(parts) > 27 else -1,
             }
         except (ValueError, IndexError):
             return None
@@ -493,7 +671,7 @@ class Plugin:
         """
         try:
             lines = self.cmd("POLL")
-        except (OSError, TimeoutError, IndexError):
+        except IndexError:
             return None, None
         if not lines or not lines[0].startswith("STATUS "):
             return None, None
@@ -526,20 +704,18 @@ class Plugin:
             return None
         if not line.startswith("CHANNELS "):
             return None
-        parts = line.split()
+        # format : index:tranche:nom, separes par une espace. Le nom peut
+        # contenir des espaces : on coupe sur les entetes, pas sur les blancs
+        # (sinon "FL Keys" devenait "FL", et "Kick 808" et "Kick 909" le
+        # meme canal).
+        _, _, suite = line.partition(" ")
+        _, _, suite = suite.partition(" ")
+        entetes = list(re.finditer(r"(?:^| )(\d+):(-?\d+):", suite))
         out = []
-        for token in parts[2:]:
-            # format : index:tranche:nom  (le nom peut contenir des ':')
-            bits = token.split(":", 2)
-            if len(bits) < 2:
-                continue
-            try:
-                index = int(bits[0])
-                track = int(bits[1])
-            except ValueError:
-                continue
-            name = bits[2] if len(bits) > 2 else ""
-            out.append((index, track, name))
+        for k, entete in enumerate(entetes):
+            fin = entetes[k + 1].start() if k + 1 < len(entetes) else len(suite)
+            out.append((int(entete.group(1)), int(entete.group(2)),
+                        suite[entete.end():fin]))
         return out
 
     def channel_mix(self):
@@ -587,30 +763,24 @@ class Plugin:
         except (OSError, TimeoutError, IndexError):
             return None
 
-    def preset_paths(self):
-        """Table nom -> chemin absolu des presets .fst de FL."""
-        if self._presets is not None:
-            return self._presets
-        table = {}
-        for base in _dossiers_fl():
-            for arbre in ("Generators", "Installed"):
-                racine = os.path.join(base, arbre)
-                if not os.path.isdir(racine):
-                    continue
-                for dossier, _sous, fichiers in os.walk(racine):
-                    for fichier in fichiers:
-                        if fichier.lower().endswith(".fst"):
-                            nom = os.path.splitext(fichier)[0].lower()
-                            table.setdefault(nom, os.path.join(dossier, fichier))
-        self._presets = table
-        return table
-
     def new_channel(self):
         """Cree un canal vide (Sampler). Sert a garder les positions alignees."""
         return self.cmd("NEWCHANNEL")[0]
 
     def load_plugin(self, chemin):
         return self.cmd(f"LOADPLUGIN {chemin}")[0]
+
+    def save_channel(self, index, chemin):
+        return self.cmd(f"SAVECHANNEL {index} {chemin}")[0]
+
+    def load_channel(self, index, chemin, nom=""):
+        return self.cmd(f"LOADCHANNEL {index} {chemin}|{nom}")[0]
+
+    def replace_channel(self, index, chemin, nom=""):
+        return self.cmd(f"REPLACECHANNEL {index} {chemin}|{nom}")[0]
+
+    def delete_channel(self, index):
+        return self.cmd(f"DELCHANNEL {index}")[0]
 
     def effects(self):
         """Effets du mixeur : {(tranche, slot): nom}.
@@ -660,14 +830,12 @@ class Plugin:
             return self._presets[arbre]
         table = {}
         for base in _dossiers_fl():
-            racine = os.path.join(base, arbre)
-            if not os.path.isdir(racine):
-                continue
-            for dossier, _sous, fichiers in os.walk(racine):
-                for fichier in fichiers:
-                    if fichier.lower().endswith(".fst"):
-                        nom = os.path.splitext(fichier)[0].lower()
-                        table.setdefault(nom, os.path.join(dossier, fichier))
+            for racine in _sous_arbres(base, arbre):
+                for dossier, _sous, fichiers in os.walk(racine):
+                    for fichier in fichiers:
+                        if fichier.lower().endswith(".fst"):
+                            nom = os.path.splitext(fichier)[0].lower()
+                            table.setdefault(nom, os.path.join(dossier, fichier))
         self._presets[arbre] = table
         return table
 
@@ -780,6 +948,177 @@ class Plugin:
 
 
 # --------------------------------------------------------------------------
+def canaux_retires(avant, apres):
+    """Positions de `avant` disparues de `apres`, ou None si le rack a change
+    autrement qu'en perdant des canaux (ajout, deplacement, renommage)."""
+    retires = []
+    suivant = 0
+    for position, canal in enumerate(avant):
+        if suivant < len(apres) and apres[suivant] == canal:
+            suivant += 1
+        else:
+            retires.append(position)
+    return retires if suivant == len(apres) else None
+
+
+def decaler_notes(notes, retires):
+    """Notes par canal, renumerotees comme FL apres la suppression de `retires`."""
+    sortie = {}
+    for canal, liste in notes.items():
+        if canal not in retires:
+            sortie[canal - sum(1 for r in retires if r < canal)] = liste
+    return sortie
+
+
+def inserer_notes(notes, ajoutes):
+    """L'inverse : des canaux sont revenus aux positions `ajoutes` (Ctrl+Z)."""
+    sortie = {}
+    for canal, liste in notes.items():
+        for position in sorted(ajoutes):
+            if canal >= position:
+                canal += 1
+        sortie[canal] = liste
+    return sortie
+
+
+def canaux_absents(voulus, locaux):
+    """Canaux de `voulus` sans homonyme dans `locaux`, dans l'ordre du rack."""
+    noms = Counter((n or "").strip().lower() for _i, _t, n in locaux)
+    absents = []
+    for canal in voulus:
+        cle = (canal[2] or "").strip().lower()
+        if noms[cle] > 0:
+            noms[cle] -= 1
+        else:
+            absents.append(canal)
+    return absents
+
+
+def evenements_fl(brut):
+    """Evenements d'un .fst ou .flp : (identifiant, debut, valeur, fin)."""
+    if brut[:4] != b"FLhd":
+        raise ValueError("pas un fichier FL")
+    pos = 8 + int.from_bytes(brut[4:8], "little")
+    if brut[pos:pos + 4] != b"FLdt":
+        raise ValueError("pas de bloc FLdt")
+    pos += 8
+    while pos < len(brut):
+        debut = pos
+        ev = classe = brut[pos]
+        pos += 1
+        if ev == 0xAC:
+            # Identifiant sur 32 bits : la classe est dans les 4 bits hauts.
+            ev = int.from_bytes(brut[pos:pos + 4], "little")
+            classe = (ev >> 24) & 0xF0
+            pos += 4
+        if classe >= 0xC0:
+            taille = decalage = 0
+            while True:
+                octet = brut[pos]
+                pos += 1
+                taille |= (octet & 0x7F) << decalage
+                decalage += 7
+                if not octet & 0x80:
+                    break
+        else:
+            taille = 1 if classe < 0x40 else 2 if classe < 0x80 else 4
+        yield ev, debut, pos, pos + taille
+        pos += taille
+
+
+def chemin_sample(brut):
+    """Chemin du sample d'un canal, tel que FL l'a ecrit dans le .fst."""
+    for ev, _debut, valeur, fin in evenements_fl(brut):
+        if ev == EVT_SAMPLE:
+            return brut[valeur:fin].decode("utf-16-le", "replace").rstrip("\0") or None
+    return None
+
+
+def modifier_evenements(brut, neufs):
+    """Le meme .fst avec d'autres valeurs : {identifiant: octets, None = retire}."""
+    bloc = 8 + int.from_bytes(brut[4:8], "little")
+    corps = bytearray()
+    for ev, debut, valeur, fin in evenements_fl(brut):
+        if ev not in neufs:
+            corps += brut[debut:fin]
+        elif neufs[ev] is None:
+            continue
+        elif ev < 0xC0:
+            corps += brut[debut:valeur] + neufs[ev]
+        else:
+            corps.append(ev)
+            reste = len(neufs[ev])
+            while True:
+                octet = reste & 0x7F
+                reste >>= 7
+                corps.append(octet | (0x80 if reste else 0))
+                if not reste:
+                    break
+            corps += neufs[ev]
+    return brut[:bloc + 4] + len(corps).to_bytes(4, "little") + bytes(corps)
+
+
+def remplacer_sample(brut, chemin):
+    """Le meme .fst, avec le sample a un autre endroit."""
+    return modifier_evenements(brut, {EVT_SAMPLE: (chemin + "\0").encode("utf-16-le")})
+
+
+def plugin_requis(brut):
+    """(nom, chemin) du plugin d'un canal, None pour un canal sans plugin.
+
+    Un VST passe par l'enveloppe de FL : son etat est une suite de blocs
+    (identifiant 32 bits, taille 64 bits), 54 = nom, 55 = chemin.
+    """
+    nom = etat = None
+    for ev, _debut, valeur, fin in evenements_fl(brut):
+        if ev == EVT_NOM_PLUGIN:
+            nom = brut[valeur:fin].decode("utf-16-le", "replace").rstrip("\0")
+        elif ev == EVT_ETAT_PLUGIN:
+            etat = brut[valeur:fin]
+    if not nom:
+        return None
+    if nom != PLUGIN_ENVELOPPE or etat is None:
+        return nom, ""
+    chemin = ""
+    pos = 4
+    while pos + 12 <= len(etat):
+        bloc = int.from_bytes(etat[pos:pos + 4], "little")
+        taille = int.from_bytes(etat[pos + 4:pos + 12], "little")
+        contenu = etat[pos + 12:pos + 12 + taille]
+        if bloc == 54:
+            nom = contenu.decode("utf-8", "replace")
+        elif bloc == 55:
+            chemin = contenu.decode("utf-8", "replace")
+        pos += 12 + taille
+    return nom, chemin
+
+
+def sans_plugin(brut):
+    """Le meme canal sans son plugin : FL affiche sinon une boite bloquante
+    (plugin introuvable) tant que personne ne clique dessus."""
+    neufs = {EVT_NOM_PLUGIN: b"\0\0", EVT_ETAT_PLUGIN: None, EVT_TYPE_CANAL: b"\0"}
+    for ev, _debut, valeur, fin in evenements_fl(brut):
+        if ev == EVT_NOUVEAU_PLUGIN:
+            neufs[ev] = brut[valeur:valeur + 8] + b"\xff\xff\xff\xff" + brut[valeur + 12:fin]
+            break
+    return modifier_evenements(brut, neufs)
+
+
+def fichier_sample(chemin):
+    """Fichier a joindre pour ce sample. Rien pour ceux livres avec FL : l'autre
+    les a au meme endroit logique."""
+    if not chemin or chemin.startswith(VARIABLE_USINE):
+        return None
+    if chemin.startswith(VARIABLE_UTILISATEUR):
+        reste = chemin[len(VARIABLE_UTILISATEUR):].lstrip("\\/")
+        for racine in _racines_image_line():
+            complet = os.path.join(racine, "FL Studio", reste)
+            if os.path.isfile(complet):
+                return complet
+        return None
+    return chemin if os.path.isfile(chemin) else None
+
+
 def diff_additions(old, new):
     """Notes presentes dans `new` mais pas dans `old`."""
     co, cn = Counter(old), Counter(new)
@@ -793,18 +1132,45 @@ def diff_removals(old, new):
 
 
 class Sync:
-    def __init__(self, plugin, link, is_host):
+    def __init__(self, plugin, link, is_host, pair=None, annonces=(), code="",
+                 accepter_projet=False):
         self.plugin = plugin
         self.link = link
         self.is_host = is_host
-        self.snapshot = plugin.state()
-        self.tempo = plugin.tempo()
-        self.playing = plugin.playing()
-        self.pattern = plugin.pattern()
+        self.annonces = list(annonces)   # STATE a redire a un plugin recharge
+        self.code = code
+        self.accepter_projet = accepter_projet
+        self.poste_pair = (pair or {}).get("poste", "?")
         self.incoming = []
         self.incoming_lock = threading.Lock()
         self.sent_initial = False
         self.label = "host" if is_host else "guest"
+        self.sent_plugins = False
+        self._presets = None
+        self.my_plugins = None
+        self.peer_plugins = None
+        # None = pas encore teste, False = plugin sans POLL
+        self.supports_poll = None
+        # Echange du projet. Hote : a_offrir, offert, envoye. Invite : attente,
+        # choix, reception, chargement. None = pas d'echange en cours.
+        self.projet_file = []
+        self.projet_attendu = None
+        self.projet_morceaux = {}
+        self.projet_pourcent = 0
+        self.projet_limite = 0.0
+        self.projet_lecture = 0.0
+        self.projet_etat = None
+        if pair and pair.get("projet"):
+            self.projet_etat = "a_offrir" if is_host else "attente"
+        self.lire_projet()
+
+    def lire_projet(self):
+        """Tout ce que l'agent sait du projet ouvert. Rappele apres un
+        chargement : plus rien de ce qu'on savait n'est vrai."""
+        self.snapshot = self.plugin.state()
+        self.tempo = self.plugin.tempo()
+        self.playing = self.plugin.playing()
+        self.pattern = self.plugin.pattern()
         self.mix = {}
         self.last_mix = 0.0
         self.clips = None            # None = pas encore lu
@@ -821,6 +1187,9 @@ class Sync:
         # correspondance par nom entre les deux racks
         self.carte_hote_vers_local = {}
         self.carte_local_vers_hote = {}
+        self.rack_hote = []
+        self.signature_rack = None   # (index, nom) au dernier passage
+        self.canal_recu = None
         self.averti_noms = set()
         self.position = None
         self.channels_state = None
@@ -828,18 +1197,16 @@ class Sync:
         self.channels_warned = None
         self.last_channels = 0.0
         self.channel_mix_state = None
-        self.sent_plugins = False
-        self._presets = None
-        self.my_plugins = None
-        self.peer_plugins = None
         self.last_channel_mix = 0.0
         # effets du mixeur : etat connu et cadence (une requete par seconde)
         self.role_sent = False
-        # None = pas encore teste, False = plugin sans POLL
-        self.supports_poll = None
         # valeur de reference venue de l'hote (l'invite s'y ramene)
         self.host_tempo = None
-        self.host_playing = None
+        self.transport_limite = 0.0
+        self.mode = None             # 0 = PAT, 1 = SONG
+        self.mode_limite = 0.0
+        self.clic = False
+        self.notes_retenues = []
         self.host_pattern = None
         self.fx = None
         self.fx_attendus = {}
@@ -886,6 +1253,20 @@ class Sync:
         """
         self.publish(message)
 
+    def publier_rack(self, channels=None):
+        """Rack complet de l'hote, d'un bloc et dans l'ordre : c'est ce qui
+        permet a l'invite de s'aligner et de faire correspondre les canaux."""
+        if channels is None:
+            channels = self.plugin.channels()
+        if channels is None:
+            return
+        self.signature_rack = [(i, n) for i, _t, n in channels]
+        self.publish_global({"type": "channelcount", "n": len(channels)})
+        if channels:
+            self.publish_global({"type": "racklist",
+                                 "channels": [[int(i), int(t), name or ""]
+                                              for i, t, name in channels]})
+
     def send_plugins(self):
         """Envoie l'inventaire des plugins, une seule fois par session."""
         if self.sent_plugins:
@@ -901,6 +1282,26 @@ class Sync:
         total = sum(len(inventaire[k]) for k in ("fl", "vst3", "vst2"))
         print(f"[plugins] {total} plugin(s) sur ce poste")
         self.publish_global({"type": "plugins", "inventaire": inventaire})
+
+    def publier_reglages(self):
+        """Tempo, motif, transport et position : ce qui ne se rejoue pas."""
+        tempo = self.plugin.tempo()
+        if tempo:
+            self.publish_global({"type": "tempo", "bpm": tempo})
+        pattern = self.plugin.pattern()
+        if pattern is not None:
+            self.publish_global({"type": "pattern", "n": pattern})
+        playing = self.plugin.playing()
+        if playing is not None:
+            self.publish_global({"type": "transport", "playing": playing})
+        # sans la position, l'invite demarre au debut alors que l'hote est
+        # ailleurs
+        status = self.plugin.status()
+        if status:
+            self.publish_global({"type": "songpos", "pos": status["position"]})
+            if status.get("mode", -1) >= 0:
+                self.publish_global({"type": "songmode", "mode": status["mode"]})
+        return tempo
 
     def push_all(self):
         """Envoi de l'etat complet (a la connexion). L'HOTE fait foi.
@@ -919,32 +1320,20 @@ class Sync:
         # l'invite doit repartir de zero, sinon ses notes s'ajoutent aux notres
         self.publish_global({"type": "reset"})
 
+        # Le rack part avant les notes : l'invite en a besoin pour savoir sur
+        # quel canal les ecrire.
+        self.publier_rack()
+
         total = 0
         for channel, notes in self.snapshot.items():
             if notes:
                 self.publish({"type": "add", "ch": channel, "notes": notes})
                 total += len(notes)
 
-        tempo = self.plugin.tempo()
-        if tempo:
-            self.publish_global({"type": "tempo", "bpm": tempo})
-        pattern = self.plugin.pattern()
-        if pattern is not None:
-            self.publish_global({"type": "pattern", "n": pattern})
-        playing = self.plugin.playing()
-        if playing is not None:
-            self.publish_global({"type": "transport", "playing": playing})
+        tempo = self.publier_reglages()
 
         channels = self.plugin.channels()
-        if channels is not None:
-            self.publish_global({"type": "channelcount", "n": len(channels)})
         if channels:
-            # Le rack part d'un bloc, dans l'ordre : c'est ce qui permet a
-            # l'invite de le reconstruire a l'identique (meme ordre, donc memes
-            # index) au lieu de recevoir des canaux un par un.
-            self.publish_global({"type": "racklist",
-                                 "channels": [[int(i), int(t), name or ""]
-                                              for i, t, name in channels]})
             for index, track, name in channels:
                 self.publish_global({"type": "channeltrack", "index": index,
                                      "track": track})
@@ -965,12 +1354,6 @@ class Sync:
                                      "vol": round(volume, 5),
                                      "pan": round(pan, 5), "mute": mute})
 
-        # la position de lecture fait partie de l'etat initial : sans elle,
-        # l'invite demarre au debut alors que l'hote est ailleurs.
-        status = self.plugin.status()
-        if status:
-            self.publish_global({"type": "songpos", "pos": status["position"]})
-
         # tranche 0 = master : oubliee tant que la boucle commencait a 1.
         for track in range(0, 17):
             state = self.plugin.mix_state(track)
@@ -984,17 +1367,44 @@ class Sync:
 
     def on_message(self, message):
         with self.incoming_lock:
-            self.incoming.append(message)
+            kind = str(message.get("type", ""))
+            if kind.startswith("projet_"):
+                if kind == "projet_debut":
+                    # Ce qui precede est dans le fichier. Ce qui suit attend
+                    # ici et sera rejoue une fois le projet charge.
+                    self.incoming.clear()
+                self.projet_file.append(message)
+            else:
+                self.incoming.append(message)
 
     def drain(self):
         with self.incoming_lock:
             pending, self.incoming = self.incoming, []
         return pending
 
-    def apply_incoming(self):
+    def apply_incoming(self, seulement=None):
         applied = 0
-        for message in self.drain():
+        messages = self.drain()
+        if seulement is None:
+            messages = self.notes_retenues + messages
+            self.notes_retenues = []
+            if self.clic:
+                # L'utilisateur tient peut-etre une note : la reecrire sous sa
+                # souris annulerait son geste. Ca attend le relachement.
+                self.notes_retenues = [m for m in messages
+                                       if m.get("type") in TOUCHENT_NOTES]
+                messages = [m for m in messages
+                            if m.get("type") not in TOUCHENT_NOTES]
+        touche_notes = any(m.get("type") in TOUCHENT_NOTES for m in messages)
+        if touche_notes and seulement is None:
+            # Ce qui n'est pas encore parti doit partir avant : la relecture
+            # de la fin l'effacerait sinon, sans que le pair le recoive jamais.
+            self.envoyer_notes(self.plugin.state())
+
+        for message in messages:
             kind = message.get("type")
+            if seulement is not None and kind not in seulement:
+                continue
             # "ch" = canal du piano roll. Les anciens messages portaient "list".
             index = message.get("ch", message.get("list", 0))
 
@@ -1063,8 +1473,21 @@ class Sync:
                     print(f"[sync] transport refuse : {reply}")
                 else:
                     print(f"[sync] transport applique : {'lecture' if want else 'arret'}")
-                self.playing = self.plugin.playing()
-                self.host_playing = want
+                # ce changement vient du pair : detect_local ne doit pas le lui
+                # renvoyer, ni la position que l'arret vient de remettre au debut
+                self.playing = want
+                self.transport_limite = time.monotonic() + DELAI_ECHO_TRANSPORT
+
+            elif kind == "songmode":
+                mode = int(message.get("mode", 0))
+                reply = self.plugin.cmd_force(f"SONGMODE {mode}")[0]
+                if reply.startswith("ERR"):
+                    print(f"[sync] mode refuse : {reply}")
+                else:
+                    print(f"[sync] mode applique : {'SONG' if mode else 'PAT'}")
+                # FL l'applique un peu apres : le STATUS suivant dit encore l'ancien
+                self.mode = mode
+                self.mode_limite = time.monotonic() + DELAI_ECHO_TRANSPORT
 
             elif kind == "songpos":
                 position = int(message.get("pos", 0))
@@ -1077,8 +1500,8 @@ class Sync:
                 print(f"[sync] l'autre a {self.peer_channels} canal(aux)")
 
             elif kind == "channelmix":
-                index = int(message.get("index", -1))
-                if index >= 0:
+                index = self.index_local(int(message.get("index", -1)))
+                if index is not None and index >= 0:
                     if "vol" in message:
                         self.plugin.set_channel_volume(index,
                                                        float(message["vol"]))
@@ -1126,7 +1549,7 @@ class Sync:
                 self.send_plugins ()
                 applied += 1
 
-            elif kind == "racklist":
+            elif kind == "racklist" and not self.is_host:
                 # Rack complet de l'hote, dans l'ordre. On s'aligne pour que les
                 # index veuillent dire la meme chose des deux cotes.
                 wanted = [(int(i), int(t), str(n))
@@ -1137,43 +1560,52 @@ class Sync:
                 print(f"[rack] l'hote a {len(wanted)} canal(aux), "
                       f"j'en ai {len(local)}")
                 crees = 0
-                for index, track, name in wanted:
-                    if index >= len(local) + crees:
-                        chemin = self.plugin.find_preset(name) if name else None
-                        if chemin:
-                            print(f"[rack] creation de '{name}' "
-                                  f"(position {index})")
-                            self.plugin.load_plugin(chemin)
+                manque = len(wanted) - len(local)
+                # Pas forcement les derniers : Ctrl+Z ramene un canal au milieu.
+                a_creer = canaux_absents(wanted, local)[-manque:] if manque > 0 else []
+                for index, track, name in a_creer:
+                    chemin = self.plugin.find_preset(name) if name else None
+                    if chemin:
+                        print(f"[rack] creation de '{name}' "
+                              f"(position {index})")
+                        self.plugin.load_plugin(chemin)
+                        crees += 1
+                    else:
+                        # Sans l'instrument, on cree quand meme un canal
+                        # vide : il recevra les notes de celui de l'hote.
+                        try:
+                            self.plugin.new_channel()
                             crees += 1
-                        else:
-                            # Sans l'instrument, on cree quand meme un canal
-                            # vide : sinon les suivants remontent d'une
-                            # position et tout le rack est decale.
-                            try:
-                                self.plugin.new_channel()
-                                crees += 1
-                                print(f"[rack] '{name}' absent de ce poste — "
-                                      f"canal vide cree pour garder la position")
-                            except (OSError, TimeoutError, IndexError):
-                                print(f"[rack] '{name}' absent et canal vide "
-                                      f"impossible : les positions suivantes "
-                                      f"seront decalees")
-                        continue
-                    if index < len(local):
-                        lindex, ltrack, lname = local[index]
-                        if name and not meme_nom(lname, name):
-                            print(f"[rack] ATTENTION : position {index} = "
-                                  f"'{lname}' chez moi, '{name}' chez l'hote")
-                        if ltrack != track:
-                            self.plugin.set_channel_track(lindex, track)
-                fresh = self.plugin.channels()
-                if fresh is not None:
-                    self.channels_state = {i: t for i, t, _ in fresh}
-                self.construire_carte(wanted)
+                            print(f"[rack] '{name}' absent de ce poste — "
+                                  f"canal vide cree pour garder la position")
+                        except (OSError, TimeoutError, IndexError):
+                            print(f"[rack] '{name}' absent et canal vide "
+                                  f"impossible : les positions suivantes "
+                                  f"seront decalees")
+                fresh = self.plugin.channels() or []
+                self.construire_carte(wanted, fresh)
+                tranches = {i: t for i, t, _ in fresh}
+                for index, track, _name in wanted:
+                    cible = self.index_local(index)
+                    if cible in tranches and tranches[cible] != track:
+                        self.plugin.set_channel_track(cible, track)
+                        tranches[cible] = track
+                self.channels_state = tranches
+                self.signature_rack = [(i, n) for i, _t, n in fresh]
                 if crees:
                     print(f"[rack] {crees} canal(aux) cree(s) — "
                           f"verifie l'ordre a l'ecran")
                 applied += 1
+
+            elif kind == "canal_debut":
+                self.canal_recu = dict(message, recus=[])
+
+            elif kind == "canal_morceau" and self.canal_recu:
+                self.canal_recu["recus"].append(base64.b64decode(message.get("d", "")))
+                if len(self.canal_recu["recus"]) >= int(self.canal_recu.get("morceaux", 0)):
+                    recu, self.canal_recu = self.canal_recu, None
+                    self.recevoir_canal(recu)
+                    applied += 1
 
             elif kind == "addchannel":
                 nom = str(message.get("name", "")).strip()
@@ -1199,6 +1631,9 @@ class Sync:
                     else:
                         print(f"[plugins] '{nom}' introuvable sur ce poste")
                     applied += 1
+
+            elif kind == "delchannels":
+                applied += self.retirer_canaux(message.get("indices", []))
 
             elif kind == "fx":
                 t = int(message.get("track", -1))
@@ -1251,9 +1686,9 @@ class Sync:
                     applied += 1
 
             elif kind == "channeltrack":
-                index = int(message.get("index", -1))
+                index = self.index_local(int(message.get("index", -1)))
                 track = int(message.get("track", -1))
-                if index >= 0 and 0 <= track <= 125:
+                if index is not None and index >= 0 and 0 <= track <= 125:
                     self.plugin.set_channel_track(index, track)
                     if self.channels_state is not None:
                         self.channels_state[index] = track
@@ -1404,7 +1839,8 @@ class Sync:
         if applied:
             self.plugin.refresh()
             # On relit l'etat pour ne pas renvoyer au pair ce qu'il vient d'envoyer.
-            self.snapshot = self.plugin.state()
+            if touche_notes:
+                self.snapshot = self.plugin.state()
 
             # Meme chose pour les clips : sans cette relecture, le clip recu
             # etait vu comme "nouveau chez moi" au cycle suivant et renvoye a
@@ -1443,11 +1879,12 @@ class Sync:
 
         if st is None:
             st = self.plugin.status()
+        self.clic = bool(st and st.get("clic"))
 
-        # --- Autorite : sur ces trois reglages, l'HOTE FAIT FOI ------------
+        # --- Autorite : tempo et motif, l'HOTE FAIT FOI ---------------------
         # L'invite ne les envoie jamais. S'il les change chez lui, on le
         # ramene a la valeur de l'hote : c'est visible, et ca evite qu'une
-        # session parte chacun de son cote.
+        # session parte chacun de son cote. Le transport, lui, est a tous.
         current_tempo = st["tempo"] if st else None
         if current_tempo is not None:
             if self.is_host:
@@ -1462,17 +1899,24 @@ class Sync:
 
         current_playing = st["playing"] if st else None
         if current_playing is not None:
-            if self.is_host:
-                if self.playing is not None and current_playing != self.playing:
-                    self.publish_global({"type": "transport", "playing": current_playing})
-                    print(f"[sync] transport envoye : {'lecture' if current_playing else 'arret'}")
-                    changed += 1
-            elif (self.host_playing is not None
-                  and current_playing != self.host_playing):
-                self.plugin.cmd_force("PLAY" if self.host_playing else "STOP")
-                print(f"[autorite] transport ramene a "
-                      f"{'lecture' if self.host_playing else 'arret'}")
-            self.playing = current_playing
+            if self.playing is None:
+                self.playing = current_playing
+            elif (current_playing != self.playing
+                  and time.monotonic() >= self.transport_limite):
+                self.publish_global({"type": "transport", "playing": current_playing})
+                print(f"[sync] transport envoye : {'lecture' if current_playing else 'arret'}")
+                changed += 1
+                self.playing = current_playing
+
+        current_mode = st.get("mode", -1) if st else -1
+        if current_mode >= 0:
+            if self.mode is None:
+                self.mode = current_mode
+            elif current_mode != self.mode and time.monotonic() >= self.mode_limite:
+                self.publish_global({"type": "songmode", "mode": current_mode})
+                print(f"[sync] mode envoye : {'SONG' if current_mode else 'PAT'}")
+                changed += 1
+                self.mode = current_mode
 
         current_pattern = st["pattern"] if st else None
         if current_pattern is not None:
@@ -1522,8 +1966,11 @@ class Sync:
                         self.clip_lengths = {(p, m, t): l
                                              for p, l, m, t in snapshot}
 
-        # channel rack : assignation canal -> tranche (cadence lente)
-        if now - self.last_channels >= 1.0:
+        # channel rack : assignation canal -> tranche (cadence lente). Des notes
+        # qui changent peuvent venir d'un canal supprime : les index ont glisse,
+        # et il faut le savoir AVANT de comparer les notes.
+        if (now - self.last_channels >= 1.0
+                or (not self.clic and current != self.snapshot)):
             self.last_channels = now
             current_channels = self.plugin.channels()
             if current_channels is not None:
@@ -1542,22 +1989,46 @@ class Sync:
                     # Un canal qui n'existait pas et qui porte un nom : c'est un
                     # plugin que l'utilisateur vient d'ajouter. On l'annonce
                     # pour que l'autre cote le cree avec le meme preset.
+                    revenus = self.canaux_revenus(current_channels)
+                    if revenus:
+                        current = self.plugin.state()
                     for index, track, name in current_channels:
-                        if index in self.channels_state:
+                        if (index not in revenus if revenus
+                                else index in self.channels_state):
+                            continue
+                        print(f"[sync] canal ajoute : '{name}' (index {index})")
+                        if self.publier_canal(index, name, revenu=index in revenus):
                             continue
                         if not name or name.strip().lower().startswith("sampler"):
                             continue
                         self.publish_global({"type": "addchannel",
                                              "name": name.strip(),
                                              "index": index})
-                        print(f"[sync] canal ajoute : '{name}' (index {index})")
 
-                    for index, track, name in current_channels:
-                        old_track = self.channels_state.get(index)
-                        if old_track is not None and old_track != track:
-                            self.publish_global({"type": "channeltrack",
-                                                 "index": index, "track": track})
-                            print(f"[sync] canal {index} ('{name}') -> tranche {track}")
+                    # Meme place, autre nom : FL renomme le canal quand on y pose
+                    # un sample ou qu'on y change de plugin.
+                    if (self.signature_rack is not None
+                            and len(self.signature_rack) == len(current_channels)):
+                        for (_i, ancien), (index, _t, name) in zip(self.signature_rack,
+                                                                   current_channels):
+                            if ancien != name:
+                                print(f"[sync] canal {index} : '{ancien}' -> '{name}'")
+                                self.publier_canal(index, name, remplace=True)
+
+                    if self.publier_retraits(current_channels):
+                        current = self.plugin.state()
+
+                    # Rack change : les index ont pu glisser, comparer les
+                    # tranches index par index inventerait des changements.
+                    if not self.suivre_rack(current_channels):
+                        for index, track, name in current_channels:
+                            old_track = self.channels_state.get(index)
+                            cible = self.index_hote(index)
+                            if (old_track is not None and old_track != track
+                                    and cible is not None):
+                                self.publish_global({"type": "channeltrack",
+                                                     "index": cible, "track": track})
+                                print(f"[sync] canal {index} ('{name}') -> tranche {track}")
                     self.channels_state = {i: t for i, t, _ in current_channels}
 
         # niveaux des canaux du channel rack (volume et panoramique)
@@ -1575,8 +2046,11 @@ class Sync:
                         if (abs(old[0] - volume) > 0.004
                                 or abs(old[1] - pan) > 0.004
                                 or old[2] != mute):
+                            cible = self.index_hote(index)
+                            if cible is None:
+                                continue
                             self.publish_global({"type": "channelmix",
-                                                 "index": index,
+                                                 "index": cible,
                                                  "vol": round(volume, 5),
                                                  "pan": round(pan, 5),
                                                  "mute": mute})
@@ -1691,7 +2165,8 @@ class Sync:
         if st and not st["playing"]:
             position = st["position"]
             if (self.position is not None
-                    and abs(position - self.position) > 8):
+                    and abs(position - self.position) > 8
+                    and time.monotonic() >= self.transport_limite):
                 self.publish_global({"type": "songpos", "pos": position})
                 print(f"[sync] position envoyee : {position}")
             self.position = position
@@ -1738,17 +2213,29 @@ class Sync:
             if sent:
                 print(f"[sync] {sent} piste(s) de mixage envoyee(s)")
 
+        # Note tenue : on n'envoie qu'au relachement, le geste en une seule fois.
+        if not self.clic:
+            changed += self.envoyer_notes(current)
+
+        if changed:
+            print(f"[sync] {changed} changement(s) local(aux) envoye(s)")
+        return changed
+
+    def envoyer_notes(self, current):
+        """Envoie au pair l'ecart entre `current` et ce qu'il connait deja."""
+        changed = 0
         for channel in set(list(current.keys()) + list(self.snapshot.keys())):
             # Un canal qui n'existe pas chez l'hote ne doit pas partir :
             # le plugin de l'autre poste le refuserait (et FL plantait avant
             # ce garde-fou).
-            if (not self.is_host and self.nb_canaux_hote is not None
-                    and channel >= self.nb_canaux_hote):
+            cible = self.index_hote(channel)
+            if cible is None or (not self.is_host
+                                 and self.nb_canaux_hote is not None
+                                 and cible >= self.nb_canaux_hote):
                 if not self.averti_canaux:
                     self.averti_canaux = True
                     print(f"[rack] ton canal {channel + 1} n'existe pas chez "
-                          f"l'hote ({self.nb_canaux_hote} canal(aux)) : ses "
-                          f"notes ne seront pas envoyees")
+                          f"l'hote : ses notes ne seront pas envoyees")
                 continue
 
             old = self.snapshot.get(channel, [])
@@ -1761,7 +2248,6 @@ class Sync:
             # Le canal est dans la note elle-meme : plus besoin de selectionner
             # le piano roll avant d'ecrire (c'etait la cause du "tout sur le
             # premier canal").
-            cible = self.index_hote(channel)
             removed = diff_removals(old, new)
             if removed:
                 self.publish({"type": "del", "ch": cible, "notes": removed})
@@ -1771,9 +2257,6 @@ class Sync:
             if added:
                 self.publish({"type": "add", "ch": cible, "notes": added})
                 changed += len(added)
-
-        if changed:
-            print(f"[sync] {changed} changement(s) local(aux) envoye(s)")
 
         self.snapshot = current
         return changed
@@ -1805,33 +2288,620 @@ class Sync:
         """Le canal de l'hote qui correspond a mon canal."""
         if self.is_host:
             return index_local
-        return self.carte_local_vers_hote.get(index_local, index_local)
+        if not self.carte_local_vers_hote:
+            return index_local     # pas encore de table : on garde l'index
+        return self.carte_local_vers_hote.get(index_local)
 
-    def construire_carte(self, wanted):
-        """Table de correspondance par nom entre le rack de l'hote et le mien."""
+    def publier_retraits(self, channels):
+        """L'utilisateur a supprime des canaux : le pair les perd aussi.
+
+        Vrai s'il y en a. FL a deja renumerote ses notes : la reference suit,
+        sinon le glissement partirait au pair comme des notes deplacees.
+        """
+        if self.signature_rack is None:
+            return False
+        avant = [(n, self.channels_state.get(i)) for i, n in self.signature_rack]
+        apres = [(n, t) for _i, t, n in channels]
+        retires = canaux_retires(avant, apres)
+        if not retires:
+            return False
+        cibles = []
+        for position in retires:
+            cible = self.index_hote(position)
+            if cible is not None:
+                cibles.append(cible)
+            print(f"[rack] canal supprime : '{avant[position][0]}'"
+                  + ("" if cible is not None else " (absent chez l'hote)"))
+        if cibles:
+            self.publish_global({"type": "delchannels", "indices": cibles})
+        self.snapshot = decaler_notes(self.snapshot, retires)
+        self.channel_mix_state = None
+        return True
+
+    def publier_canal(self, index, nom, remplace=False, revenu=False):
+        """Envoie le canal entier, sample compris : le pair en a une copie
+        exacte. Faux si ca n'a pas pu partir."""
+        chemin = os.path.join(sous_dossier_local("canaux"), f"envoi-{os.getpid()}.fst")
+        brut = None
+        try:
+            reponse = self.plugin.save_channel(index, chemin)
+            if reponse.startswith("SAVECHANNEL OK"):
+                with open(chemin, "rb") as fichier:
+                    brut = fichier.read()
+            else:
+                print(f"[canal] sauvegarde refusee : {reponse}")
+        except (OSError, TimeoutError, IndexError) as exc:
+            print(f"[canal] sauvegarde impossible : {exc}")
+        try:
+            os.remove(chemin)
+        except OSError:
+            pass
+        if brut is None:
+            return False
+        if len(brut) > TAILLE_CANAL_MAX:
+            print(f"[canal] '{nom}' trop lourd ({len(brut)} octets) : pas envoye")
+            return False
+
+        son = b""
+        original = None
+        try:
+            original = chemin_sample(brut)
+            source = fichier_sample(original)
+            if source is not None:
+                if os.path.getsize(source) <= TAILLE_SAMPLE_MAX:
+                    with open(source, "rb") as fichier:
+                        son = fichier.read()
+                else:
+                    print(f"[canal] sample trop lourd, l'autre ne l'aura pas : {source}")
+        except (ValueError, IndexError, OSError) as exc:
+            print(f"[canal] sample illisible : {exc}")
+
+        contenu = brut + son
+        paquet = zlib.compress(contenu, 1 if son else 6)
+        nombre = max(1, (len(paquet) + MORCEAU_PROJET - 1) // MORCEAU_PROJET)
+        cible = self.index_hote(index)
+        self.publish_global({"type": "canal_debut",
+                             "index": index if cible is None else cible,
+                             "nom": nom or "", "taille": len(brut),
+                             "chemin": original or "", "remplace": remplace,
+                             "revenu": revenu,
+                             "sha256": hashlib.sha256(contenu).hexdigest(),
+                             "morceaux": nombre})
+        for i in range(nombre):
+            morceau = paquet[i * MORCEAU_PROJET:(i + 1) * MORCEAU_PROJET]
+            self.publish_global({"type": "canal_morceau", "i": i,
+                                 "d": base64.b64encode(morceau).decode("ascii")})
+        print(f"[canal] '{nom}' envoye : {len(brut)} octets"
+              + (f" + sample de {len(son)} octets" if son else ""))
+        return True
+
+    def plugin_present(self, nom, chemin):
+        """Faux si FL ne trouvera pas ce plugin. Sans dossier de plugins lisible,
+        on ne peut rien dire pour un plugin de FL : on le laisse tenter."""
+        if chemin and os.path.exists(chemin):
+            return True
+        if self.plugin.find_preset(nom):
+            return True
+        # "Serum 2.fst" pour un plugin qui se nomme "Serum2"
+        compact = nom.replace(" ", "").lower()
+        table = self.plugin.preset_paths()
+        if any(cle.replace(" ", "") == compact for cle in table):
+            return True
+        return not chemin and not table
+
+    def poser_sample(self, brut, son, recu):
+        """Range le sample recu et fait pointer le .fst dessus. Celui qu'on a
+        deja au meme endroit reste ou il est."""
+        original = str(recu.get("chemin", ""))
+        local = fichier_sample(original)
+        if local is not None and os.path.getsize(local) == len(son):
+            return brut
+        nom = re.sub(r"[^\w .()-]", "_", original.replace("/", "\\").rsplit("\\", 1)[-1])
+        cible = os.path.join(sous_dossier_local("samples"),
+                             f"{str(recu.get('sha256', ''))[:8]}-{nom}")
+        if not os.path.isfile(cible):
+            with open(cible, "wb") as fichier:
+                fichier.write(son)
+        return remplacer_sample(brut, cible)
+
+    def recevoir_canal(self, recu):
+        """Le pair a envoye un canal entier : on en fait une copie ici."""
+        nom = str(recu.get("nom", ""))
+        if recu.get("revenu") and any(n == nom for _i, _t, n in self.plugin.channels() or []):
+            # Ctrl+Z chez l'autre : tant que la suppression n'est pas suivie,
+            # le canal n'a jamais quitte ce poste.
+            return
+        try:
+            contenu = zlib.decompress(b"".join(recu["recus"]))
+            if hashlib.sha256(contenu).hexdigest() != recu.get("sha256"):
+                print(f"[canal] '{nom}' recu abime : ignore")
+                return
+            taille = int(recu.get("taille", 0))
+            brut, son = contenu[:taille], contenu[taille:]
+            if son:
+                brut = self.poser_sample(brut, son, recu)
+            sample = chemin_sample(brut)
+            if (sample and not sample.startswith(VARIABLE_USINE)
+                    and fichier_sample(sample) is None):
+                print(f"[canal] sample absent de ce poste : {sample}")
+                brut = modifier_evenements(brut, {EVT_SAMPLE: None})
+            requis = plugin_requis(brut)
+            if requis and not self.plugin_present(*requis):
+                print(f"[canal] plugin '{requis[0]}' absent de ce poste : canal vide a la place")
+                brut = sans_plugin(brut)
+            chemin = os.path.join(sous_dossier_local("canaux"), f"recu-{os.getpid()}.fst")
+            with open(chemin, "wb") as fichier:
+                fichier.write(brut)
+        except (OSError, ValueError, IndexError, zlib.error) as exc:
+            print(f"[canal] '{nom}' illisible : {exc}")
+            return
+
+        index = int(recu.get("index", 0))
+        try:
+            if recu.get("remplace"):
+                cible = index if self.is_host else self.index_local(index)
+                if cible is None:
+                    print(f"[canal] '{nom}' n'a pas de correspondant ici")
+                    return
+                reponse = self.plugin.replace_channel(cible, chemin, nom)
+            else:
+                local = self.plugin.channels() or []
+                reponse = self.plugin.load_channel(min(index, len(local)), chemin, nom)
+        except (OSError, TimeoutError, IndexError) as exc:
+            reponse = str(exc)
+        finally:
+            try:
+                os.remove(chemin)
+            except OSError:
+                pass
+        if " OK " not in reponse:
+            print(f"[canal] '{nom}' refuse : {reponse}")
+            return
+        print(f"[canal] '{nom}' recu")
+
+        fresh = self.plugin.channels()
+        if fresh is None:
+            return
+        self.channels_state = {i: t for i, t, _ in fresh}
+        self.signature_rack = [(i, n) for i, _t, n in fresh]
+        self.channel_mix_state = None
+        if self.is_host:
+            self.publier_rack(fresh)
+        elif self.rack_hote:
+            self.construire_carte(self.rack_hote, fresh)
+
+    def canaux_revenus(self, channels):
+        """Positions des canaux reapparus au milieu du rack (Ctrl+Z dans FL).
+
+        Les suivants ont glisse : comme pour une suppression, la reference suit,
+        sinon le glissement partirait au pair comme des notes deplacees. Un ajout
+        en fin de rack ne deplace rien et ne passe pas ici.
+        """
+        if self.signature_rack is None:
+            return []
+        avant = [(n, self.channels_state.get(i)) for i, n in self.signature_rack]
+        apres = [(n, t) for _i, t, n in channels]
+        revenus = canaux_retires(apres, avant) or []
+        if not revenus or revenus[0] >= len(avant):
+            return []
+        self.snapshot = inserer_notes(self.snapshot, revenus)
+        self.channel_mix_state = None
+        return revenus
+
+    def retirer_canaux(self, indices):
+        """Le pair a supprime ces canaux (numerotation de l'hote)."""
+        if not SUPPRESSION_RECUE:
+            for index in indices:
+                nom = self.nom_hote(int(index)) or f"numero {int(index) + 1}"
+                print(f"[rack] l'autre a supprime le canal '{nom}' : "
+                      f"supprime-le a la main si tu veux le suivre")
+            return 0
+        if not self.is_host and not self.carte_hote_vers_local:
+            # sans table, l'index pourrait viser un autre instrument
+            print("[rack] suppression ignoree : racks sans nom commun")
+            return 0
+        locaux = {self.index_local(int(i)) for i in indices} - {None}
+        retires = 0
+        # du dernier au premier : les suivants ne glissent pas en route
+        for index in sorted(locaux, reverse=True):
+            reponse = self.plugin.delete_channel(index)
+            if reponse.startswith("DELCHANNEL OK"):
+                retires += 1
+                print(f"[rack] canal {index} supprime comme chez l'autre")
+            else:
+                print(f"[rack] suppression refusee : {reponse}")
+        fresh = self.plugin.channels()
+        if fresh is not None:
+            self.channels_state = {i: t for i, t, _ in fresh}
+            self.signature_rack = [(i, n) for i, _t, n in fresh]
+            if self.is_host:
+                self.publier_rack(fresh)
+        self.channel_mix_state = None
+        return retires
+
+    def suivre_rack(self, channels):
+        """Le rack a change en pleine session : on refait la correspondance.
+
+        L'hote renvoie son rack ; l'invite recalcule sa table. Les index
+        n'ont de sens que tant que la table est a jour. Vrai si le rack a
+        change.
+        """
+        signature = [(i, n) for i, _t, n in channels]
+        if signature == self.signature_rack:
+            return False
+        premiere = self.signature_rack is None
+        self.signature_rack = signature
+        if premiere:
+            return False
+        if self.is_host:
+            print("[rack] le rack a change : envoi a l'invite")
+            self.publier_rack(channels)
+        elif self.rack_hote:
+            self.construire_carte(self.rack_hote, channels)
+        return True
+
+    def construire_carte(self, wanted, local=None):
+        """Table de correspondance par nom entre le rack de l'hote et le mien.
+
+        Deux canaux peuvent porter le meme nom : le 2e "Sampler" de l'hote
+        va sur mon 2e "Sampler", dans l'ordre du rack. Ce qui reste est
+        rapproche avec meme_nom, car FL renomme parfois les canaux.
+        """
         if self.is_host:
             return
-        local = self.plugin.channels() or []
+        if local is None:
+            local = self.plugin.channels() or []
         par_nom = {}
         for i, _t, n in local:
             cle = (n or "").strip().lower()
-            if cle and cle not in par_nom:
-                par_nom[cle] = i
+            if cle:
+                par_nom.setdefault(cle, []).append(i)
 
-        self.carte_hote_vers_local = {}
-        self.carte_local_vers_hote = {}
+        carte = {}
+        restants = []
         for index, _t, name in wanted:
             cle = (name or "").strip().lower()
-            if not cle or cle not in par_nom:
-                continue
-            self.carte_hote_vers_local[index] = par_nom[cle]
-            self.carte_local_vers_hote[par_nom[cle]] = index
+            if par_nom.get(cle):
+                carte[index] = par_nom[cle].pop(0)
+            else:
+                restants.append((index, name))
 
-        if self.carte_hote_vers_local:
+        noms = {i: n for i, _t, n in local}
+        libres = [(i, noms[i]) for indices in par_nom.values() for i in indices]
+        libres += [(i, n) for i, _t, n in local if not (n or "").strip()]
+        libres.sort()
+        for index, name in restants:
+            for libre in libres:
+                if meme_nom(libre[1], name):
+                    carte[index] = libre[0]
+                    libres.remove(libre)
+                    break
+
+        # Un "Sampler" tient la place d'un canal que l'autre poste n'a pas pu
+        # creer. Il recoit les notes : mieux vaut les voir que les perdre.
+        for index, name in restants:
+            if index in carte:
+                continue
+            for libre in libres:
+                if nom_generique(name) or nom_generique(libre[1]):
+                    carte[index] = libre[0]
+                    libres.remove(libre)
+                    break
+
+        changee = carte != self.carte_hote_vers_local
+        self.carte_hote_vers_local = carte
+        self.carte_local_vers_hote = {l: h for h, l in carte.items()}
+        self.averti_canaux = False
+        self.averti_noms = set()
+        if not changee:
+            return
+        if carte:
             print(f"[rack] correspondance par nom : "
-                  f"{len(self.carte_hote_vers_local)} canal(aux) reconnu(s)")
+                  f"{len(carte)} canal(aux) reconnu(s)")
         else:
             print("[rack] aucun nom commun : les notes suivront les index")
+
+    def proteger(self, action, message):
+        """Une erreur de traitement ne coupe pas la session, un plugin perdu
+        si : il faut qu'il remonte jusqu'a run(), sinon on tourne dans le vide."""
+        try:
+            action()
+        except TimeoutError:
+            # FL est occupe. Sa reponse arrivera en retard et decalerait toutes
+            # les suivantes : on repart sur une connexion neuve.
+            print("[sync] FL ne repond pas a temps : reconnexion au plugin")
+            self.reprendre_plugin()
+        except (ConnectionError, OSError):
+            raise
+        except Exception as exc:
+            print(f"{message} : {exc}")
+
+    def reprendre_plugin(self):
+        self.plugin.reconnecter()
+        self.annoncer()
+
+    def annoncer(self):
+        """La fenetre oublie la session des que l'agent se deconnecte."""
+        self.role_sent = False
+        for texte in self.annonces:
+            gui_etat(self.plugin, texte)
+
+    def statut_session(self):
+        if self.annonces:
+            gui_etat(self.plugin, self.annonces[-1])
+
+    # -- Echange du projet ---------------------------------------------------
+    # L'hote fait foi : a la connexion, l'invite charge son .flp, et FL fait
+    # tout le travail (motifs, rack, instruments, mixage, playlist). Refuser
+    # revient a quitter la session : la synchro effacerait ses motifs.
+    #
+    #   hote                                invite
+    #   projet_offre            ->
+    #                                       question dans la fenetre
+    #                                       sauvegarde de son projet
+    #                           <-          projet_demande
+    #   SAVEPROJECT
+    #   projet_debut, morceaux  ->          ecrit, verifie, LOADPROJECT
+    #   (synchro normale)       ->          garde tout ca de cote
+    #                                       le plugin revient
+    #                           <-          projet_pret
+    #   reglages                ->          rejoue ce qu'il a garde
+    #
+    # projet_refuse : l'hote n'a pas pu produire le fichier, l'invite quitte la
+    # session.
+
+    def projet_gele(self):
+        return not self.is_host and self.projet_etat is not None
+
+    def avancer_projet(self):
+        with self.incoming_lock:
+            recus, self.projet_file = self.projet_file, []
+        if self.is_host:
+            self.projet_cote_hote(recus)
+        else:
+            self.projet_cote_invite(recus)
+
+    def projet_cote_hote(self, recus):
+        if self.projet_etat == "a_offrir":
+            # l'inventaire d'abord : l'invite voit ce qui lui manque avant de
+            # repondre
+            self.send_plugins()
+            self.publish_global({"type": "projet_offre",
+                                 "poste": socket.gethostname().upper()})
+            self.projet_etat = "offert"
+            gui_etat(self.plugin, f"En attente de la réponse de {self.poste_pair}…")
+
+        for message in recus:
+            kind = message.get("type")
+            if kind == "projet_demande" and self.projet_etat == "offert":
+                self.envoyer_projet()
+            elif kind == "projet_pret":
+                print(f"[projet] {self.poste_pair} a charge le projet")
+                self.projet_etat = None
+                self.sent_initial = True
+                self.publier_rack()
+                self.publier_reglages()
+                self.statut_session()
+
+    def envoyer_projet(self):
+        gui_etat(self.plugin, f"Envoi du projet à {self.poste_pair}…")
+        chemin = os.path.join(sous_dossier_local("projets"),
+                              f"envoi-{os.getpid()}.flp")
+        brut = None
+        try:
+            raison = self.plugin.sauver_projet(chemin)
+        except TimeoutError:
+            raison = "FL n'a pas repondu"
+            self.reprendre_plugin()
+        if raison is None:
+            try:
+                with open(chemin, "rb") as fichier:
+                    brut = fichier.read()
+            except OSError as exc:
+                raison = str(exc)
+        try:
+            os.remove(chemin)
+        except OSError:
+            pass
+        if raison is None and len(brut) > TAILLE_PROJET_MAX:
+            raison = f"projet trop lourd ({len(brut)} octets)"
+        if raison is not None:
+            self.refuser_projet(raison)
+            return
+
+        paquet = zlib.compress(brut, 6)
+        nombre = max(1, (len(paquet) + MORCEAU_PROJET - 1) // MORCEAU_PROJET)
+        print(f"[projet] envoi : {len(brut)} octets, {len(paquet)} compresses, "
+              f"{nombre} morceau(x)")
+        self.publish_global({"type": "projet_debut", "taille": len(brut),
+                             "sha256": hashlib.sha256(brut).hexdigest(),
+                             "morceaux": nombre})
+        for i in range(nombre):
+            morceau = paquet[i * MORCEAU_PROJET:(i + 1) * MORCEAU_PROJET]
+            self.publish_global({"type": "projet_morceau", "i": i,
+                                 "d": base64.b64encode(morceau).decode("ascii")})
+        self.projet_etat = "envoye"
+
+    def refuser_projet(self, raison):
+        """L'invite s'en va : son depart rend la main a l'hote, qui attend le
+        suivant."""
+        print(f"[projet] pas d'envoi : {raison}")
+        self.projet_etat = "refuse"
+        self.publish_global({"type": "projet_refuse", "raison": raison})
+        self.statut_session()
+
+    def projet_cote_invite(self, recus):
+        for message in recus:
+            kind = message.get("type")
+            if kind == "projet_offre":
+                self.poste_pair = message.get("poste", self.poste_pair)
+                if self.accepter_projet:
+                    self.accepter()
+                else:
+                    self.projet_etat = "choix"
+                    self.projet_limite = time.monotonic() + DELAI_CHOIX
+                    gui_etat(self.plugin, f"DEMANDE {self.poste_pair}")
+            elif kind == "projet_refuse":
+                # son projet a ete sauvegarde, mais il n'a pas encore ete touche
+                self.quitter_session(f"L'hôte n'a pas pu envoyer son projet : "
+                                     f"{message.get('raison')}")
+            elif kind == "projet_debut":
+                self.projet_attendu = message
+                self.projet_morceaux = {}
+                self.projet_pourcent = 0
+            elif kind == "projet_morceau" and self.projet_attendu:
+                self.projet_morceaux[int(message.get("i", -1))] = message.get("d", "")
+                nombre = int(self.projet_attendu.get("morceaux", 0))
+                pourcent = 100 * len(self.projet_morceaux) // max(1, nombre)
+                if pourcent >= self.projet_pourcent + 10:
+                    self.projet_pourcent = pourcent
+                    gui_etat(self.plugin, f"Réception du projet : {pourcent} %")
+                if len(self.projet_morceaux) >= nombre:
+                    self.charger_projet_hote()
+                    return
+
+        if self.projet_etat == "choix":
+            self.lire_choix()
+
+    def lire_choix(self):
+        maintenant = time.monotonic()
+        if maintenant - self.projet_lecture < 0.2:
+            return
+        self.projet_lecture = maintenant
+
+        reponse = self.plugin.cmd("CHOIX")[0]
+        if not reponse.startswith("CHOIX "):
+            self.quitter_session("Plugin trop ancien : mets FruityMulti à jour")
+        choix = reponse[6:].strip()
+        if choix == "oui":
+            self.accepter()
+        elif choix == "non":
+            self.quitter_session("Session quittée : projet de l'hôte refusé")
+        elif maintenant > self.projet_limite:
+            gui_etat(self.plugin, "DEMANDE -")
+            self.quitter_session("Session quittée : pas de réponse")
+
+    def accepter(self):
+        """La sauvegarde passe avant tout le reste : a partir d'ici, le projet
+        de l'invite va etre remplace."""
+        gui_etat(self.plugin, "Sauvegarde de ton projet…")
+        dossier = sous_dossier_local("sauvegardes")
+        chemin = os.path.join(dossier, time.strftime("avant-session-%Y%m%d-%H%M%S.flp"))
+        try:
+            raison = self.plugin.sauver_projet(chemin)
+        except TimeoutError:
+            raison = "FL n'a pas repondu"
+        if raison is not None:
+            self.quitter_session(f"Sauvegarde de ton projet impossible : {raison}")
+        garder_recentes(dossier, SAUVEGARDES_GARDEES)
+        print(f"[projet] ton projet est sauvegarde : {chemin}")
+
+        self.projet_etat = "reception"
+        gui_etat(self.plugin, f"Réception du projet de {self.poste_pair}…")
+        self.publish_global({"type": "projet_demande"})
+
+    def lire_fichier_recu(self):
+        """Le .flp recu, ou None s'il n'est pas intact."""
+        attendu = self.projet_attendu
+        try:
+            paquet = b"".join(base64.b64decode(self.projet_morceaux[i])
+                              for i in range(int(attendu["morceaux"])))
+            brut = zlib.decompress(paquet)
+        except (KeyError, ValueError, zlib.error) as exc:
+            print(f"[projet] fichier recu illisible : {exc}")
+            return None
+        if hashlib.sha256(brut).hexdigest() != attendu.get("sha256"):
+            print("[projet] empreinte fausse : fichier abime en route")
+            return None
+        # Un fichier refuse par FL laisserait le plugin arrete pour de bon :
+        # LOADPROJECT coupe tous ses threads avant de lancer le chargement.
+        if brut[:4] != b"FLhd":
+            print("[projet] ce n'est pas un projet FL")
+            return None
+        return brut
+
+    def charger_projet_hote(self):
+        brut = self.lire_fichier_recu()
+        self.projet_morceaux = {}
+        if brut is None:
+            self.quitter_session("Projet de l'hôte reçu abîmé")
+
+        nom = f"session-{self.code or 'directe'}.flp"
+        chemin = os.path.join(sous_dossier_local("projets"), nom)
+        try:
+            with open(chemin, "wb") as fichier:
+                fichier.write(brut)
+        except OSError as exc:
+            self.quitter_session(f"Écriture du projet impossible : {exc}")
+
+        print(f"[projet] chargement de {chemin}")
+        gui_etat(self.plugin, "Chargement du projet…")
+        reponse = self.plugin.cmd(f"LOADPROJECT {chemin}")[0]
+        if not reponse.startswith("LOADPROJECT planifie"):
+            self.quitter_session(f"Chargement refusé : {reponse}")
+
+        self.projet_etat = "chargement"
+        if not self.plugin.attendre_fermeture(DELAI_COUPURE):
+            self.quitter_session("FL n'a pas lancé le chargement")
+        self.attendre_retour_plugin()
+        self.verifier_chargement()
+        self.attendre_stabilite()
+
+        with self.incoming_lock:
+            self.incoming = [m for m in self.incoming if m.get("type") != "mouse"]
+        self.lire_projet()
+        self.annoncer()
+        self.projet_etat = None
+        self.sent_initial = True
+        self.publish_global({"type": "projet_pret"})
+        print(f"[projet] projet de {self.poste_pair} charge")
+
+    def verifier_chargement(self):
+        """Le plugin revient aussi quand FL a refuse le fichier : son retour ne
+        prouve rien. -1 : le chargeur n'a pas encore rendu la main. Un plugin
+        sans LOADSTATUS ne peut pas le dire."""
+        limite = time.monotonic() + DELAI_RETOUR_PLUGIN
+        while True:
+            reponse = self.plugin.cmd("LOADSTATUS")[0]
+            code = reponse[11:].strip() if reponse.startswith("LOADSTATUS ") else "0"
+            if code != "-1" or time.monotonic() > limite:
+                break
+            time.sleep(0.5)
+        if code != "0":
+            self.quitter_session(f"FL a refusé le projet (code {code})")
+
+    def attendre_retour_plugin(self):
+        """Le Bridge est dans le projet de l'hote, donc il revient tout seul.
+        S'il ne revient pas, on retombe sur le cas du plugin perdu."""
+        limite = time.monotonic() + DELAI_RETOUR_PLUGIN
+        while time.monotonic() < limite:
+            time.sleep(1.0)
+            try:
+                self.plugin.reconnecter()
+                if self.plugin.ping():
+                    return
+            except OSError:
+                pass
+        raise ConnectionError("le plugin n'est pas revenu apres le chargement")
+
+    def attendre_stabilite(self):
+        """FL peut repondre alors qu'il n'a pas fini : une lecture a moitie
+        faite partirait a l'hote comme des modifications de l'invite."""
+        limite = time.monotonic() + DELAI_STABILITE
+        precedente = None
+        while time.monotonic() < limite:
+            vue = (self.plugin.channels(), self.plugin.state())
+            if vue == precedente:
+                return
+            precedente = vue
+            time.sleep(1.0)
+
+    def quitter_session(self, raison):
+        """Sortie de l'agent : la fenetre garde la raison affichee."""
+        print(f"[projet] {raison}")
+        self._liberer_autorite()
+        gui_etat(self.plugin, f"ERREUR {raison}")
+        raise SystemExit(1)
 
     def run(self):
         print("[sync] pret")
@@ -1856,20 +2926,24 @@ class Sync:
                         print(f"[autorite] role non transmis : {exc}")
                     self.role_sent = True
 
-                # Un message malforme ne doit jamais couper la session : on le
-                # signale et on continue. Sans cela, la moindre erreur dans un
-                # gestionnaire tuait la connexion et provoquait une boucle de
-                # reconnexions.
-                try:
-                    self.apply_incoming()
-                except Exception as exc:
-                    print(f"[sync] message ignore : {exc}")
+                if self.projet_gele():
+                    # On ne touche a rien avant de savoir si le projet sera
+                    # remplace ; le comparatif des plugins aide a decider.
+                    if self.projet_etat in ("attente", "choix"):
+                        self.proteger(lambda: self.apply_incoming(("plugins",)),
+                                      "[sync] message ignore")
+                else:
+                    # Un message malforme ne doit jamais couper la session : on
+                    # le signale et on continue. Sans cela, la moindre erreur
+                    # dans un gestionnaire tuait la connexion et provoquait une
+                    # boucle de reconnexions.
+                    self.proteger(self.apply_incoming, "[sync] message ignore")
+                    self.proteger(self.detect_local,
+                                  "[sync] analyse locale impossible")
 
-                try:
-                    self.detect_local()
-                except Exception as exc:
-                    print(f"[sync] analyse locale impossible : {exc}")
-                if not self.sent_initial:
+                if self.projet_etat is not None:
+                    self.avancer_projet()
+                if not self.sent_initial and self.projet_etat is None:
                     self.push_all()
                     self.sent_initial = True
                 time.sleep(POLL)
@@ -2012,7 +3086,7 @@ def poignee_de_main(transport, est_hote, code, delai=10.0):
     sur le delai, avec un message qui dit de mettre a jour.
     """
     moi = {"type": "hello", "proto": PROTO, "version": AGENT_VERSION,
-           "role": "hote" if est_hote else "invite",
+           "role": "hote" if est_hote else "invite", "projet": 1,
            "poste": socket.gethostname().upper()}
     if not est_hote:
         moi["code"] = code
@@ -2611,6 +3685,9 @@ def main():
                         help="imprimer la derniere version publiee (MAJ n)")
     parser.add_argument("--installer", action="store_true",
                         help="apres telechargement, lance l'installateur")
+    parser.add_argument("--accepter-projet", action="store_true",
+                        help="invite sans fenetre : charger le projet de l'hote "
+                             "sans poser la question")
     parser.add_argument("--parent", type=int, metavar="PID",
                         help="s'arreter quand ce processus (FL) se ferme")
     args = parser.parse_args()
@@ -2682,6 +3759,7 @@ def main():
     verifier_versions(version)
     est_hote = bool(args.heberger or args.listen)
     gui_etat(plugin, "ROLE " + ("hote" if est_hote else "invite"))
+    plugin.veiller()
 
     # --- ou se retrouver ---------------------------------------------------
     serveur = None        # socket d'ecoute en direct (hote)
@@ -2747,6 +3825,7 @@ def main():
 
     while True:
         # --- etablissement de la connexion ---------------------------------
+        plugin.veiller()
         try:
             if est_hote and par_relais:
                 if transport is None:
@@ -2801,21 +3880,31 @@ def main():
         gui_etat(plugin, f"Connecté à {poste} ({'hôte' if est_hote else 'invité'})")
 
         # --- session -------------------------------------------------------
-        sync = None
-        link = Link(transport,
-                    lambda m: sync.on_message(m) if sync is not None else None)
-        sync = Sync(plugin, link, est_hote)
-
+        role_affiche = "hôte" if est_hote else "invité"
+        annonces = ["ROLE " + ("hote" if est_hote else "invite"),
+                    "ADRESSE " + (adresse if est_hote
+                                  else (args.rejoindre or args.peer).strip()),
+                    f"PAIR {poste}", f"Connecté à {poste} ({role_affiche})"]
+        plugin.fin_veille()
+        link = None
         try:
+            # Sync d'abord : un message recu avant qu'elle existe serait perdu,
+            # et c'est le premier qui compte (l'offre du projet).
+            sync = Sync(plugin, None, est_hote, pair=pair, annonces=annonces,
+                        code=code, accepter_projet=args.accepter_projet)
+            link = Link(transport, sync.on_message)
+            sync.link = link
             sync.run()
         except KeyboardInterrupt:
             raise
-        except PluginLost as exc:
+        except (PluginLost, OSError) as exc:
             # FL a ete ferme, ou l'effet a ete retire : on attend son retour
             # au lieu de demander a l'utilisateur de relancer l'agent.
             print(f"[sync] FL a disparu ({exc})")
             print("[sync] on attend le retour de l'effet FruityMulti Bridge...")
-            link.alive = False
+            plugin.close()
+            if link is not None:
+                link.alive = False
             transport.fermer()
             transport = None
             ecrire_compat([], [], [])
@@ -2839,7 +3928,8 @@ def main():
         except Exception as exc:
             print(f"[sync] session interrompue : {exc}")
 
-        link.alive = False
+        if link is not None:
+            link.alive = False
         transport.fermer()
         transport = None
         ecrire_compat([], [], [])

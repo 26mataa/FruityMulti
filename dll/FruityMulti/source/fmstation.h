@@ -28,6 +28,7 @@ struct Etat
 	std::string code;          // K7P2QX, ou ip:port/K7P2QX en direct
 	std::string statut;        // derniere phrase de l'agent
 	std::string pair;          // poste en face, vide = personne
+	std::string demande;       // poste qui propose son projet, vide = rien
 	std::string poste;         // ce PC
 	int version = 0;
 	Maj maj = Maj::Repos;
@@ -44,7 +45,8 @@ struct Polices
 	ImFont* monoGras = nullptr;
 };
 
-enum class Action { Heberger, Rejoindre, Copier, Couper, VerifierMaj, InstallerMaj };
+enum class Action { Heberger, Rejoindre, Copier, Couper, VerifierMaj, InstallerMaj,
+                    ProjetOui, ProjetNon };
 
 class Station
 {

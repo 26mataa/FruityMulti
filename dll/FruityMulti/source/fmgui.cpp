@@ -49,6 +49,8 @@ std::string g_statut;
 std::string g_adresse;
 std::string g_pair;
 std::string g_erreur;   // pourquoi l'agent s'est arrete, s'il l'a dit
+std::string g_demande;  // poste qui propose son projet, vide = pas de question
+std::string g_choix;    // reponse pas encore lue par l'agent
 int  g_role = 0;
 bool g_agent = false;
 
@@ -491,6 +493,13 @@ void actionCouper ()
 	fmgui::agentParti ();
 }
 
+void actionRepondre (const char* choix)
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	g_demande.clear ();
+	g_choix = choix;
+}
+
 void actionVerifierMaj ()
 {
 	// Le fichier a deja ete remplace (installation faite pendant que FL
@@ -897,6 +906,8 @@ void FmView::executer (fmstation::Action a, const std::string& arg)
 	case fmstation::Action::Heberger: actionHeberger (); break;
 	case fmstation::Action::Rejoindre: actionRejoindre (arg); break;
 	case fmstation::Action::Couper: actionCouper (); break;
+	case fmstation::Action::ProjetOui: actionRepondre ("oui"); break;
+	case fmstation::Action::ProjetNon: actionRepondre ("non"); break;
 	case fmstation::Action::VerifierMaj: actionVerifierMaj (); break;
 	case fmstation::Action::InstallerMaj: actionInstallerMaj (); break;
 	case fmstation::Action::Copier:
@@ -944,6 +955,7 @@ void FmView::image ()
 		e.code = g_adresse;
 		e.statut = g_statut;
 		e.pair = g_pair;
+		e.demande = g_demande;
 	}
 	e.poste = poste;
 	e.version = fmgui::kVersionPlugin;
@@ -1136,12 +1148,29 @@ void soumettreEtat (const char* texte)
 	setStatus (texte);
 }
 
+void setDemande (const char* poste)
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	g_demande = (poste != nullptr && strcmp (poste, "-") != 0) ? poste : "";
+	g_choix.clear ();
+}
+
+std::string prendreChoix ()
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	std::string choix = g_choix.empty () ? "-" : g_choix;
+	g_choix.clear ();
+	return choix;
+}
+
 void agentParti ()
 {
 	std::lock_guard<std::mutex> g (g_mtx);
 	g_role = 0;
 	g_pair.clear ();
 	g_adresse.clear ();
+	g_demande.clear ();
+	g_choix.clear ();
 	g_statut = g_erreur;   // vide, sauf si l'agent a dit pourquoi il part
 }
 
