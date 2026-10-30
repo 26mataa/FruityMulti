@@ -5,8 +5,12 @@ Le plugin expose FL ; cet agent ne fait que comparer et diffuser.
 
 Utilisation
 -----------
-Hote   : python agent_sync.py --listen 5000
-Invite : python agent_sync.py --peer <ip-de-l-hote>:5000
+Hote   : python agent_sync.py --heberger          (affiche un code, ex. K7P2QX)
+Invite : python agent_sync.py --rejoindre K7P2QX
+
+Sans relais (reseau local, ou port ouvert sur la box) :
+Hote   : python agent_sync.py --listen 5000       (affiche ip:port/CODE)
+Invite : python agent_sync.py --peer ip:5000/CODE
 
 Le plugin ne gere qu'un client a la fois : on garde donc UNE seule
 connexion ouverte et on serialise les commandes.
@@ -25,7 +29,7 @@ from collections import Counter
 # Le depot public qui heberge les versions. L'agent y lit la derniere release
 # et telecharge le plugin + lui-meme. A incrementer a chaque publication.
 DEPOT = "26mataa/FruityMulti"
-AGENT_VERSION = 28
+AGENT_VERSION = 29
 ADRESSE_RELEASES = f"https://github.com/{DEPOT}/releases/latest"
 
 PLUGIN_HOST = "127.0.0.1"
@@ -104,6 +108,33 @@ def scan_plugins():
     return {"fl": sorted(fl, key=str.lower),
             "vst3": sorted(vst3, key=str.lower),
             "vst2": sorted(vst2, key=str.lower)}
+
+
+def dossier_local():
+    """%LOCALAPPDATA%\\FruityMulti : journal, inventaires, comparaison.
+
+    Jamais le dossier courant : lance par FL, c'est Program Files.
+    """
+    dossier = os.path.join(os.environ.get("LOCALAPPDATA", "."), "FruityMulti")
+    try:
+        os.makedirs(dossier, exist_ok=True)
+    except OSError:
+        pass
+    return dossier
+
+
+def ecrire_compat(commun, ici_seul, autre_seul):
+    """compat.txt, lu par la fenetre : "= nom" partout, "+ nom" ici
+    seulement, "- nom" chez l'autre seulement. Vide = pas de session."""
+    chemin = os.path.join(dossier_local(), "compat.txt")
+    try:
+        with open(chemin + ".tmp", "w", encoding="utf-8") as fichier:
+            for prefixe, noms in (("-", autre_seul), ("+", ici_seul), ("=", commun)):
+                for nom in noms:
+                    fichier.write(f"{prefixe} {nom}\n")
+        os.replace(chemin + ".tmp", chemin)
+    except OSError:
+        pass
 
 
 def comparer_plugins(ici, autre):
@@ -1069,8 +1100,10 @@ class Sync:
                 autre = message.get("inventaire") or {}
                 self.peer_plugins = autre
                 poste = (autre.get("poste") or "pair").replace("/", "-")
+                chemin_inventaire = os.path.join(dossier_local(),
+                                                 f"inventaire_{poste}.json")
                 try:
-                    with open(f"inventaire_{poste}.json", "w",
+                    with open(chemin_inventaire, "w",
                               encoding="utf-8") as fichier:
                         json.dump(autre, fichier, ensure_ascii=False, indent=2)
                 except OSError:
@@ -1078,6 +1111,7 @@ class Sync:
 
                 ici = self.my_plugins or scan_plugins()
                 commun, ici_seul, autre_seul = comparer_plugins(ici, autre)
+                ecrire_compat(commun, ici_seul, autre_seul)
                 print()
                 print(f"[plugins] {autre.get('poste', 'pair')} : "
                       f"{len(commun)} en commun, "
@@ -1087,8 +1121,7 @@ class Sync:
                     apercu = ", ".join(autre_seul[:8])
                     print(f"[plugins] presents chez lui et pas ici : {apercu}"
                           + (" ..." if len(autre_seul) > 8 else ""))
-                print("[plugins] fichier ecrit : "
-                      f"inventaire_{poste}.json")
+                print(f"[plugins] fichier ecrit : {chemin_inventaire}")
                 print()
                 self.send_plugins ()
                 applied += 1
@@ -1846,49 +1879,289 @@ class Sync:
 
 
 # --------------------------------------------------------------------------
-class Link:
-    """Ligne JSON delimitée par des retours a la ligne."""
+# Reseau entre les deux agents.
+#
+# Deux chemins, le meme protocole :
+#   - le RELAIS (par defaut) : chacun se connecte en WebSocket a un salon
+#     designe par un code de 6 caracteres. Aucun port a ouvrir, aucune IP
+#     echangee, ca passe partout (4G, CGNAT, reseau d'ecole).
+#   - le DIRECT (repli, ou reseau local) : TCP sur le port 5000, UPnP sur la
+#     box. L'adresse a donner est alors "ip:port/CODE".
+#
+# Dans les deux cas, chaque trame est une liste JSON de messages : l'emetteur
+# regroupe ce qui part dans la meme fenetre de 40 ms. Le relais gratuit compte
+# les trames, pas les messages.
 
-    def __init__(self, sock, on_message):
+PROTO = 1
+RELAIS = os.environ.get("FM_RELAIS", "wss://fruitymulti-relais.26mataa.workers.dev")
+PORT_DIRECT = 5000
+ALPHABET_CODE = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # ni I, ni O, ni 0, ni 1
+
+
+class Refus(Exception):
+    """La connexion a abouti mais l'autre cote (ou le relais) n'en veut pas."""
+
+
+def nouveau_code():
+    import secrets
+    return "".join(secrets.choice(ALPHABET_CODE) for _ in range(6))
+
+
+def est_un_code(texte):
+    return (len(texte) == 6
+            and all(c in ALPHABET_CODE for c in texte.upper()))
+
+
+class TransportTcp:
+    """Une ligne de texte par trame, sur une socket TCP."""
+
+    def __init__(self, sock):
+        # Socket bloquante : le delai de lecture passe par select(). Un
+        # settimeout() changerait aussi le delai de l'envoi en cours dans
+        # l'autre thread.
+        sock.settimeout(None)
         self.sock = sock
-        self.on_message = on_message
-        self.lock = threading.Lock()
         self.buf = b""
+        self.lock = threading.Lock()
+
+    def envoyer(self, texte):
+        with self.lock:
+            self.sock.sendall((texte + "\n").encode("utf-8"))
+
+    def recevoir(self, delai=None):
+        import select
+        while b"\n" not in self.buf:
+            if delai is not None:
+                lisible, _, _ = select.select([self.sock], [], [], delai)
+                if not lisible:
+                    raise TimeoutError("rien recu")
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("pair deconnecte")
+            self.buf += chunk
+        ligne, _, self.buf = self.buf.partition(b"\n")
+        return ligne.decode("utf-8")
+
+    def fermer(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class TransportRelais:
+    """Une trame WebSocket par trame, via le relais."""
+
+    def __init__(self, ws):
+        self.ws = ws
+
+    def envoyer(self, texte):
+        from websockets.exceptions import ConnectionClosed
+        try:
+            self.ws.send(texte)
+        except ConnectionClosed as exc:
+            raise ConnectionError(f"relais ferme ({exc})")
+
+    def recevoir(self, delai=None):
+        from websockets.exceptions import ConnectionClosed
+        try:
+            message = self.ws.recv(timeout=delai)
+        except ConnectionClosed as exc:
+            raise ConnectionError(f"relais ferme ({exc})")
+        return message if isinstance(message, str) else message.decode("utf-8")
+
+    def fermer(self):
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+
+def ouvrir_relais(code, role):
+    from websockets.sync.client import connect
+    url = f"{RELAIS}/salon/{code}?role={role}&proto={PROTO}"
+    ws = connect(url, open_timeout=10, max_size=4 * 1024 * 1024,
+                 ping_interval=20, ping_timeout=20)
+    return TransportRelais(ws)
+
+
+def _messages(texte):
+    """Une trame -> liste de messages (une trame peut aussi etre un objet seul)."""
+    donnees = json.loads(texte)
+    if isinstance(donnees, list):
+        return [m for m in donnees if isinstance(m, dict)]
+    return [donnees] if isinstance(donnees, dict) else []
+
+
+def attendre_pair_relais(transport):
+    """Attend que le relais annonce l'autre. Leve Refus si le salon est refuse."""
+    while True:
+        for m in _messages(transport.recevoir(None)):
+            evenement = m.get("_relais")
+            if evenement == "pair_arrive":
+                return
+            if evenement == "refuse":
+                raise Refus(m.get("raison", "refuse par le relais"))
+
+
+def poignee_de_main(transport, est_hote, code, delai=10.0):
+    """Chacun se presente. Retourne la carte du pair, ou leve Refus.
+
+    L'invite parle le premier ; l'hote verifie le code et le protocole avant de
+    repondre. Un agent d'avant le protocole 1 ne se presente pas : il tombe
+    sur le delai, avec un message qui dit de mettre a jour.
+    """
+    moi = {"type": "hello", "proto": PROTO, "version": AGENT_VERSION,
+           "role": "hote" if est_hote else "invite",
+           "poste": socket.gethostname().upper()}
+    if not est_hote:
+        moi["code"] = code
+        transport.envoyer(json.dumps([moi]))
+
+    lui = None
+    limite = time.monotonic() + delai
+    while lui is None:
+        reste = limite - time.monotonic()
+        if reste <= 0:
+            raise Refus("le pair ne s'est pas presente : version trop ancienne ?")
+        try:
+            texte = transport.recevoir(reste)
+        except TimeoutError:
+            continue
+        for m in _messages(texte):
+            if m.get("_relais") == "pair_parti":
+                raise ConnectionError("pair parti pendant la presentation")
+            if m.get("type") == "refus":
+                raise Refus(m.get("raison", "refuse par l'hote"))
+            if m.get("type") == "hello":
+                lui = m
+                break
+
+    raison = None
+    if lui.get("proto") != PROTO:
+        raison = (f"protocole {lui.get('proto')} chez l'autre, {PROTO} ici : "
+                  f"mettez FruityMulti a jour tous les deux")
+    elif lui.get("role") == moi["role"]:
+        raison = f"deux {moi['role']}s dans la meme session"
+    elif est_hote and str(lui.get("code", "")).upper() != code:
+        raison = "code de session faux"
+
+    if raison is not None:
+        if est_hote:
+            try:
+                transport.envoyer(json.dumps([{"type": "refus", "raison": raison}]))
+            except OSError:
+                pass
+        raise Refus(raison)
+
+    if est_hote:
+        transport.envoyer(json.dumps([moi]))
+    if lui.get("version") != AGENT_VERSION:
+        print(f"[reseau] ATTENTION : version {lui.get('version')} chez "
+              f"l'autre, {AGENT_VERSION} ici")
+    return lui
+
+
+class Link:
+    """Liaison avec le pair : messages groupes par trame, battement de coeur.
+
+    Sans nouvelles du pair pendant SILENCE_MAX, la liaison est declaree morte :
+    une coupure Wi-Fi ne ferme pas toujours la connexion proprement, et la
+    session restait figee indefiniment.
+    """
+
+    LOT = 0.04
+    BATTEMENT = 5.0
+    SILENCE_MAX = 20.0
+    TRAME_MAX = 512 * 1024
+
+    def __init__(self, transport, on_message):
+        self.transport = transport
+        self.on_message = on_message
         self.alive = True
-        threading.Thread(target=self._reader, daemon=True).start()
+        self.file = []
+        self.cond = threading.Condition()
+        self.dernier_recu = time.monotonic()
+        threading.Thread(target=self._lecteur, daemon=True).start()
+        threading.Thread(target=self._emetteur, daemon=True).start()
 
     def send(self, message):
         if not self.alive:
             return
-        data = (json.dumps(message) + "\n").encode("utf-8")
-        with self.lock:
-            try:
-                self.sock.sendall(data)
-            except OSError as exc:
-                self.alive = False
-                print(f"[reseau] pair deconnecte ({exc})")
+        with self.cond:
+            self.file.append(message)
+            self.cond.notify()
 
-    def _reader(self):
-        while True:
-            try:
-                chunk = self.sock.recv(4096)
-            except OSError:
-                self.alive = False
+    def _mort(self, raison):
+        if self.alive:
+            self.alive = False
+            print(f"[reseau] {raison}")
+        with self.cond:
+            self.cond.notify()
+        self.transport.fermer()
+
+    def _trames(self, lot):
+        """Decoupe un lot en trames de taille raisonnable (le relais coupe a 1 Mo)."""
+        trame, taille = [], 0
+        for message in lot:
+            texte = json.dumps(message)
+            if trame and taille + len(texte) > self.TRAME_MAX:
+                yield "[" + ",".join(trame) + "]"
+                trame, taille = [], 0
+            trame.append(texte)
+            taille += len(texte) + 1
+        if trame:
+            yield "[" + ",".join(trame) + "]"
+
+    def _emetteur(self):
+        dernier_envoi = 0.0
+        while self.alive:
+            with self.cond:
+                if not self.file:
+                    self.cond.wait(timeout=self.BATTEMENT)
+            # laisse les messages d'une meme rafale rejoindre la trame
+            attente = self.LOT - (time.monotonic() - dernier_envoi)
+            if attente > 0:
+                time.sleep(attente)
+            with self.cond:
+                lot, self.file = self.file, []
+            if not self.alive:
                 return
-            if not chunk:
-                self.alive = False
-                print("[reseau] pair deconnecte")
-                return
-            self.buf += chunk
-            while b"\n" in self.buf:
-                line, _, self.buf = self.buf.partition(b"\n")
-                line = line.strip()
-                if not line:
+            if not lot:
+                if time.monotonic() - dernier_envoi < self.BATTEMENT:
                     continue
-                try:
-                    message = json.loads(line.decode("utf-8"))
-                except (ValueError, UnicodeDecodeError) as exc:
-                    print(f"[reseau] message invalide : {exc}")
+                lot = [{"type": "_battement"}]
+            try:
+                for trame in self._trames(lot):
+                    self.transport.envoyer(trame)
+            except Exception as exc:
+                self._mort(f"pair deconnecte ({exc})")
+                return
+            dernier_envoi = time.monotonic()
+
+    def _lecteur(self):
+        while self.alive:
+            try:
+                texte = self.transport.recevoir(1.0)
+            except TimeoutError:
+                if time.monotonic() - self.dernier_recu > self.SILENCE_MAX:
+                    self._mort(f"plus de nouvelles du pair depuis {self.SILENCE_MAX:.0f} s")
+                    return
+                continue
+            except Exception as exc:
+                self._mort(f"pair deconnecte ({exc})")
+                return
+            self.dernier_recu = time.monotonic()
+            try:
+                messages = _messages(texte)
+            except ValueError as exc:
+                print(f"[reseau] message invalide : {exc}")
+                continue
+            for message in messages:
+                if message.get("_relais") == "pair_parti":
+                    self._mort("pair deconnecte")
+                    return
+                if "_relais" in message or message.get("type") in ("_battement", "hello"):
                     continue
                 # Le thread de lecture demarre avant que Sync existe : un
                 # message peut arriver dans cet intervalle. On l'ignore au lieu
@@ -2262,10 +2535,8 @@ def verrou_unique():
 
 def ouvrir_journal():
     """Tout ce que l'agent affiche part aussi dans journal.txt."""
-    dossier = os.path.join(os.environ.get("LOCALAPPDATA", "."), "FruityMulti")
-    try:
-        os.makedirs(dossier, exist_ok=True)
-    except OSError:
+    dossier = dossier_local()
+    if not os.path.isdir(dossier):
         return
     chemin = os.path.join(dossier, "journal.txt")
     try:
@@ -2279,6 +2550,31 @@ def ouvrir_journal():
         pass
     sys.stdout = _Journal(sys.stdout, chemin)
     sys.stderr = sys.stdout
+
+
+def surveiller_parent(pid):
+    """Quitte l'agent quand FL se ferme.
+
+    Sans ca, apres un plantage de FL, l'agent orphelin gardait le verrou :
+    la session suivante sortait aussitot ("un agent tourne deja").
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    noyau = ctypes.windll.kernel32
+    SYNCHRONIZE = 0x00100000
+    poignee = noyau.OpenProcess(SYNCHRONIZE, False, pid)
+    if not poignee:
+        print(f"[sync] FL (pid {pid}) deja ferme : arret")
+        os._exit(0)
+
+    def attendre():
+        noyau.WaitForSingleObject(poignee, 0xFFFFFFFF)
+        print("[sync] FL s'est ferme : arret de l'agent")
+        ecrire_compat([], [], [])
+        os._exit(0)
+
+    threading.Thread(target=attendre, daemon=True).start()
 
 
 def main():
@@ -2295,10 +2591,14 @@ def main():
 
     parser = argparse.ArgumentParser(description="FruityMulti - synchronisation")
     group = parser.add_mutually_exclusive_group()
+    group.add_argument("--heberger", action="store_true",
+                       help="ouvrir une session par le relais (hote)")
+    group.add_argument("--rejoindre", metavar="CODE",
+                       help="rejoindre une session : CODE, ou ip:port/CODE en direct")
     group.add_argument("--listen", type=int, metavar="PORT",
-                       help="attendre un pair (hote)")
-    group.add_argument("--peer", metavar="HOTE:PORT",
-                       help="se connecter a un pair (invite)")
+                       help="ouvrir une session en direct, sans relais (hote)")
+    group.add_argument("--peer", metavar="HOTE:PORT/CODE",
+                       help="rejoindre une session directe (invite)")
     parser.add_argument("--plugin", default=f"{PLUGIN_HOST}:{PLUGIN_PORT}",
                         help="adresse du plugin local")
     parser.add_argument("--once", action="store_true",
@@ -2309,7 +2609,11 @@ def main():
                         help="imprimer la derniere version publiee (MAJ n)")
     parser.add_argument("--installer", action="store_true",
                         help="apres telechargement, lance l'installateur")
+    parser.add_argument("--parent", type=int, metavar="PID",
+                        help="s'arreter quand ce processus (FL) se ferme")
     args = parser.parse_args()
+    if args.parent:
+        surveiller_parent(args.parent)
 
     if args.maj:
         return mettre_a_jour(lancer_installateur=args.installer)
@@ -2321,8 +2625,8 @@ def main():
         except Exception:
             print("MAJ 0")
         return 0
-    if not args.listen and not args.peer:
-        parser.error("il faut --listen, --peer, --maj ou --check")
+    if not (args.heberger or args.rejoindre or args.listen or args.peer):
+        parser.error("il faut --heberger, --rejoindre, --listen, --peer, --maj ou --check")
 
     # un seul agent de SESSION a la fois (les --check et --maj sont libres)
     verrou = verrou_unique()
@@ -2343,9 +2647,17 @@ def main():
     last_error = None
     for attempt in range(6):
         try:
-            if plugin.ping():
+            reponse = plugin.cmd("PING")[0]
+            if reponse == "OK":
                 last_error = None
                 break
+            if "version de FL" in reponse:
+                # FL mis a jour depuis la compilation du plugin : inutile
+                # d'insister, et surtout pas "un autre agent l'utilise"
+                print("[sync] le plugin ne reconnait pas cette version de FL")
+                print("[sync] il faut la version de FL prevue par FruityMulti")
+                gui_etat(plugin, "ERREUR Version de FL non reconnue : mets FruityMulti à jour")
+                return 1
             last_error = "reponse inattendue"
         except (OSError, TimeoutError) as exc:
             last_error = exc
@@ -2358,6 +2670,7 @@ def main():
         return 1
 
     print(f"[sync] plugin connecte ({args.plugin})")
+    ecrire_compat([], [], [])   # rien de la session precedente
 
     try:
         version = plugin.cmd("VERSION")[0]
@@ -2365,55 +2678,107 @@ def main():
         version = "inconnue"
     print(f"[sync] version du plugin : {version}")
     verifier_versions(version)
-    gui_etat(plugin, "ROLE " + ("hote" if args.listen else "invite"))
+    est_hote = bool(args.heberger or args.listen)
+    gui_etat(plugin, "ROLE " + ("hote" if est_hote else "invite"))
 
-    if args.listen:
-        address = try_upnp(args.listen)
-        if address:
-            host_ip, host_port = address
-        else:
-            # pas de box compatible : on donne l'adresse du reseau local
+    # --- ou se retrouver ---------------------------------------------------
+    serveur = None        # socket d'ecoute en direct (hote)
+    port_upnp = None
+    pair_direct = None    # (ip, port) a joindre en direct (invite)
+    transport = None
+    if est_hote:
+        code = nouveau_code()
+        par_relais = not args.listen
+        if par_relais:
             try:
-                host_ip = socket.gethostbyname(socket.gethostname())
-            except OSError:
-                host_ip = "127.0.0.1"
-            host_port = args.listen
+                transport = ouvrir_relais(code, "hote")
+                adresse = code
+            except Exception as exc:
+                print(f"[reseau] relais injoignable ({exc}) : connexion directe")
+                par_relais = False
+        if not par_relais:
+            port_ecoute = args.listen or PORT_DIRECT
+            publique = try_upnp(port_ecoute)
+            if publique:
+                ip_hote, port_hote = publique
+                port_upnp = port_ecoute
+            else:
+                # pas de box compatible : on donne l'adresse du reseau local
+                try:
+                    ip_hote = socket.gethostbyname(socket.gethostname())
+                except OSError:
+                    ip_hote = "127.0.0.1"
+                port_hote = port_ecoute
+            serveur = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            serveur.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            serveur.bind(("0.0.0.0", port_ecoute))
+            serveur.listen(1)
+            adresse = f"{ip_hote}:{port_hote}/{code}"
 
         print("")
         print("=" * 52)
-        print("  donnez cette adresse a votre invite :")
-        print(f"        {host_ip}:{host_port}")
+        print("  donnez ce code a votre invite :")
+        print(f"        {adresse}")
         print("=" * 52)
         print("")
+        gui_etat(plugin, f"ADRESSE {adresse}")
+        gui_etat(plugin, f"Code {adresse} : en attente de l'invité")
+    else:
+        cible = (args.rejoindre or args.peer).strip()
+        if est_un_code(cible):
+            par_relais = True
+            code = cible.upper()
+        else:
+            par_relais = False
+            cible, _, code = cible.partition("/")
+            code = code.strip().upper()
+            ip, _, port_pair = cible.partition(":")
+            pair_direct = (ip, int(port_pair or PORT_DIRECT))
+        gui_etat(plugin, f"Connexion à la session {code or cible}…")
 
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("0.0.0.0", args.listen))
-        server.listen(1)
-        print(f"[sync] en attente d'un pair sur le port {args.listen}")
-
-        gui_etat(plugin, f"ADRESSE {host_ip}:{host_port}")
-        gui_etat(plugin, f"En attente sur {host_ip}:{host_port}")
+    def fermer_tout():
+        plugin.close()
+        if serveur is not None:
+            serveur.close()
+        if port_upnp is not None:
+            close_upnp(port_upnp)
 
     while True:
         # --- etablissement de la connexion ---------------------------------
-        if args.listen:
-            try:
-                peer_sock, addr = server.accept()
-            except OSError as exc:
-                print(f"[sync] accept impossible ({exc}), nouvelle tentative")
-                time.sleep(2.0)
-                continue
-            print(f"[sync] pair connecte : {addr[0]}:{addr[1]}")
-            gui_etat(plugin, f"Connecte a {addr[0]} (hote)")
-        else:
-            peer_host, _, peer_port = args.peer.partition(":")
-            try:
-                peer_sock = socket.create_connection((peer_host, int(peer_port)),
-                                                     timeout=10.0)
-            except OSError as exc:
-                raison = getattr(exc, "winerror", None)
-                print(f"[sync] connexion impossible a {args.peer} ({exc})")
+        try:
+            if est_hote and par_relais:
+                if transport is None:
+                    transport = ouvrir_relais(code, "hote")
+                attendre_pair_relais(transport)
+            elif est_hote:
+                sock, addr = serveur.accept()
+                print(f"[sync] connexion entrante : {addr[0]}:{addr[1]}")
+                transport = TransportTcp(sock)
+            elif par_relais:
+                transport = ouvrir_relais(code, "invite")
+                attendre_pair_relais(transport)
+            else:
+                sock = socket.create_connection(pair_direct, timeout=10.0)
+                transport = TransportTcp(sock)
+            pair = poignee_de_main(transport, est_hote, code)
+        except KeyboardInterrupt:
+            raise
+        except Refus as exc:
+            print(f"[reseau] refuse : {exc}")
+            gui_etat(plugin, f"Refusé : {exc}")
+            if transport is not None:
+                transport.fermer()
+                transport = None
+            if not est_hote:
+                time.sleep(3.0)
+            continue
+        except Exception as exc:
+            if transport is not None:
+                transport.fermer()
+                transport = None
+            raison = getattr(exc, "winerror", None)
+            print(f"[reseau] connexion impossible ({exc})")
+            if pair_direct is not None:
                 if raison == 10061:
                     print("[sync]   -> personne n'ecoute a cette adresse.")
                     print("[sync]      verifie le PORT : la box peut avoir ouvert")
@@ -2424,18 +2789,20 @@ def main():
                     print("[sync]      verifier que l'agent est bien lance chez lui.")
                 elif raison == 11001:
                     print("[sync]   -> adresse introuvable : erreur de frappe ?")
-                print("[sync] nouvelle tentative dans 3 s (Ctrl+C pour arreter)")
-                time.sleep(3.0)
-                continue
-            peer_sock.settimeout(None)
-            print(f"[sync] connecte au pair {args.peer}")
-            gui_etat(plugin, f"Connecte a {args.peer} (invite)")
+            print("[sync] nouvelle tentative dans 3 s (Ctrl+C pour arreter)")
+            time.sleep(3.0)
+            continue
+
+        poste = pair.get("poste", "?")
+        print(f"[sync] session ouverte avec {poste} (version {pair.get('version')})")
+        gui_etat(plugin, f"PAIR {poste}")
+        gui_etat(plugin, f"Connecté à {poste} ({'hôte' if est_hote else 'invité'})")
 
         # --- session -------------------------------------------------------
         sync = None
-        link = Link(peer_sock,
+        link = Link(transport,
                     lambda m: sync.on_message(m) if sync is not None else None)
-        sync = Sync(plugin, link, args.listen is not None)
+        sync = Sync(plugin, link, est_hote)
 
         try:
             sync.run()
@@ -2446,10 +2813,10 @@ def main():
             # au lieu de demander a l'utilisateur de relancer l'agent.
             print(f"[sync] FL a disparu ({exc})")
             print("[sync] on attend le retour de l'effet FruityMulti Bridge...")
-            try:
-                peer_sock.close()
-            except OSError:
-                pass
+            link.alive = False
+            transport.fermer()
+            transport = None
+            ecrire_compat([], [], [])
             while True:
                 time.sleep(2.0)
                 try:
@@ -2465,27 +2832,26 @@ def main():
                 plugin.close()
             continue
         except SystemExit:
-            plugin.close()
-            if args.listen:
-                close_upnp(args.listen)
+            fermer_tout()
             return 1
         except Exception as exc:
             print(f"[sync] session interrompue : {exc}")
 
-        try:
-            peer_sock.close()
-        except OSError:
-            pass
+        link.alive = False
+        transport.fermer()
+        transport = None
+        ecrire_compat([], [], [])
+        gui_etat(plugin, "PAIR -")
 
         if args.once:
             break
         print("[sync] on attend un nouveau pair")
-        if not args.listen:
+        gui_etat(plugin, "Pair parti : en attente" if est_hote
+                 else "Session perdue : reconnexion…")
+        if not est_hote:
             time.sleep(2.0)
 
-    plugin.close()
-    if args.listen:
-        close_upnp(args.listen)
+    fermer_tout()
     return 0
 
 

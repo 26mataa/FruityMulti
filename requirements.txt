@@ -1,3 +1,5 @@
 mido
 python-rtmidi
 psutil
+miniupnpc
+websockets==15.0.1

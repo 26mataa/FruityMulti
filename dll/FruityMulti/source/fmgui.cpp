@@ -1,91 +1,88 @@
-// FruityMulti - la fenêtre du plugin.
+// FruityMulti - la fenetre du plugin.
 //
-// Trois choses, et rien de plus : héberger une session, en rejoindre une, et
-// vérifier les mises à jour. Le reste (l'état, l'adresse, le journal) tient sur
-// une seule page.
+// Une fenetre Win32 enfant de FL, rendue en DirectX 11 par Dear ImGui. Le
+// dessin lui-meme est dans fmstation.cpp ; ici : l'etat partage avec l'agent,
+// le lancement de l'agent, la mise a jour, et la plomberie de la vue VST3.
 //
-// Tout est dessiné à la main en GDI : pas de dépendance, pas de toolkit, et ça
-// ressemble à un vrai plugin.
+// Tout tourne sur le thread de l'interface de FL (minuterie de 16 ms) : rien
+// ici ne doit bloquer, sinon FL entier se fige.
 
 #include "fmgui.h"
+#include "fmstation.h"
 
 // winsock2 doit venir avant windows.h
 #include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
+#include <d3d11.h>
 
 #include <atomic>
-#include <thread>
-#include <string>
-#include <mutex>
-#include <vector>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "imgui.h"
+#include "backends/imgui_impl_dx11.h"
+#include "polices.h"
 
 #include "pluginterfaces/base/funknown.h"
+#include "pluginterfaces/base/keycodes.h"
 #include "pluginterfaces/gui/iplugview.h"
+#include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 
 using namespace Steinberg;
 
 // --------------------------------------------------------------------------
-// Etat partagé (écrit par le fil réseau du plugin, lu par la fenêtre)
+// Etat partage (ecrit par le fil reseau du plugin, lu par la fenetre)
 // --------------------------------------------------------------------------
 namespace {
 
 std::mutex g_mtx;
-std::string g_statut = "Aucune session";
+std::string g_statut;
 std::string g_adresse;
-std::string g_maj = "";
+std::string g_pair;
+std::string g_erreur;   // pourquoi l'agent s'est arrete, s'il l'a dit
 int  g_role = 0;
 bool g_agent = false;
 
-HWND g_panel = nullptr;      // notre fenêtre
-HANDLE g_agentProc = nullptr; // agent lance depuis la fenetre
-DWORD  g_agentPid = 0;
-HWND g_edit = nullptr;       // champ adresse
-bool g_hover[5] = { false, false, false, false, false };
-int  g_majDispo = 0;   // numero de la version proposee, 0 = aucune
+// l'agent de session lance depuis la fenetre (un seul par FL)
+HANDLE g_agentProc = nullptr;
+bool   g_arretVoulu = false;
+
+// mise a jour
+std::atomic<int> g_majEtat ((int)fmstation::Maj::Repos);
+std::atomic<int> g_majVersion (0);
 std::atomic<bool> g_checkEnCours (false);
-std::atomic<int>  g_checkResultat (-1);   // -1 = pas encore repondu
-
-const char* kClasse = "FruityMultiPanel";
-
-// Couleurs (thème sombre, accent orange FL)
-const COLORREF C_FOND      = RGB (0x17, 0x18, 0x1C);
-const COLORREF C_CARTE     = RGB (0x20, 0x21, 0x27);
-const COLORREF C_BORD      = RGB (0x2E, 0x30, 0x38);
-const COLORREF C_TEXTE     = RGB (0xE9, 0xEA, 0xEE);
-const COLORREF C_DIM       = RGB (0x8A, 0x8D, 0x97);
-const COLORREF C_ACCENT    = RGB (0xFF, 0x7A, 0x18);
-const COLORREF C_ACCENT2   = RGB (0xD9, 0x62, 0x0E);
-const COLORREF C_VERT      = RGB (0x3D, 0xDC, 0x84);
-const COLORREF C_ROUGE     = RGB (0xE5, 0x5B, 0x5B);
-
-const int L = 22;            // marge
-const int W = 520;
-const int H = 352;
-
-// Zones cliquables
-RECT g_btnHeberger, g_btnRejoindre, g_btnCopier, g_btnMaj, g_btnQuitter;
 
 // --------------------------------------------------------------------------
 // Petits utilitaires
 // --------------------------------------------------------------------------
-std::string cheminAgent ()
+std::string dossierLocal ()
 {
 	char base[MAX_PATH] = { 0 };
-	const DWORD n = GetEnvironmentVariableA ("LOCALAPPDATA", base, MAX_PATH);
-	if (n > 0 && n < MAX_PATH)
+	if (GetEnvironmentVariableA ("LOCALAPPDATA", base, MAX_PATH) == 0)
+		return std::string ();
+	return std::string (base) + "\\FruityMulti";
+}
+
+std::string cheminAgent ()
+{
+	const std::string local = dossierLocal ();
+	if (!local.empty ())
 	{
-		std::string p (base);
-		p += "\\FruityMulti\\fm_agent.exe";
+		const std::string p = local + "\\fm_agent.exe";
 		if (GetFileAttributesA (p.c_str ()) != INVALID_FILE_ATTRIBUTES)
 			return p;
 	}
 
-	// repli : à côté de la DLL du plugin
+	// repli : a cote de la DLL du plugin
 	HMODULE self = nullptr;
 	GetModuleHandleExA (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
 	                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -101,8 +98,16 @@ std::string cheminAgent ()
 	return std::string ();
 }
 
-// Lance l'agent. `console` = fenêtre noire visible (pour voir les messages).
-bool lancerAgent (const std::string& arguments, bool console)
+HINSTANCE moduleDuPlugin ()
+{
+	HMODULE soi = nullptr;
+	GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+	                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                    (LPCWSTR)&moduleDuPlugin, &soi);
+	return (HINSTANCE)soi;
+}
+
+bool creerProcessus (const std::string& arguments, HANDLE* proc)
 {
 	const std::string exe = cheminAgent ();
 	if (exe.empty ())
@@ -117,21 +122,91 @@ bool lancerAgent (const std::string& arguments, bool console)
 	si.cb = sizeof (si);
 	PROCESS_INFORMATION pi;
 	memset (&pi, 0, sizeof (pi));
-
-	const DWORD drapeaux = console ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
 	if (!CreateProcessA (nullptr, buf.data (), nullptr, nullptr, FALSE,
-	                     drapeaux, nullptr, nullptr, &si, &pi))
+	                     CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
 		return false;
-
 	CloseHandle (pi.hThread);
-	if (g_agentProc != nullptr)
-		CloseHandle (g_agentProc);
-	g_agentProc = pi.hProcess;
-	g_agentPid = pi.dwProcessId;
+	if (proc != nullptr)
+		*proc = pi.hProcess;
+	else
+		CloseHandle (pi.hProcess);
 	return true;
 }
 
-// Lance un programme et récupère sa sortie (utilisé pour --check).
+// Arrete tous les agents de session. Un agent orphelin (FL ferme ou plante
+// pendant une session) gardait le verrou : le suivant sortait aussitot et la
+// fenetre affichait une session qui n'existait pas.
+void tuerAgents ()
+{
+	if (g_agentProc != nullptr)
+	{
+		g_arretVoulu = true;
+		TerminateProcess (g_agentProc, 0);
+		WaitForSingleObject (g_agentProc, 1000);
+		CloseHandle (g_agentProc);
+		g_agentProc = nullptr;
+	}
+
+	HANDLE instantane = CreateToolhelp32Snapshot (TH32CS_SNAPPROCESS, 0);
+	if (instantane == INVALID_HANDLE_VALUE)
+		return;
+	PROCESSENTRY32W entree;
+	entree.dwSize = sizeof (entree);
+	if (Process32FirstW (instantane, &entree))
+	{
+		do
+		{
+			if (_wcsicmp (entree.szExeFile, L"fm_agent.exe") == 0)
+			{
+				HANDLE p = OpenProcess (PROCESS_TERMINATE | SYNCHRONIZE, FALSE,
+				                        entree.th32ProcessID);
+				if (p != nullptr)
+				{
+					TerminateProcess (p, 0);
+					WaitForSingleObject (p, 1000);
+					CloseHandle (p);
+				}
+			}
+		} while (Process32NextW (instantane, &entree));
+	}
+	CloseHandle (instantane);
+}
+
+bool lancerSession (const std::string& arguments)
+{
+	tuerAgents ();
+	char parent[32];
+	snprintf (parent, sizeof (parent), " --parent %lu", GetCurrentProcessId ());
+	g_arretVoulu = false;
+	{
+		std::lock_guard<std::mutex> g (g_mtx);
+		g_erreur.clear ();
+	}
+	return creerProcessus (arguments + parent, &g_agentProc);
+}
+
+// L'agent s'est arrete sans qu'on le demande : la fenetre doit le dire au
+// lieu d'afficher une session fantome.
+void surveillerAgent ()
+{
+	if (g_agentProc == nullptr)
+		return;
+	if (WaitForSingleObject (g_agentProc, 0) != WAIT_OBJECT_0)
+		return;
+	CloseHandle (g_agentProc);
+	g_agentProc = nullptr;
+	if (!g_arretVoulu)
+	{
+		std::lock_guard<std::mutex> g (g_mtx);
+		g_role = 0;
+		g_pair.clear ();
+		g_statut = g_erreur.empty () ? "L'agent s'est arrêté — voir le journal" : g_erreur;
+	}
+}
+
+// Lance un programme et recupere sa sortie (utilise pour --check). La sortie
+// est lue au fil de l'eau : attendre la fin d'abord bloquait l'enfant des que
+// le tuyau etait plein.
 std::string lancerEtLire (const std::string& arguments, DWORD attenteMs)
 {
 	std::string sortie;
@@ -159,11 +234,9 @@ std::string lancerEtLire (const std::string& arguments, DWORD attenteMs)
 	si.dwFlags = STARTF_USESTDHANDLES;
 	si.hStdOutput = ecriture;
 	si.hStdError = ecriture;
-	si.hStdInput = nullptr;
 
 	PROCESS_INFORMATION pi;
 	memset (&pi, 0, sizeof (pi));
-
 	if (!CreateProcessA (nullptr, buf.data (), nullptr, nullptr, TRUE,
 	                     CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
 	{
@@ -171,16 +244,34 @@ std::string lancerEtLire (const std::string& arguments, DWORD attenteMs)
 		CloseHandle (ecriture);
 		return sortie;
 	}
-
 	CloseHandle (ecriture);
-	WaitForSingleObject (pi.hProcess, attenteMs);
 
-	char morceau[512];
-	DWORD lus = 0;
-	while (ReadFile (lecture, morceau, sizeof (morceau) - 1, &lus, nullptr) && lus > 0)
+	const DWORD debut = GetTickCount ();
+	for (;;)
 	{
-		morceau[lus] = 0;
-		sortie += morceau;
+		DWORD dispo = 0;
+		if (PeekNamedPipe (lecture, nullptr, 0, nullptr, &dispo, nullptr) && dispo > 0)
+		{
+			char morceau[512];
+			DWORD lus = 0;
+			if (ReadFile (lecture, morceau, sizeof (morceau), &lus, nullptr) && lus > 0)
+				sortie.append (morceau, lus);
+			continue;
+		}
+		if (WaitForSingleObject (pi.hProcess, 50) == WAIT_OBJECT_0)
+		{
+			char morceau[512];
+			DWORD lus = 0;
+			while (PeekNamedPipe (lecture, nullptr, 0, nullptr, &dispo, nullptr) && dispo > 0
+			       && ReadFile (lecture, morceau, sizeof (morceau), &lus, nullptr) && lus > 0)
+				sortie.append (morceau, lus);
+			break;
+		}
+		if (GetTickCount () - debut > attenteMs)
+		{
+			TerminateProcess (pi.hProcess, 1);
+			break;
+		}
 	}
 
 	CloseHandle (lecture);
@@ -189,176 +280,12 @@ std::string lancerEtLire (const std::string& arguments, DWORD attenteMs)
 	return sortie;
 }
 
-// Adresse IPv4 locale (première non-loopback).
-std::string adresseLocale ()
-{
-	// On demande a Windows quelle adresse sortirait vers internet : c'est la
-	// seule qui soit joignable par l'autre poste. gethostname() renvoyait une
-	// adresse d'une carte virtuelle au lieu de la vraie carte reseau.
-	SOCKET s = socket (AF_INET, SOCK_DGRAM, 0);
-	if (s == INVALID_SOCKET)
-		return "127.0.0.1";
-
-	sockaddr_in cible;
-	memset (&cible, 0, sizeof (cible));
-	cible.sin_family = AF_INET;
-	cible.sin_port = htons (53);
-	cible.sin_addr.s_addr = inet_addr ("8.8.8.8");
-
-	std::string resultat = "127.0.0.1";
-	if (connect (s, (sockaddr*)&cible, sizeof (cible)) == 0)
-	{
-		sockaddr_in local;
-		int taille = sizeof (local);
-		if (getsockname (s, (sockaddr*)&local, &taille) == 0)
-		{
-			const unsigned char* o = (const unsigned char*)&local.sin_addr;
-			char texte[64];
-			snprintf (texte, sizeof (texte), "%u.%u.%u.%u", o[0], o[1], o[2], o[3]);
-			if (o[0] != 127)
-				resultat = texte;
-		}
-	}
-	closesocket (s);
-	return resultat;
-}
-
-void copier (const std::string& texte)
-{
-	if (texte.empty ())
-		return;
-	if (!OpenClipboard (g_panel))
-		return;
-	EmptyClipboard ();
-	const size_t n = texte.size () + 1;
-	HGLOBAL mem = GlobalAlloc (GMEM_MOVEABLE, n);
-	if (mem != nullptr)
-	{
-		void* p = GlobalLock (mem);
-		if (p != nullptr)
-		{
-			memcpy (p, texte.c_str (), n);
-			GlobalUnlock (mem);
-			SetClipboardData (CF_TEXT, mem);
-		}
-	}
-	CloseClipboard ();
-}
-
-// Peinture : coins arrondis + dégradé discret
-void carte (HDC dc, RECT r, COLORREF fond, COLORREF bord)
-{
-	HBRUSH b = CreateSolidBrush (fond);
-	HPEN p = CreatePen (PS_SOLID, 1, bord);
-	HGDIOBJ ob = SelectObject (dc, b);
-	HGDIOBJ op = SelectObject (dc, p);
-	RoundRect (dc, r.left, r.top, r.right, r.bottom, 10, 10);
-	SelectObject (dc, ob);
-	SelectObject (dc, op);
-	DeleteObject (b);
-	DeleteObject (p);
-}
-
-void texteCentre (HDC dc, const wchar_t* s, RECT r, COLORREF c, HFONT f)
-{
-	HGDIOBJ of = SelectObject (dc, f);
-	SetBkMode (dc, TRANSPARENT);
-	SetTextColor (dc, c);
-	DrawTextW (dc, s, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-	SelectObject (dc, of);
-}
-
-void texteGauche (HDC dc, const char* s, RECT r, COLORREF c, HFONT f, UINT format = 0)
-{
-	HGDIOBJ of = SelectObject (dc, f);
-	SetBkMode (dc, TRANSPARENT);
-	SetTextColor (dc, c);
-	int largeur = MultiByteToWideChar (CP_UTF8, 0, s, -1, nullptr, 0);
-	std::wstring w (largeur > 0 ? largeur : 1, L'\0');
-	MultiByteToWideChar (CP_UTF8, 0, s, -1, &w[0], largeur);
-	DrawTextW (dc, w.c_str (), -1, &r, format | DT_SINGLELINE | DT_END_ELLIPSIS);
-	SelectObject (dc, of);
-}
-
-std::string texteDeLEdit ()
-{
-	if (g_edit == nullptr)
-		return std::string ();
-	char buf[128] = { 0 };
-	GetWindowTextA (g_edit, buf, sizeof (buf) - 1);
-	return std::string (buf);
-}
-
-void poserEdit (const std::string& s)
-{
-	if (g_edit != nullptr)
-		SetWindowTextA (g_edit, s.c_str ());
-}
-
-// --------------------------------------------------------------------------
-// Actions des boutons
-// --------------------------------------------------------------------------
-void actionHeberger ()
-{
-	// On n'invente aucune adresse : seule celle que l'agent obtient (IP
-	// publique + port reellement ouvert sur la box) est juste.
-	poserEdit ("");
-	if (lancerAgent ("--listen 5000", false))
-	{
-		fmgui::setRole (1);
-		fmgui::setStatus ("ouverture de la session\u2026 l'adresse arrive");
-	}
-	else
-	{
-		fmgui::setStatus ("fm_agent.exe introuvable : reinstalle le plugin");
-	}
-	InvalidateRect (g_panel, nullptr, FALSE);
-}
-
-void actionRejoindre ()
-{
-	std::string adresse = texteDeLEdit ();
-	if (adresse.find (':') == std::string::npos)
-		adresse += ":5000";
-
-	if (lancerAgent ("--peer " + adresse, false))
-	{
-		fmgui::setRole (2);
-		fmgui::setAddress (adresse.c_str ());
-		fmgui::setStatus (("Connexion à " + adresse + "…").c_str ());
-	}
-	else
-	{
-		fmgui::setStatus ("fm_agent.exe introuvable : reinstalle le plugin");
-	}
-	InvalidateRect (g_panel, nullptr, FALSE);
-}
-
-void actionQuitter ()
-{
-	if (g_agentProc != nullptr)
-	{
-		TerminateProcess (g_agentProc, 0);
-		CloseHandle (g_agentProc);
-		g_agentProc = nullptr;
-		g_agentPid = 0;
-	}
-	fmgui::setRole (0);
-	fmgui::setStatus ("Aucune session");
-	InvalidateRect (g_panel, nullptr, FALSE);
-}
-
 // Vrai si le fichier du plugin sur le disque a ete remplace APRES le
 // demarrage de FL : la version chargee en memoire est donc perimee.
 bool pluginObsolete ()
 {
 	wchar_t chemin[MAX_PATH] = { 0 };
-	HMODULE soi = nullptr;
-	if (!GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-	                         | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-	                         (LPCWSTR)&pluginObsolete, &soi))
-		return false;
-	if (GetModuleFileNameW (soi, chemin, MAX_PATH) == 0)
+	if (GetModuleFileNameW (moduleDuPlugin (), chemin, MAX_PATH) == 0)
 		return false;
 
 	WIN32_FILE_ATTRIBUTE_DATA info;
@@ -366,8 +293,7 @@ bool pluginObsolete ()
 		return false;
 
 	FILETIME creation, sortie, noyau, utilisateur;
-	if (!GetProcessTimes (GetCurrentProcess (), &creation, &sortie,
-	                      &noyau, &utilisateur))
+	if (!GetProcessTimes (GetCurrentProcess (), &creation, &sortie, &noyau, &utilisateur))
 		return false;
 
 	ULARGE_INTEGER fichier, processus;
@@ -378,416 +304,260 @@ bool pluginObsolete ()
 	return fichier.QuadPart > processus.QuadPart;
 }
 
-std::string dossierLocal ()
+std::wstring enLarge (const std::string& s)
 {
-	char base[MAX_PATH] = { 0 };
-	if (GetEnvironmentVariableA ("LOCALAPPDATA", base, MAX_PATH) == 0)
-		return std::string ();
-	return std::string (base) + "\\FruityMulti";
+	const int n = MultiByteToWideChar (CP_UTF8, 0, s.c_str (), -1, nullptr, 0);
+	std::wstring w (n > 0 ? n : 1, L'\0');
+	MultiByteToWideChar (CP_UTF8, 0, s.c_str (), -1, &w[0], n);
+	return w;
 }
 
-void actionInstaller ()
+std::string enUtf8 (const wchar_t* w)
 {
-	// L'agent telecharge la nouvelle version puis lance l'installateur, qui
-	// ferme FL, copie le plugin et l'agent au bon endroit, et redemarre FL.
-	if (!lancerAgent ("--maj --installer", false))
-	{
-		fmgui::soumettreEtat ("fm_agent.exe introuvable : reinstalle le plugin");
-	}
-	else
-	{
-		const std::string setup = dossierLocal () + "\\FruityMultiSetup.exe";
-		if (GetFileAttributesA (setup.c_str ()) == INVALID_FILE_ATTRIBUTES)
-			fmgui::soumettreEtat ("installateur absent : reinstalle une fois a la main");
-		else
-			fmgui::soumettreEtat ("mise a jour en cours : FL va redemarrer tout seul");
-	}
-	InvalidateRect (g_panel, nullptr, FALSE);
+	const int n = WideCharToMultiByte (CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+	std::string s (n > 0 ? n : 1, '\0');
+	WideCharToMultiByte (CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+	if (!s.empty () && s.back () == '\0')
+		s.pop_back ();
+	return s;
 }
 
-void actionCopier ()
+void copierTexte (HWND proprietaire, const std::string& texte)
 {
-	const std::string a = texteDeLEdit ();
-	copier (a.empty () ? g_adresse : a);
-	fmgui::soumettreEtat ("adresse copiée");
-	InvalidateRect (g_panel, nullptr, FALSE);
-}
-
-// Reponse de la verification, arrivee par WM_APP + 2 (thread de travail).
-void afficherResultatMaj ()
-{
-	const int distante = g_checkResultat.exchange (-1);
-	g_checkEnCours = false;
-	if (distante < 0)
-	{
-		InvalidateRect (g_panel, nullptr, FALSE);
+	if (texte.empty () || !OpenClipboard (proprietaire))
 		return;
+	EmptyClipboard ();
+	const std::wstring w = enLarge (texte);
+	HGLOBAL mem = GlobalAlloc (GMEM_MOVEABLE, w.size () * sizeof (wchar_t));
+	if (mem != nullptr)
+	{
+		void* p = GlobalLock (mem);
+		if (p != nullptr)
+		{
+			memcpy (p, w.c_str (), w.size () * sizeof (wchar_t));
+			GlobalUnlock (mem);
+			if (SetClipboardData (CF_UNICODETEXT, mem) == nullptr)
+				GlobalFree (mem);
+		}
 	}
+	CloseClipboard ();
+}
 
-	char message[128];
-	if (distante == 0)
+std::string lirePressePapiers (HWND proprietaire)
+{
+	std::string r;
+	if (!OpenClipboard (proprietaire))
+		return r;
+	HANDLE h = GetClipboardData (CF_UNICODETEXT);
+	if (h != nullptr)
 	{
-		g_majDispo = 0;
-		snprintf (message, sizeof (message),
-		          "vérification impossible (pas de réseau ?)");
+		const wchar_t* w = (const wchar_t*)GlobalLock (h);
+		if (w != nullptr)
+		{
+			r = enUtf8 (w);
+			GlobalUnlock (h);
+		}
 	}
-	else if (distante <= fmgui::kVersionPlugin)
+	CloseClipboard ();
+	return r.size () > 200 ? r.substr (0, 200) : r;
+}
+
+std::string nomDuPoste ()
+{
+	char nom[MAX_COMPUTERNAME_LENGTH + 1] = { 0 };
+	DWORD n = sizeof (nom);
+	GetComputerNameA (nom, &n);
+	return nom;
+}
+
+// Fin d'un fichier texte (le journal de l'agent peut peser 400 Ko).
+std::vector<std::string> dernieresLignes (const std::string& chemin, size_t combien)
+{
+	std::vector<std::string> lignes;
+	HANDLE f = CreateFileA (chemin.c_str (), GENERIC_READ,
+	                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	                        nullptr, OPEN_EXISTING, 0, nullptr);
+	if (f == INVALID_HANDLE_VALUE)
+		return lignes;
+	LARGE_INTEGER taille;
+	GetFileSizeEx (f, &taille);
+	const LONGLONG lire = taille.QuadPart < 4096 ? taille.QuadPart : 4096;
+	LARGE_INTEGER pos;
+	pos.QuadPart = taille.QuadPart - lire;
+	SetFilePointerEx (f, pos, nullptr, FILE_BEGIN);
+	std::string buf ((size_t)lire, '\0');
+	DWORD lus = 0;
+	if (lire > 0)
+		ReadFile (f, &buf[0], (DWORD)lire, &lus, nullptr);
+	CloseHandle (f);
+	buf.resize (lus);
+
+	size_t debut = 0;
+	while (debut < buf.size ())
 	{
-		g_majDispo = 0;
-		snprintf (message, sizeof (message),
-		          "à jour (version %d)", fmgui::kVersionPlugin);
+		size_t fin = buf.find ('\n', debut);
+		if (fin == std::string::npos)
+			fin = buf.size ();
+		std::string l = buf.substr (debut, fin - debut);
+		while (!l.empty () && (l.back () == '\r' || l.back () == ' '))
+			l.pop_back ();
+		// les cadres de « ==== » de l'agent n'apportent rien ici
+		size_t g = 0;
+		while (g < l.size () && (l[g] == ' ' || l[g] == '='))
+			++g;
+		// une erreur repetee en boucle ne doit pas remplir tout l'ecran
+		if (g < l.size () && (lignes.empty () || lignes.back () != l.substr (g)))
+			lignes.push_back (l.substr (g));
+		debut = fin + 1;
+	}
+	if (lire == 4096 && !lignes.empty ())
+		lignes.erase (lignes.begin ());   // premiere ligne sans doute coupee
+	if (lignes.size () > combien)
+		lignes.erase (lignes.begin (), lignes.end () - combien);
+	return lignes;
+}
+
+// compat.txt, ecrit par l'agent : « = nom », « + nom », « - nom »
+std::vector<std::pair<char, std::string>> lireCompat (const std::string& chemin)
+{
+	std::vector<std::pair<char, std::string>> r;
+	FILE* f = fopen (chemin.c_str (), "rb");
+	if (f == nullptr)
+		return r;
+	char ligne[512];
+	while (fgets (ligne, sizeof (ligne), f) != nullptr)
+	{
+		std::string l (ligne);
+		while (!l.empty () && (l.back () == '\n' || l.back () == '\r'))
+			l.pop_back ();
+		if (l.size () > 2 && (l[0] == '=' || l[0] == '+' || l[0] == '-') && l[1] == ' ')
+			r.emplace_back (l[0], l.substr (2));
+	}
+	fclose (f);
+	return r;
+}
+
+// --------------------------------------------------------------------------
+// Actions
+// --------------------------------------------------------------------------
+void actionHeberger ()
+{
+	{
+		std::lock_guard<std::mutex> g (g_mtx);
+		g_adresse.clear ();
+		g_pair.clear ();
+	}
+	if (lancerSession ("--heberger"))
+	{
+		fmgui::setRole (1);
+		fmgui::setStatus ("Ouverture de la station…");
 	}
 	else
 	{
-		g_majDispo = distante;
-		snprintf (message, sizeof (message),
-		          "version %d disponible : clique sur Installer", distante);
+		fmgui::setStatus ("fm_agent.exe introuvable : réinstalle FruityMulti");
 	}
-	fmgui::soumettreEtat (message);
-	InvalidateRect (g_panel, nullptr, FALSE);
 }
 
-void actionMaj ()
+void actionRejoindre (const std::string& brut)
 {
-	// Le fichier a deja ete remplace (installation ou mise a jour faite
-	// pendant que FL tournait) : inutile de telecharger, il faut redemarrer.
+	// Un code (K7P2QX) ou, en direct, ip:port/CODE. Rien d'autre ne passe :
+	// le texte finit sur la ligne de commande de l'agent.
+	std::string adresse;
+	for (char c : brut)
+		if (isalnum ((unsigned char)c) || c == '.' || c == ':' || c == '/' || c == '-')
+			adresse += c;
+	if (adresse.empty ())
+		return;
+
+	{
+		std::lock_guard<std::mutex> g (g_mtx);
+		g_pair.clear ();
+	}
+	if (lancerSession ("--rejoindre " + adresse))
+	{
+		fmgui::setRole (2);
+		fmgui::setAddress (adresse.c_str ());
+		fmgui::setStatus ("Recherche de la fréquence…");
+	}
+	else
+	{
+		fmgui::setStatus ("fm_agent.exe introuvable : réinstalle FruityMulti");
+	}
+}
+
+void actionCouper ()
+{
+	tuerAgents ();
+	fmgui::agentParti ();
+}
+
+void actionVerifierMaj ()
+{
+	// Le fichier a deja ete remplace (installation faite pendant que FL
+	// tournait) : inutile de telecharger, il faut redemarrer.
 	if (pluginObsolete ())
 	{
-		g_majDispo = 0;
-		fmgui::soumettreEtat ("mise à jour déjà installée : redémarre FL Studio");
-		InvalidateRect (g_panel, nullptr, FALSE);
+		g_majEtat = (int)fmstation::Maj::Redemarrer;
 		return;
 	}
-
 	if (g_checkEnCours.exchange (true))
-		return;   // deja en cours
-
-	fmgui::soumettreEtat ("vérification en cours…");
-	InvalidateRect (g_panel, nullptr, FALSE);
+		return;
+	g_majEtat = (int)fmstation::Maj::Verif;
 
 	// JAMAIS d'attente sur le thread de l'interface : Windows declare FL
 	// fige au bout de 5 s. On interroge GitHub depuis un thread.
 	std::thread ([] {
+		const DWORD debut = GetTickCount ();
 		const std::string sortie = lancerEtLire ("--check", 20000);
 		int distante = 0;
 		const size_t pos = sortie.find ("MAJ ");
 		if (pos != std::string::npos)
 			distante = atoi (sortie.c_str () + pos + 4);
-		g_checkResultat = distante;
-		if (g_panel != nullptr)
-			PostMessageW (g_panel, WM_APP + 2, 0, 0);
+		// une reponse instantanee passerait inapercue : on laisse le temps
+		// de voir que GitHub a ete interroge
+		const DWORD duree = GetTickCount () - debut;
+		if (duree < 700)
+			Sleep (700 - duree);
+		g_majVersion = distante;
+		if (distante <= 0)
+			g_majEtat = (int)fmstation::Maj::Erreur;
+		else if (distante <= fmgui::kVersionPlugin)
+			g_majEtat = (int)fmstation::Maj::AJour;
+		else
+			g_majEtat = (int)fmstation::Maj::Dispo;
+		g_checkEnCours = false;
 	}).detach ();
 }
 
-// --------------------------------------------------------------------------
-// Fenêtre
-// --------------------------------------------------------------------------
-void dessiner (HDC dc, int largeur, int hauteur)
+void actionInstallerMaj ()
 {
-	// fond
-	HBRUSH fond = CreateSolidBrush (C_FOND);
-	RECT tout = { 0, 0, largeur, hauteur };
-	FillRect (dc, &tout, fond);
-	DeleteObject (fond);
-
-	HFONT titre   = CreateFontW (-26, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-	                             DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY,
-	                             DEFAULT_PITCH, L"Segoe UI");
-	HFONT sous    = CreateFontW (-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-	                             DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY,
-	                             DEFAULT_PITCH, L"Segoe UI");
-	HFONT bouton  = CreateFontW (-15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-	                             DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY,
-	                             DEFAULT_PITCH, L"Segoe UI");
-	HFONT petit   = CreateFontW (-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-	                             DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY,
-	                             DEFAULT_PITCH, L"Segoe UI");
-
-	RECT r = { L, 16, largeur - L, 52 };
-	texteGauche (dc, "FruityMulti", r, C_TEXTE, titre);
-
-	RECT rv = { largeur - 150, 22, largeur - L, 46 };
-	char version[64];
-	snprintf (version, sizeof (version), "version %d", fmgui::kVersionPlugin);
-	texteGauche (dc, version, rv, C_DIM, petit, DT_RIGHT);
-
-	r = { L, 50, largeur - L, 72 };
-	texteGauche (dc, "Produire à deux dans FL Studio, chacun sur son PC", r, C_DIM, sous);
-
-	// deux gros boutons
-	const int bw = (largeur - 3 * L) / 2;
-	g_btnHeberger = { L, 88, L + bw, 148 };
-	g_btnRejoindre = { L * 2 + bw, 88, largeur - L, 148 };
-
-	carte (dc, g_btnHeberger, g_hover[0] ? C_ACCENT2 : C_ACCENT, C_ACCENT);
-	texteCentre (dc, L"HÉBERGER", g_btnHeberger, RGB (20, 12, 6), bouton);
-
-	carte (dc, g_btnRejoindre, g_hover[1] ? RGB (0x2A, 0x2C, 0x34) : C_CARTE, C_BORD);
-	texteCentre (dc, L"REJOINDRE", g_btnRejoindre, C_TEXTE, bouton);
-
-	// adresse
-	r = { L, 164, largeur - L, 184 };
-	texteGauche (dc, "Adresse de la session", r, C_DIM, petit);
-
-	// le champ lui-même est un contrôle enfant (voir WM_CREATE)
-	g_btnCopier = { largeur - L - 88, 190, largeur - L, 222 };
-	carte (dc, g_btnCopier, g_hover[2] ? RGB (0x2A, 0x2C, 0x34) : C_CARTE, C_BORD);
-	texteCentre (dc, L"Copier", g_btnCopier, C_TEXTE, petit);
-
-	// état
-	COLORREF couleur = C_DIM;
-	if (g_role == 1) couleur = C_ACCENT;
-	if (g_role == 2) couleur = C_VERT;
-
-	HBRUSH pastille = CreateSolidBrush (couleur);
-	HGDIOBJ ob = SelectObject (dc, pastille);
-	HGDIOBJ op = SelectObject (dc, GetStockObject (NULL_PEN));
-	Ellipse (dc, L, 246, L + 10, 256);
-	SelectObject (dc, ob);
-	SelectObject (dc, op);
-	DeleteObject (pastille);
-
-	RECT re = { L + 18, 240, largeur - L - 92, 262 };
-	texteGauche (dc, g_statut.c_str (), re, C_TEXTE, sous);
-
-	// bouton Quitter, seulement quand une session tourne
-	g_btnQuitter = { largeur - L - 84, 236, largeur - L, 264 };
-	if (g_role != 0)
-	{
-		carte (dc, g_btnQuitter,
-		       g_hover[4] ? RGB (0x3A, 0x2A, 0x2A) : C_CARTE, C_BORD);
-		texteCentre (dc, L"Quitter", g_btnQuitter, C_ROUGE, petit);
-	}
-
-	// pied de page
-	g_btnMaj = { largeur - L - 190, 292, largeur - L, 324 };
-	carte (dc, g_btnMaj, g_hover[3] ? RGB (0x2A, 0x2C, 0x34) : C_CARTE, C_BORD);
-	if (g_majDispo > 0)
-	{
-		wchar_t libelle[64];
-		swprintf_s (libelle, L"Installer la version %d", g_majDispo);
-		carte (dc, g_btnMaj, g_hover[3] ? C_ACCENT2 : C_ACCENT, C_ACCENT);
-		texteCentre (dc, libelle, g_btnMaj, RGB (20, 12, 6), petit);
-	}
+	// L'agent telecharge la nouvelle version puis lance l'installateur, qui
+	// ferme FL, copie le plugin et l'agent, et redemarre FL. Ce processus-la
+	// n'est pas l'agent de session : il ne doit pas etre surveille ni tue.
+	if (creerProcessus ("--maj --installer", nullptr))
+		g_majEtat = (int)fmstation::Maj::Telechargement;
 	else
-	{
-		texteCentre (dc, L"Vérifier les mises à jour", g_btnMaj, C_TEXTE, petit);
-	}
-
-	RECT rm = { L, 296, largeur - L - 200, 322 };
-	texteGauche (dc, g_maj.c_str (), rm, C_DIM, petit);
-
-	DeleteObject (titre);
-	DeleteObject (sous);
-	DeleteObject (bouton);
-	DeleteObject (petit);
+		g_majEtat = (int)fmstation::Maj::Erreur;
 }
 
-LRESULT CALLBACK panelProc (HWND h, UINT msg, WPARAM w, LPARAM l)
-{
-	switch (msg)
-	{
-	case WM_CREATE:
-	{
-		HFONT police = CreateFontA (-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-		                            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY,
-		                            DEFAULT_PITCH, "Segoe UI");
-		g_edit = CreateWindowExA (0, "EDIT", "",
-		                          WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-		                          L, 190, W - 2 * L - 100, 32,
-		                          h, nullptr, nullptr, nullptr);
-		SendMessageA (g_edit, WM_SETFONT, (WPARAM)police, TRUE);
+// ==========================================================================
+// La vue
+// ==========================================================================
+const wchar_t kClasse[] = L"FruityMultiStation";
+int g_vues = 0;   // classe de fenetre enregistree tant qu'il reste une vue
 
-		// rien de pre-rempli : une adresse inventee est pire que pas d'adresse
-		SetWindowTextA (g_edit, "");
+LRESULT CALLBACK procVue (HWND h, UINT msg, WPARAM w, LPARAM l);
 
-		SetTimer (h, 1, 400, nullptr);
-		return 0;
-	}
-	case WM_APP + 2:
-		afficherResultatMaj ();
-		return 0;
-
-	case WM_TIMER:
-	{
-		// L'agent connait la vraie adresse (UPnP) : on suit ce qu'il annonce.
-		static std::string derniere;
-		std::string voulue;
-		{
-			std::lock_guard<std::mutex> g (g_mtx);
-			voulue = g_adresse;
-		}
-		if (!voulue.empty () && voulue != derniere)
-		{
-			derniere = voulue;
-			if (g_edit != nullptr && GetFocus () != g_edit)
-				SetWindowTextA (g_edit, voulue.c_str ());
-		}
-		InvalidateRect (h, nullptr, FALSE);
-		return 0;
-	}
-
-	case WM_CTLCOLOREDIT:
-	{
-		HDC dc = (HDC)w;
-		SetBkColor (dc, RGB (0x24, 0x26, 0x2D));
-		SetTextColor (dc, C_TEXTE);
-		static HBRUSH pinceau = CreateSolidBrush (RGB (0x24, 0x26, 0x2D));
-		return (LRESULT)pinceau;
-	}
-
-	case WM_MOUSEMOVE:
-	{
-		POINT p = { GET_X_LPARAM (l), GET_Y_LPARAM (l) };
-		g_hover[0] = PtInRect (&g_btnHeberger, p) != 0;
-		g_hover[1] = PtInRect (&g_btnRejoindre, p) != 0;
-		g_hover[2] = PtInRect (&g_btnCopier, p) != 0;
-		g_hover[3] = PtInRect (&g_btnMaj, p) != 0;
-		g_hover[4] = g_role != 0 && PtInRect (&g_btnQuitter, p) != 0;
-		InvalidateRect (h, nullptr, FALSE);
-		return 0;
-	}
-
-	case WM_SETCURSOR:
-	{
-		POINT p;
-		GetCursorPos (&p);
-		ScreenToClient (h, &p);
-		if (PtInRect (&g_btnHeberger, p) || PtInRect (&g_btnRejoindre, p)
-		    || PtInRect (&g_btnCopier, p) || PtInRect (&g_btnMaj, p)
-		    || (g_role != 0 && PtInRect (&g_btnQuitter, p)))
-		{
-			SetCursor (LoadCursorW (nullptr, IDC_HAND));
-			return TRUE;
-		}
-		break;
-	}
-
-	case WM_LBUTTONDOWN:
-	{
-		POINT p = { GET_X_LPARAM (l), GET_Y_LPARAM (l) };
-		if (PtInRect (&g_btnHeberger, p))
-			actionHeberger ();
-		else if (PtInRect (&g_btnRejoindre, p))
-			actionRejoindre ();
-		else if (PtInRect (&g_btnCopier, p))
-			actionCopier ();
-		else if (PtInRect (&g_btnMaj, p))
-		{
-			if (g_majDispo > 0)
-				actionInstaller ();
-			else
-				actionMaj ();
-		}
-		else if (g_role != 0 && PtInRect (&g_btnQuitter, p))
-			actionQuitter ();
-		return 0;
-	}
-
-	case WM_ERASEBKGND:
-		return 1;   // tout est redessiné dans WM_PAINT
-
-	case WM_PAINT:
-	{
-		PAINTSTRUCT ps;
-		HDC dc = BeginPaint (h, &ps);
-		if (dc != nullptr)
-		{
-			// double tampon : évite le clignotement
-			HDC mem = CreateCompatibleDC (dc);
-			HBITMAP bmp = CreateCompatibleBitmap (dc, W, H);
-			HGDIOBJ ancien = SelectObject (mem, bmp);
-			dessiner (mem, W, H);
-			BitBlt (dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
-			SelectObject (mem, ancien);
-			DeleteObject (bmp);
-			DeleteDC (mem);
-		}
-		EndPaint (h, &ps);
-		return 0;
-	}
-
-	case WM_DESTROY:
-		KillTimer (h, 1);
-		g_panel = nullptr;
-		g_edit = nullptr;
-		return 0;
-	}
-	return DefWindowProcA (h, msg, w, l);
-}
-
-void enregistrerClasse ()
-{
-	static bool fait = false;
-	if (fait)
-		return;
-	WNDCLASSEXA wc;
-	memset (&wc, 0, sizeof (wc));
-	wc.cbSize = sizeof (wc);
-	wc.lpfnWndProc = panelProc;
-	wc.hInstance = GetModuleHandleA (nullptr);
-	wc.hCursor = LoadCursorW (nullptr, IDC_ARROW);
-	wc.lpszClassName = kClasse;
-	wc.hbrBackground = nullptr;
-	RegisterClassExA (&wc);
-	fait = true;
-}
-
-} // namespace
-
-// --------------------------------------------------------------------------
-// Etat partagé
-// --------------------------------------------------------------------------
-namespace fmgui {
-
-void setRole (int role)
-{
-	std::lock_guard<std::mutex> g (g_mtx);
-	g_role = role;
-}
-
-void setStatus (const char* texte)
-{
-	std::lock_guard<std::mutex> g (g_mtx);
-	g_statut = (texte != nullptr && *texte != 0) ? texte : "Aucune session";
-	g_agent = true;
-}
-
-void setAddress (const char* adresse)
-{
-	std::lock_guard<std::mutex> g (g_mtx);
-	g_adresse = (adresse != nullptr) ? adresse : "";
-}
-
-void soumettreEtat (const char* texte)
-{
-	std::lock_guard<std::mutex> g (g_mtx);
-	g_maj = (texte != nullptr) ? texte : "";
-}
-
-int role ()
-{
-	std::lock_guard<std::mutex> g (g_mtx);
-	return g_role;
-}
-
-bool agentLance ()
-{
-	std::lock_guard<std::mutex> g (g_mtx);
-	return g_agent;
-}
-
-} // namespace fmgui
-
-// --------------------------------------------------------------------------
-// La vue VST3
-// --------------------------------------------------------------------------
-namespace {
-
-class FmView : public IPlugView
+class FmView : public IPlugView, public IPlugViewContentScaleSupport
 {
 public:
-	FmView () : refCount (1) {}
+	// getSize est appele avant attached : on part de l'echelle du systeme
+	FmView () : refCount (1)
+	{
+		const UINT dpi = GetDpiForSystem ();
+		if (dpi >= 96)
+			echelle = dpi / 96.0f;
+	}
 
 	// --- FUnknown ---------------------------------------------------------
 	tresult PLUGIN_API queryInterface (const TUID iid, void** obj) SMTG_OVERRIDE
@@ -798,6 +568,12 @@ public:
 		    || FUnknownPrivate::iidEqual (iid, IPlugView::iid))
 		{
 			*obj = static_cast<IPlugView*> (this);
+			addRef ();
+			return kResultOk;
+		}
+		if (FUnknownPrivate::iidEqual (iid, IPlugViewContentScaleSupport::iid))
+		{
+			*obj = static_cast<IPlugViewContentScaleSupport*> (this);
 			addRef ();
 			return kResultOk;
 		}
@@ -825,43 +601,111 @@ public:
 
 	tresult PLUGIN_API attached (void* parent, FIDString type) SMTG_OVERRIDE
 	{
-		if (parent == nullptr || type == nullptr)
+		if (parent == nullptr || type == nullptr || strcmp (type, kPlatformTypeHWND) != 0)
 			return kResultFalse;
-		if (strcmp (type, kPlatformTypeHWND) != 0)
-			return kResultFalse;
-		if (g_panel != nullptr)
+		if (hwnd != nullptr)
 			return kResultFalse;
 
-		enregistrerClasse ();
-		g_panel = CreateWindowExA (0, kClasse, "",
-		                           WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
-		                           0, 0, W, H,
-		                           (HWND)parent, nullptr,
-		                           GetModuleHandleA (nullptr), nullptr);
-		return g_panel != nullptr ? kResultTrue : kResultFalse;
+		// Pas d'echelle donnee par FL : on prend celle de l'ecran. L'hote a
+		// deja dimensionne son cadre avec getSize : si l'ecran du parent n'a
+		// pas l'echelle prevue, il faut le lui redemander, sinon le bas de
+		// la fenetre est coupe.
+		bool redemander = false;
+		if (!echelleImposee)
+		{
+			const UINT dpi = GetDpiForWindow ((HWND)parent);
+			if (dpi >= 96 && std::fabs (dpi / 96.0f - echelle) > 0.01f)
+			{
+				echelle = dpi / 96.0f;
+				redemander = true;
+			}
+		}
+
+		HINSTANCE inst = moduleDuPlugin ();
+		if (g_vues++ == 0)
+		{
+			// Classe enregistree avec la DLL (et non l'exe de FL) et retiree
+			// a la derniere vue : sinon, apres un dechargement du plugin, la
+			// classe pointait vers du code disparu.
+			WNDCLASSEXW wc;
+			memset (&wc, 0, sizeof (wc));
+			wc.cbSize = sizeof (wc);
+			wc.style = CS_DBLCLKS;
+			wc.lpfnWndProc = procVue;
+			wc.hInstance = inst;
+			wc.hCursor = LoadCursorW (nullptr, (LPCWSTR)IDC_ARROW);
+			wc.lpszClassName = kClasse;
+			RegisterClassExW (&wc);
+		}
+
+		hwnd = CreateWindowExW (0, kClasse, L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+		                        0, 0, largeurPx (), hauteurPx (), (HWND)parent, nullptr,
+		                        inst, this);
+		if (hwnd == nullptr)
+		{
+			if (--g_vues == 0)
+				UnregisterClassW (kClasse, inst);
+			return kResultFalse;
+		}
+		poste = nomDuPoste ();
+		initialiserRendu ();
+		SetTimer (hwnd, 1, 16, nullptr);
+		dernierTick = GetTickCount64 ();
+		if (redemander && frame != nullptr)
+		{
+			ViewRect r (0, 0, largeurPx (), hauteurPx ());
+			frame->resizeView (this, &r);
+		}
+		return kResultTrue;
 	}
 
 	tresult PLUGIN_API removed () SMTG_OVERRIDE
 	{
-		if (g_panel != nullptr)
+		if (hwnd != nullptr)
 		{
-			DestroyWindow (g_panel);
-			g_panel = nullptr;
+			KillTimer (hwnd, 1);
+			libererRendu ();
+			DestroyWindow (hwnd);
+			hwnd = nullptr;
+			if (--g_vues == 0)
+				UnregisterClassW (kClasse, moduleDuPlugin ());
 		}
 		return kResultTrue;
 	}
 
 	tresult PLUGIN_API onWheel (float) SMTG_OVERRIDE { return kResultFalse; }
 
-	tresult PLUGIN_API onKeyDown (char16, int16, int16) SMTG_OVERRIDE
+	// Certains hotes envoient le clavier par ici plutot que par la fenetre.
+	tresult PLUGIN_API onKeyDown (char16 key, int16 keyCode, int16 modifiers) SMTG_OVERRIDE
 	{
-		return kResultFalse;
+		int vk = 0;
+		switch (keyCode)
+		{
+		case KEY_UP: vk = VK_UP; break;
+		case KEY_DOWN: vk = VK_DOWN; break;
+		case KEY_RETURN:
+		case KEY_ENTER: vk = VK_RETURN; break;
+		case KEY_BACK: vk = VK_BACK; break;
+		case KEY_ESCAPE: vk = VK_ESCAPE; break;
+		default: break;
+		}
+		bool servi = false;
+		const bool ctrl = (modifiers & kControlKey) != 0;
+		if (ctrl && (key == 'v' || key == 'V'))
+		{
+			station.coller (lirePressePapiers (hwnd));
+			servi = true;
+		}
+		else if (vk != 0)
+			servi = station.touche (vk, ctrl);
+		else if (key != 0)
+			servi = station.caractere ((unsigned)key);
+		if (servi)
+			dedoublon = GetTickCount64 ();
+		return servi ? kResultTrue : kResultFalse;
 	}
 
-	tresult PLUGIN_API onKeyUp (char16, int16, int16) SMTG_OVERRIDE
-	{
-		return kResultFalse;
-	}
+	tresult PLUGIN_API onKeyUp (char16, int16, int16) SMTG_OVERRIDE { return kResultFalse; }
 
 	tresult PLUGIN_API getSize (ViewRect* taille) SMTG_OVERRIDE
 	{
@@ -869,16 +713,19 @@ public:
 			return kInvalidArgument;
 		taille->left = 0;
 		taille->top = 0;
-		taille->right = W;
-		taille->bottom = H;
+		taille->right = largeurPx ();
+		taille->bottom = hauteurPx ();
 		return kResultTrue;
 	}
 
 	tresult PLUGIN_API onSize (ViewRect*) SMTG_OVERRIDE { return kResultTrue; }
-
 	tresult PLUGIN_API onFocus (TBool) SMTG_OVERRIDE { return kResultTrue; }
 
-	tresult PLUGIN_API setFrame (IPlugFrame*) SMTG_OVERRIDE { return kResultTrue; }
+	tresult PLUGIN_API setFrame (IPlugFrame* f) SMTG_OVERRIDE
+	{
+		frame = f;
+		return kResultTrue;
+	}
 
 	tresult PLUGIN_API canResize () SMTG_OVERRIDE { return kResultFalse; }
 
@@ -886,17 +733,431 @@ public:
 	{
 		if (rect == nullptr)
 			return kInvalidArgument;
-		rect->right = rect->left + W;
-		rect->bottom = rect->top + H;
+		rect->right = rect->left + largeurPx ();
+		rect->bottom = rect->top + hauteurPx ();
 		return kResultTrue;
 	}
 
+	// --- IPlugViewContentScaleSupport -----------------------------------
+	tresult PLUGIN_API setContentScaleFactor (ScaleFactor facteur) SMTG_OVERRIDE
+	{
+		if (facteur < 0.5f || facteur > 4.0f)
+			return kResultFalse;
+		echelleImposee = true;
+		if (std::fabs (facteur - echelle) < 0.01f)
+			return kResultTrue;
+		echelle = facteur;
+		if (hwnd != nullptr)
+		{
+			SetWindowPos (hwnd, nullptr, 0, 0, largeurPx (), hauteurPx (),
+			              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+			redimensionnerRendu ();
+			if (frame != nullptr)
+			{
+				ViewRect r (0, 0, largeurPx (), hauteurPx ());
+				frame->resizeView (this, &r);
+			}
+		}
+		return kResultTrue;
+	}
+
+	// ----------------------------------------------------------------------
+	LRESULT message (UINT msg, WPARAM w, LPARAM l);
+
 private:
 	~FmView () = default;
+
+	int largeurPx () const { return (int)(fmstation::kLargeur * echelle + 0.5f); }
+	int hauteurPx () const { return (int)(fmstation::kHauteur * echelle + 0.5f); }
+
+	bool initialiserRendu ();
+	void libererRendu ();
+	void redimensionnerRendu ();
+	void creerCible ();
+	void image ();
+	void executer (fmstation::Action a, const std::string& arg);
+
 	std::atomic<uint32> refCount;
+	HWND hwnd = nullptr;
+	IPlugFrame* frame = nullptr;
+	float echelle = 1.0f;
+	bool echelleImposee = false;
+	ULONGLONG dernierTick = 0;
+	ULONGLONG dedoublon = 0;     // touche deja traitee par onKeyDown
+	bool suiviSouris = false;
+	std::string poste;
+
+	// rendu
+	ID3D11Device* device = nullptr;
+	ID3D11DeviceContext* contexte = nullptr;
+	IDXGISwapChain* chaine = nullptr;
+	ID3D11RenderTargetView* cible = nullptr;
+	ImGuiContext* imgui = nullptr;
+	fmstation::Polices polices;
+	fmstation::Station station;
+
+	// fichiers relus de temps en temps
+	ULONGLONG dernierJournal = 0;
+	std::vector<std::string> journal;
+	std::vector<std::pair<char, std::string>> compat;
 };
 
+bool FmView::initialiserRendu ()
+{
+	DXGI_SWAP_CHAIN_DESC sd;
+	memset (&sd, 0, sizeof (sd));
+	sd.BufferCount = 2;
+	sd.BufferDesc.Width = largeurPx ();
+	sd.BufferDesc.Height = hauteurPx ();
+	sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sd.OutputWindow = hwnd;
+	sd.SampleDesc.Count = 1;
+	sd.Windowed = TRUE;
+	sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+	const D3D_FEATURE_LEVEL niveaux[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+	D3D_FEATURE_LEVEL obtenu;
+	HRESULT hr = D3D11CreateDeviceAndSwapChain (nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+	                                            niveaux, 2, D3D11_SDK_VERSION, &sd, &chaine,
+	                                            &device, &obtenu, &contexte);
+	if (FAILED (hr))   // pas de carte compatible : rendu logiciel
+		hr = D3D11CreateDeviceAndSwapChain (nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+		                                    niveaux, 2, D3D11_SDK_VERSION, &sd, &chaine,
+		                                    &device, &obtenu, &contexte);
+	if (FAILED (hr))
+		return false;
+	creerCible ();
+
+	IMGUI_CHECKVERSION ();
+	ImGuiContext* avant = ImGui::GetCurrentContext ();
+	imgui = ImGui::CreateContext ();
+	ImGui::SetCurrentContext (imgui);
+	ImGuiIO& io = ImGui::GetIO ();
+	io.IniFilename = nullptr;
+	io.LogFilename = nullptr;
+
+	ImFontConfig cfg;
+	cfg.FontDataOwnedByAtlas = false;   // les polices sont dans la DLL
+	polices.titre = io.Fonts->AddFontFromMemoryTTF ((void*)archivo_cond_black,
+	                                                sizeof (archivo_cond_black), 28.0f, &cfg);
+	polices.texte = io.Fonts->AddFontFromMemoryTTF ((void*)archivo_semibold,
+	                                                sizeof (archivo_semibold), 14.0f, &cfg);
+	polices.mono = io.Fonts->AddFontFromMemoryTTF ((void*)plex_mono_medium,
+	                                               sizeof (plex_mono_medium), 11.0f, &cfg);
+	polices.monoGras = io.Fonts->AddFontFromMemoryTTF ((void*)plex_mono_bold,
+	                                                   sizeof (plex_mono_bold), 11.0f, &cfg);
+	ImGui_ImplDX11_Init (device, contexte);
+	ImGui::SetCurrentContext (avant != nullptr ? avant : imgui);
+	return true;
+}
+
+void FmView::creerCible ()
+{
+	ID3D11Texture2D* tampon = nullptr;
+	if (SUCCEEDED (chaine->GetBuffer (0, IID_PPV_ARGS (&tampon))) && tampon != nullptr)
+	{
+		device->CreateRenderTargetView (tampon, nullptr, &cible);
+		tampon->Release ();
+	}
+}
+
+void FmView::redimensionnerRendu ()
+{
+	if (chaine == nullptr)
+		return;
+	if (cible != nullptr)
+	{
+		cible->Release ();
+		cible = nullptr;
+	}
+	chaine->ResizeBuffers (0, largeurPx (), hauteurPx (), DXGI_FORMAT_UNKNOWN, 0);
+	creerCible ();
+}
+
+void FmView::libererRendu ()
+{
+	if (imgui != nullptr)
+	{
+		ImGui::SetCurrentContext (imgui);
+		ImGui_ImplDX11_Shutdown ();
+		ImGui::DestroyContext (imgui);
+		imgui = nullptr;
+	}
+	if (cible != nullptr) { cible->Release (); cible = nullptr; }
+	if (chaine != nullptr) { chaine->Release (); chaine = nullptr; }
+	if (contexte != nullptr) { contexte->Release (); contexte = nullptr; }
+	if (device != nullptr) { device->Release (); device = nullptr; }
+}
+
+void FmView::executer (fmstation::Action a, const std::string& arg)
+{
+	switch (a)
+	{
+	case fmstation::Action::Heberger: actionHeberger (); break;
+	case fmstation::Action::Rejoindre: actionRejoindre (arg); break;
+	case fmstation::Action::Couper: actionCouper (); break;
+	case fmstation::Action::VerifierMaj: actionVerifierMaj (); break;
+	case fmstation::Action::InstallerMaj: actionInstallerMaj (); break;
+	case fmstation::Action::Copier:
+	{
+		std::string adresse;
+		{
+			std::lock_guard<std::mutex> g (g_mtx);
+			adresse = g_adresse;
+		}
+		if (adresse.empty ())
+			station.signaler ("Pas encore de fréquence");
+		else
+		{
+			copierTexte (hwnd, adresse);
+			station.signaler ("Fréquence copiée → presse-papiers");
+		}
+		break;
+	}
+	}
+}
+
+void FmView::image ()
+{
+	surveillerAgent ();
+	if (imgui == nullptr || cible == nullptr)
+		return;
+
+	const ULONGLONG maintenant = GetTickCount64 ();
+	const float dt = (float)(maintenant - dernierTick) / 1000.0f;
+	dernierTick = maintenant;
+
+	// journal et comparaison : relus deux fois par seconde, pas plus
+	if (maintenant - dernierJournal > 500)
+	{
+		dernierJournal = maintenant;
+		const std::string dossier = dossierLocal ();
+		journal = dernieresLignes (dossier + "\\journal.txt", 6);
+		compat = lireCompat (dossier + "\\compat.txt");
+	}
+
+	fmstation::Etat e;
+	{
+		std::lock_guard<std::mutex> g (g_mtx);
+		e.role = g_role;
+		e.code = g_adresse;
+		e.statut = g_statut;
+		e.pair = g_pair;
+	}
+	e.poste = poste;
+	e.version = fmgui::kVersionPlugin;
+	e.maj = (fmstation::Maj)g_majEtat.load ();
+	e.majVersion = g_majVersion.load ();
+	e.journal = journal;
+	e.compat = compat;
+
+	ImGuiContext* avant = ImGui::GetCurrentContext ();
+	ImGui::SetCurrentContext (imgui);
+	ImGuiIO& io = ImGui::GetIO ();
+	io.DisplaySize = ImVec2 ((float)largeurPx (), (float)hauteurPx ());
+	io.DeltaTime = dt > 0.0f ? dt : 1.0f / 60.0f;
+
+	ImGui_ImplDX11_NewFrame ();
+	ImGui::NewFrame ();
+	station.image (ImGui::GetBackgroundDrawList (), polices, echelle, io.DeltaTime, e);
+	ImGui::Render ();
+
+	const float fond[4] = { 0xEC / 255.0f, 0xE7 / 255.0f, 0xDA / 255.0f, 1.0f };
+	contexte->OMSetRenderTargets (1, &cible, nullptr);
+	contexte->ClearRenderTargetView (cible, fond);
+	ImGui_ImplDX11_RenderDrawData (ImGui::GetDrawData ());
+	const HRESULT hr = chaine->Present (0, 0);
+	ImGui::SetCurrentContext (avant != nullptr ? avant : imgui);
+
+	// carte graphique perdue (pilote mis a jour, veille) : on recree tout
+	if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+	{
+		libererRendu ();
+		initialiserRendu ();
+	}
+
+	fmstation::Action a;
+	std::string arg;
+	while (station.prendreAction (a, arg))
+		executer (a, arg);
+}
+
+LRESULT FmView::message (UINT msg, WPARAM w, LPARAM l)
+{
+	switch (msg)
+	{
+	case WM_TIMER:
+		image ();
+		return 0;
+
+	case WM_PAINT:
+	{
+		PAINTSTRUCT ps;
+		BeginPaint (hwnd, &ps);
+		EndPaint (hwnd, &ps);
+		image ();
+		return 0;
+	}
+
+	case WM_ERASEBKGND:
+		return 1;
+
+	case WM_MOUSEMOVE:
+		if (!suiviSouris)
+		{
+			TRACKMOUSEEVENT tme;
+			memset (&tme, 0, sizeof (tme));
+			tme.cbSize = sizeof (tme);
+			tme.dwFlags = TME_LEAVE;
+			tme.hwndTrack = hwnd;
+			TrackMouseEvent (&tme);
+			suiviSouris = true;
+		}
+		station.souris ((float)GET_X_LPARAM (l), (float)GET_Y_LPARAM (l));
+		return 0;
+
+	case WM_MOUSELEAVE:
+		suiviSouris = false;
+		station.souris (-1.0f, -1.0f);
+		return 0;
+
+	case WM_LBUTTONDOWN:
+	case WM_LBUTTONDBLCLK:
+		SetFocus (hwnd);   // sans le focus, le clavier va a FL
+		station.souris ((float)GET_X_LPARAM (l), (float)GET_Y_LPARAM (l));
+		station.bouton (true);
+		return 0;
+
+	case WM_LBUTTONUP:
+		station.bouton (false);
+		return 0;
+
+	case WM_SETCURSOR:
+		if (LOWORD (l) == HTCLIENT)
+		{
+			SetCursor (LoadCursorW (nullptr, station.survolCliquable () ? (LPCWSTR)IDC_HAND
+			                                                            : (LPCWSTR)IDC_ARROW));
+			return TRUE;
+		}
+		break;
+
+	case WM_GETDLGCODE:
+		return DLGC_WANTALLKEYS | DLGC_WANTCHARS | DLGC_WANTARROWS;
+
+	case WM_KEYDOWN:
+	{
+		if (GetTickCount64 () - dedoublon < 60)
+			return 0;
+		const bool ctrl = (GetKeyState (VK_CONTROL) & 0x8000) != 0;
+		if (ctrl && w == 'V')
+		{
+			station.coller (lirePressePapiers (hwnd));
+			return 0;
+		}
+		if (station.touche ((int)w, ctrl))
+			return 0;
+		break;
+	}
+
+	case WM_CHAR:
+		if (GetTickCount64 () - dedoublon < 60)
+			return 0;
+		if (station.caractere ((unsigned)w))
+			return 0;
+		break;
+
+	case WM_DESTROY:
+		KillTimer (hwnd, 1);
+		return 0;
+	}
+	return DefWindowProcW (hwnd, msg, w, l);
+}
+
+LRESULT CALLBACK procVue (HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+	if (msg == WM_NCCREATE)
+	{
+		const CREATESTRUCTW* cs = (const CREATESTRUCTW*)l;
+		SetWindowLongPtrW (h, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+	}
+	FmView* vue = (FmView*)GetWindowLongPtrW (h, GWLP_USERDATA);
+	if (vue == nullptr || msg == WM_NCCREATE)
+		return DefWindowProcW (h, msg, w, l);
+	if (msg == WM_NCDESTROY)
+	{
+		SetWindowLongPtrW (h, GWLP_USERDATA, 0);
+		return DefWindowProcW (h, msg, w, l);
+	}
+	return vue->message (msg, w, l);
+}
+
 } // namespace
+
+// --------------------------------------------------------------------------
+namespace fmgui {
+
+void setRole (int role)
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	g_role = role;
+	if (role == 0)
+		g_pair.clear ();
+}
+
+void setStatus (const char* texte)
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	g_statut = (texte != nullptr) ? texte : "";
+	g_agent = true;
+}
+
+void setAddress (const char* adresse)
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	g_adresse = (adresse != nullptr) ? adresse : "";
+}
+
+void setPeer (const char* nom)
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	g_pair = (nom != nullptr && strcmp (nom, "-") != 0) ? nom : "";
+}
+
+void setErreur (const char* texte)
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	g_erreur = (texte != nullptr) ? texte : "";
+	g_statut = g_erreur;
+}
+
+void soumettreEtat (const char* texte)
+{
+	setStatus (texte);
+}
+
+void agentParti ()
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	g_role = 0;
+	g_pair.clear ();
+	g_adresse.clear ();
+	g_statut = g_erreur;   // vide, sauf si l'agent a dit pourquoi il part
+}
+
+int role ()
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	return g_role;
+}
+
+bool agentLance ()
+{
+	std::lock_guard<std::mutex> g (g_mtx);
+	return g_agent;
+}
+
+} // namespace fmgui
 
 IPlugView* fmCreateView ()
 {

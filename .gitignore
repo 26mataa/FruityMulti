@@ -46,3 +46,7 @@ net/sync.py
 setup/payload/
 setup/payload.rc
 setup/build/
+
+# --- Tests et archive de distribution : restent en local -------------------
+net/test_reseau.py
+FruityMulti.zip

@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -467,15 +469,18 @@ static void*   g_insertFn = nullptr;
 static SOCKET  g_srv = INVALID_SOCKET;
 static volatile LONG g_stopServer = 0;
 
+// Partagee entre le thread serveur et le thread principal : une requete
+// expiree (TIMEOUT) peut encore etre executee plus tard sans ecrire dans une
+// pile qui a servi a la requete suivante.
 struct Request
 {
 	std::string cmd;
 	std::string reply;
-	bool done;
+	std::atomic<bool> done { false };
 };
 
 static std::mutex g_mtx;
-static std::vector<Request*> g_pending;
+static std::vector<std::shared_ptr<Request>> g_pending;
 
 static BOOL CALLBACK invalidateProc (HWND hwnd, LPARAM lp)
 {
@@ -998,14 +1003,15 @@ static std::string executeCommand (const std::string& line)
 		return r;
 	}
 
-	if (InterlockedCompareExchange (&g_disabled, 0, 0) != 0)
+	// Plugin desactive (FL d'une autre version) : la fenetre doit pouvoir le
+	// dire, donc STATE et VERSION restent permis.
+	if (InterlockedCompareExchange (&g_disabled, 0, 0) != 0
+	    && line.rfind ("STATE", 0) != 0 && line != "VERSION")
 		return "ERR version de FL non reconnue par le plugin";
 
 	if (line == "PING")
 		return "OK";
 
-	// Identifiant de build : permet de savoir quelle version tourne
-	// chez chacun, sans ambiguite.
 	// L'agent annonce son etat a la fenetre : "STATE en attente…"
 	if (line.rfind ("STATE", 0) == 0)
 	{
@@ -1019,14 +1025,24 @@ static std::string executeCommand (const std::string& line)
 		{
 			fmgui::setAddress (quoi.substr (8).c_str ());
 		}
+		else if (quoi.rfind ("PAIR ", 0) == 0)
+		{
+			fmgui::setPeer (quoi.substr (5).c_str ());
+		}
+		else if (quoi.rfind ("ERREUR ", 0) == 0)
+		{
+			fmgui::setErreur (quoi.substr (7).c_str ());
+		}
 		else
 		{
 			fmgui::setStatus (quoi.c_str ());
 		}
 		return "STATE OK";
 	}
+	// Identifiant de build : permet de savoir quelle version tourne
+	// chez chacun, sans ambiguite.
 	if (line == "VERSION")
-		return "VERSION 28-fenetre";
+		return "VERSION 29-codes";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -2917,15 +2933,15 @@ static void applyClipLength (unsigned pos, unsigned len)
 
 static void processPending ()
 {
-	std::vector<Request*> work;
+	std::vector<std::shared_ptr<Request>> work;
 	{
 		std::lock_guard<std::mutex> lock (g_mtx);
 		work.swap (g_pending);
 	}
-	for (Request* r : work)
+	for (auto& r : work)
 	{
 		r->reply = executeCommand (r->cmd);
-		r->done = true;
+		r->done.store (true);
 	}
 }
 
@@ -3007,14 +3023,18 @@ static DWORD WINAPI serverThread (LPVOID)
 		// recv voit expirer sans fin. Sans ce compteur, le serveur restait
 		// bloque et refusait toute nouvelle connexion.
 		DWORD dernierOctet = GetTickCount ();
+		std::string recu;
 
 		for (;;)
 		{
 			if (InterlockedCompareExchange (&g_stopServer, 0, 0) != 0)
 				break;
 
-			char buf[1024];
-			int n = recv (c, buf, sizeof (buf) - 1, 0);
+			// Un recv ne rend pas une ligne : une longue commande (ADDX avec
+			// des centaines de notes) arrive en plusieurs morceaux, et deux
+			// courtes peuvent arriver ensemble. On decoupe sur les fins de ligne.
+			char buf[4096];
+			int n = recv (c, buf, sizeof (buf), 0);
 			if (n == SOCKET_ERROR)
 			{
 				if (WSAGetLastError () == WSAETIMEDOUT)
@@ -3030,42 +3050,68 @@ static DWORD WINAPI serverThread (LPVOID)
 			}
 			if (n <= 0)
 				break;
-			buf[n] = 0;
-
-			std::string line (buf);
-			while (!line.empty () && (line.back () == '\n' || line.back () == '\r'))
-				line.pop_back ();
-			if (line.empty ())
-				continue;
-
-			Request r;
-			r.cmd = line;
-			r.done = false;
+			dernierOctet = GetTickCount ();
+			recu.append (buf, n);
+			if (recu.size () > 8 * 1024 * 1024)
 			{
-				std::lock_guard<std::mutex> lock (g_mtx);
-				g_pending.push_back (&r);
+				logLine ("serveur TCP      : ligne demesuree, deconnexion");
+				break;
 			}
 
-			// On previent le thread principal tout de suite au lieu d'attendre
-			// le prochain tick de minuterie : c'est la moitie du gain de latence.
-			if (g_wakeWnd != nullptr)
-				PostMessageA (g_wakeWnd, WM_APP + 1, 0, 0);
+			bool coupe = false;
+			size_t fin;
+			while ((fin = recu.find ('\n')) != std::string::npos)
+			{
+				std::string line = recu.substr (0, fin);
+				recu.erase (0, fin + 1);
+				while (!line.empty () && (line.back () == '\r' || line.back () == '\n'))
+					line.pop_back ();
+				if (line.empty ())
+					continue;
 
-			// Certaines commandes sont lentes : le mixeur redessine son interface,
-			// et ADDCHANNEL scanne la base de plugins sur disque (jusqu'a 6 s).
-			// On patiente jusqu'a 12 s, en revenant des que la reponse est prete.
-			for (int i = 0; i < 10000 && !r.done; ++i)
-				Sleep (1);
+				auto r = std::make_shared<Request> ();
+				r->cmd = line;
+				{
+					std::lock_guard<std::mutex> lock (g_mtx);
+					g_pending.push_back (r);
+				}
 
-			std::string out = r.done ? r.reply : std::string ("TIMEOUT");
-			out += "\n";
-			send (c, out.c_str (), (int)out.size (), 0);
+				// On previent le thread principal tout de suite au lieu d'attendre
+				// le prochain tick de minuterie : c'est la moitie du gain de latence.
+				if (g_wakeWnd != nullptr)
+					PostMessageA (g_wakeWnd, WM_APP + 1, 0, 0);
+
+				// Certaines commandes sont lentes : le mixeur redessine son interface,
+				// et ADDCHANNEL scanne la base de plugins sur disque (jusqu'a 6 s).
+				// On patiente jusqu'a 12 s, en revenant des que la reponse est prete.
+				for (int i = 0; i < 10000 && !r->done.load (); ++i)
+					Sleep (1);
+
+				std::string out = r->done.load () ? r->reply : std::string ("TIMEOUT");
+				out += "\n";
+				// send peut n'envoyer qu'une partie (reponses INVENTORY de
+				// plusieurs centaines de Ko)
+				size_t envoye = 0;
+				while (envoye < out.size ())
+				{
+					const int k = send (c, out.c_str () + envoye, (int)(out.size () - envoye), 0);
+					if (k <= 0)
+					{
+						coupe = true;
+						break;
+					}
+					envoye += (size_t)k;
+				}
+				if (coupe)
+					break;
+			}
+			if (coupe)
+				break;
 		}
 		closesocket (c);
 
 		// l'agent est parti : la fenetre le dit
-		fmgui::setRole (0);
-		fmgui::setStatus ("Aucune session");
+		fmgui::agentParti ();
 	}
 
 	closesocket (srv);
@@ -3319,19 +3365,8 @@ public:
 			g_serverThread = nullptr;
 		}
 
-		// La file contient des pointeurs vers la PILE du thread serveur. S'il en
-		// restait une seule apres sa mort, le thread principal lirait de la
-		// memoire liberee — plantage qui n'apparait qu'apres plusieurs cycles.
 		{
 			std::lock_guard<std::mutex> lock (g_mtx);
-			for (Request* r : g_pending)
-			{
-				if (r != nullptr)
-				{
-					r->done = true;
-					r->reply = "ARRET";
-				}
-			}
 			g_pending.clear ();
 		}
 

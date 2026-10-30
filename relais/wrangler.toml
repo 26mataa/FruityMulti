@@ -1,0 +1,12 @@
+name = "fruitymulti-relais"
+main = "src/worker.js"
+compatibility_date = "2026-10-01"
+
+[[durable_objects.bindings]]
+name = "SALONS"
+class_name = "Salon"
+
+# Offre gratuite : uniquement des Durable Objects adosses a SQLite
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Salon"]
