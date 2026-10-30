@@ -57,7 +57,15 @@ DELAI_ECHO_TRANSPORT = 1.0
 INTERVALLE_TEMPO = 0.25
 INTERVALLE_POTARD = 0.1               # volume, pan, stereo d'une tranche
 TOUCHENT_NOTES = ("add", "del", "pattern", "reset", "delchannels", "racklist",
-                  "canal_debut", "canal_morceau")
+                  "canal_debut", "canal_morceau", "etat_notes")
+# Un clip recu : FL retouche sa longueur juste apres, ce n'est pas un geste.
+DELAI_ECHO_CLIPS = 1.0
+# L'hote compare regulierement notes et clips : deux gestes croises peuvent
+# laisser un ecart que plus rien ne corrigerait.
+INTERVALLE_CONTROLE = 2.0
+CONTROLES_AVANT_REPARATION = 2
+REPARATIONS_MAX = 3
+EFFET_DOUBLURE = "Fruity Balance"     # ne change pas le son
 # Un canal part en entier : son .fst (reglages du plugin) et son sample.
 TAILLE_CANAL_MAX = 8 * 1024 * 1024
 TAILLE_SAMPLE_MAX = 4 * 1024 * 1024   # 3 Mo prennent 47 s a 66 ko/s en montee
@@ -1286,6 +1294,12 @@ class Sync:
         self.clip_lengths = None
         self.clips_key = None
         self.last_clipsync = 0.0
+        self.clips_limite = 0.0
+        self.last_controle = 0.0
+        self.ecart = None
+        self.ecart_vus = 0
+        self.reparations = 0
+        self.fx_absents = set()
         self.nb_canaux_hote = None   # taille du rack de l hote
         self.averti_canaux = False
         # correspondance par nom entre les deux racks
@@ -1817,6 +1831,7 @@ class Sync:
                 elif not nom:
                     print(f"[fx] l'autre a retire l'effet de la tranche {t} slot {s}")
                     self.plugin.fx_load(t, s)
+                    self.fx_absents.discard((t, s))
                     if self.fx is not None:
                         self.fx.pop((t, s), None)
                     self.oublier_slot(t, s)
@@ -1852,7 +1867,7 @@ class Sync:
                 s = int(message.get("slot", -1))
                 i = int(message.get("i", -1))
                 v = int(message.get("v", 0))
-                if 0 <= t <= 125 and 0 <= s <= 9 and i >= 0:
+                if 0 <= t <= 125 and 0 <= s <= 9 and i >= 0 and (t, s) not in self.fx_absents:
                     self.plugin.set_param_raw(t, s, i, v)
                     # on met a jour notre reference : sinon on renverrait au
                     # pair ce qu'il vient de nous envoyer
@@ -1929,7 +1944,7 @@ class Sync:
                 # donc plus de clignotement inutile et bien moins de commandes.
                 # Un clip en trop chez moi est supprime : aucun orphelin.
                 items = []
-                for item in message.get("clips", [])[:300]:
+                for item in message.get("clips", [])[:512]:
                     if len(item) < 4:
                         continue
                     try:
@@ -1983,11 +1998,21 @@ class Sync:
 
                 # on adopte la liste recue : pas de renvoi en echo
                 self.clips_key = tuple(sorted(items))
+                self.clips_limite = time.time() + DELAI_ECHO_CLIPS
                 applied += 1 + added + resized + removed
                 if added or resized or removed:
                     print(f"[sync] playlist : {added} ajout(s), "
                           f"{resized} redimensionnement(s), "
                           f"{removed} suppression(s)")
+
+            elif kind == "controle":
+                self.comparer_controle(message)
+
+            elif kind == "controle_demande":
+                self.envoyer_reparation(message)
+
+            elif kind == "etat_notes":
+                applied += self.reparer_notes(message)
 
             elif kind == "clip":
                 position = int(message.get("pos", 0))
@@ -2130,7 +2155,7 @@ class Sync:
                     self.clips_key = key
                     self.clips = Counter((p, m, t) for p, l, m, t in snapshot)
                     self.clip_lengths = {(p, m, t): l for p, l, m, t in snapshot}
-                elif key != self.clips_key:
+                elif key != self.clips_key and now >= self.clips_limite:
                     # On ne met a jour l'etat de reference QUE si l'envoi a
                     # vraiment eu lieu. Sinon un changement bloque par la
                     # limitation etait perdu pour de bon.
@@ -2247,6 +2272,7 @@ class Sync:
                     for (t, s), nom in courants.items():
                         if self.fx.get((t, s)) == nom:
                             continue
+                        self.fx_absents.discard((t, s))
                         self.oublier_slot(t, s)
                         if self.publier_fx(t, s, nom):
                             continue
@@ -2262,6 +2288,10 @@ class Sync:
                         if (t, s) in courants:
                             continue
                         self.oublier_slot(t, s)
+                        if (t, s) in self.fx_absents:
+                            # ma doublure, pas son effet : le sien reste chez lui
+                            self.fx_absents.discard((t, s))
+                            continue
                         self.publish_global({"type": "fx", "track": t,
                                              "slot": s, "name": "",
                                              "preset": ""})
@@ -2295,6 +2325,8 @@ class Sync:
             self.last_fxparams = now
             if self.fx:
                 for (t, s) in sorted(self.fx):
+                    if (t, s) in self.fx_absents:
+                        continue
                     detail = self.plugin.effect_detail(t, s)
                     if not detail or not detail[0]:
                         continue
@@ -2415,9 +2447,86 @@ class Sync:
         if not self.clic:
             changed += self.envoyer_notes(current)
 
+        if self.is_host and now - self.last_controle >= INTERVALLE_CONTROLE:
+            self.last_controle = now
+            self.publier_controle(current)
+
         if changed:
             print(f"[sync] {changed} changement(s) local(aux) envoye(s)")
         return changed
+
+    def empreintes(self, notes, clips):
+        """Une empreinte par canal (numerotation de l'hote) et une pour les clips."""
+        canaux = {}
+        for canal, liste in notes.items():
+            cible = self.index_hote(canal)
+            if liste and cible is not None:
+                canaux[str(cible)] = zlib.crc32(repr(sorted(liste)).encode("ascii"))
+        return canaux, zlib.crc32(repr(sorted(map(tuple, clips))).encode("ascii"))
+
+    def publier_controle(self, notes):
+        if self.clic:
+            return
+        clips = self.plugin.clips()
+        if clips is None:
+            return
+        canaux, empreinte = self.empreintes(notes, clips)
+        self.publish({"type": "controle", "motif": self.pattern, "notes": canaux,
+                      "clips": empreinte})
+
+    def comparer_controle(self, message):
+        """Invite : meme ecart deux fois de suite, rien en route : on demande
+        ce que l'hote a. Son etat fait foi."""
+        notes = self.plugin.state()
+        clips = self.plugin.clips()
+        if (clips is None or self.clic or message.get("motif") != self.pattern
+                or notes != self.snapshot or tuple(sorted(clips)) != self.clips_key):
+            return
+        canaux, empreinte = self.empreintes(notes, clips)
+        chez_lui = message.get("notes", {})
+        ecart = (sorted(int(c) for c in set(canaux) | set(chez_lui)
+                        if canaux.get(c) != chez_lui.get(c)
+                        and self.index_local(int(c)) is not None),
+                 empreinte != message.get("clips"))
+        if not ecart[0] and not ecart[1]:
+            self.ecart, self.ecart_vus, self.reparations = None, 0, 0
+            return
+        self.ecart_vus = self.ecart_vus + 1 if ecart == self.ecart else 1
+        self.ecart = ecart
+        if self.ecart_vus < CONTROLES_AVANT_REPARATION:
+            return
+        self.ecart_vus = 0
+        if self.reparations >= REPARATIONS_MAX:
+            return
+        self.reparations += 1
+        print(f"[controle] ecart avec l'hote : canaux {ecart[0]}, clips {ecart[1]}")
+        self.publish({"type": "controle_demande", "canaux": ecart[0], "clips": ecart[1]})
+
+    def envoyer_reparation(self, message):
+        notes = self.plugin.state()
+        for canal in message.get("canaux", []):
+            self.publish({"type": "etat_notes", "ch": canal, "motif": self.pattern,
+                          "notes": [list(n) for n in notes.get(int(canal), [])]})
+        if message.get("clips"):
+            clips = self.plugin.clips()
+            if clips is not None:
+                self.publish_global({"type": "clipsync", "clips": [list(c) for c in clips]})
+
+    def reparer_notes(self, message):
+        cible = self.index_local(int(message.get("ch", -1)))
+        if cible is None or message.get("motif") != self.pattern:
+            return 0
+        voulues = [tuple(n) for n in message.get("notes", [])]
+        presentes = self.plugin.state().get(cible, [])
+        retirees = diff_removals(presentes, voulues)
+        ajoutees = diff_additions(presentes, voulues)
+        if retirees:
+            self.plugin.del_many(cible, retirees)
+        if ajoutees:
+            self.plugin.add_many(cible, ajoutees)
+        print(f"[controle] canal {cible} : {len(retirees)} retiree(s), "
+              f"{len(ajoutees)} ajoutee(s)")
+        return len(retirees) + len(ajoutees)
 
     def envoyer_notes(self, current):
         """Envoie au pair l'ecart entre `current` et ce qu'il connait deja."""
@@ -2627,20 +2736,35 @@ class Sync:
         t, s, nom = int(recu.get("track", -1)), int(recu.get("slot", -1)), str(recu.get("nom", ""))
         if not (0 <= t <= 125 and 0 <= s <= 9):
             return
-        chemin = os.path.join(sous_dossier_local("canaux"), f"effet-recu-{os.getpid()}.fst")
+        chemin = ""
         try:
             brut = zlib.decompress(b"".join(recu["recus"]))
             if hashlib.sha256(brut).hexdigest() != recu.get("sha256"):
                 print(f"[fx] '{nom}' recu abime : ignore")
                 return
             requis = plugin_requis(brut)
-            if requis and not (self.plugin_present(*requis)
-                                or self.plugin.find_effect(requis[0])):
-                print(f"[fx] effet '{requis[0]}' absent de ce poste : tranche {t} slot {s} vide")
-                return
+            absent = requis and not (self.plugin_present(*requis)
+                                     or self.plugin.find_effect(requis[0]))
+            if absent:
+                # Comme FL pour un projet : le slot montre ce qui manque.
+                doublure = self.plugin.find_effect(EFFET_DOUBLURE)
+                if not doublure:
+                    print(f"[fx] effet '{requis[0]}' absent de ce poste : "
+                          f"tranche {t} slot {s} vide")
+                    return
+                print(f"[fx] effet '{requis[0]}' absent de ce poste : doublure "
+                      f"tranche {t} slot {s}")
+                with open(doublure, "rb") as fichier:
+                    brut = fichier.read()
+                nom = f"ABSENT - {requis[0]}"
+            # FL nomme le slot d'apres le fichier.
+            chemin = os.path.join(sous_dossier_local("canaux"),
+                                  re.sub(r"[^\w .()-]", "_", nom or "Effet") + ".fst")
             with open(chemin, "wb") as fichier:
                 fichier.write(brut)
             reponse = self.plugin.fx_load(t, s, chemin)
+            if absent and reponse.startswith("FXLOAD OK"):
+                self.fx_absents.add((t, s))
         except (OSError, ValueError, IndexError, zlib.error) as exc:
             print(f"[fx] '{nom}' illisible : {exc}")
             return
@@ -3532,7 +3656,7 @@ class Link:
                 canaux.add(attente.get("index"))
             elif genre in ("fx_debut", "fx_morceau"):
                 effets.add((attente.get("track"), attente.get("slot")))
-        if kind in ("racklist", "channelcount", "addchannel"):
+        if kind in ("racklist", "channelcount", "addchannel", "controle"):
             return True
         if kind in ("add", "del"):
             return message.get("ch") in canaux

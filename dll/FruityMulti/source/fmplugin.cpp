@@ -1289,7 +1289,7 @@ static std::string executeCommand (const std::string& line)
 	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
 	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 47-g";
+		return "VERSION 47-h";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -2105,8 +2105,12 @@ static std::string executeCommand (const std::string& line)
 				continue;
 			if (wantPat >= 1 && (int)r[0x06] != wantPat)
 				continue;
+			// +0x18 debut, +0x1C fin : tant que le debut vaut -1, FL ramene le clip
+			// a la longueur du motif au prochain rafraichissement.
 			*(unsigned*)(r + 0x08) = len;
+			*(unsigned*)(r + 0x18) = 0;
 			*(unsigned*)(r + 0x1C) = len;
+			requestRefresh ();
 			return "CLIPLEN " + std::to_string (pos) + " " + std::to_string (len);
 		}
 		return "ERR clip introuvable";
@@ -3160,6 +3164,7 @@ static std::string executeCommand (const std::string& line)
 		}
 		*(unsigned*)(record + 0x00) = pos;
 		*(unsigned*)(record + 0x08) = len;
+		*(unsigned*)(record + 0x18) = 0;
 		*(unsigned*)(record + 0x1C) = len;
 		*(unsigned*)(record + 0x20) = (unsigned)(count + 1);
 		if (motif >= 0 && motif <= 255)
