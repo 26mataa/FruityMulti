@@ -1200,14 +1200,13 @@ class Sync:
         self.last_channel_mix = 0.0
         # effets du mixeur : etat connu et cadence (une requete par seconde)
         self.role_sent = False
-        # valeur de reference venue de l'hote (l'invite s'y ramene)
-        self.host_tempo = None
+        self.tempo_limite = 0.0
+        self.pattern_limite = 0.0
         self.transport_limite = 0.0
         self.mode = None             # 0 = PAT, 1 = SONG
         self.mode_limite = 0.0
         self.clic = False
         self.notes_retenues = []
-        self.host_pattern = None
         self.fx = None
         self.fx_attendus = {}
         self.fx_params = {}
@@ -1460,11 +1459,9 @@ class Sync:
                         print("       (il faut FruityMultiBridge.vst3 de 503 Ko)")
                     else:
                         print(f"[sync] tempo applique : {bpm}  [{reply}]")
-                    self.tempo = self.plugin.tempo()
-                    try:
-                        self.host_tempo = float(bpm)
-                    except (TypeError, ValueError):
-                        pass
+                    # vient du pair : detect_local ne doit pas le lui renvoyer
+                    self.tempo = float(bpm)
+                    self.tempo_limite = time.monotonic() + DELAI_ECHO_TRANSPORT
 
             elif kind == "transport":
                 want = bool(message.get("playing"))
@@ -1702,8 +1699,8 @@ class Sync:
                         print(f"[sync] pattern refuse : {reply}")
                     else:
                         print(f"[sync] pattern applique : {number}")
-                    self.pattern = self.plugin.pattern()
-                    self.host_pattern = int(number)
+                    self.pattern = int(number)
+                    self.pattern_limite = time.monotonic() + DELAI_ECHO_TRANSPORT
 
             elif kind == "mouse":
                 # coordonnees proportionnelles (0..1000) : independantes de la
@@ -1881,21 +1878,18 @@ class Sync:
             st = self.plugin.status()
         self.clic = bool(st and st.get("clic"))
 
-        # --- Autorite : tempo et motif, l'HOTE FAIT FOI ---------------------
-        # L'invite ne les envoie jamais. S'il les change chez lui, on le
-        # ramene a la valeur de l'hote : c'est visible, et ca evite qu'une
-        # session parte chacun de son cote. Le transport, lui, est a tous.
+        # Tempo et motif sont a tous, comme le transport : le dernier qui parle
+        # gagne.
         current_tempo = st["tempo"] if st else None
         if current_tempo is not None:
-            if self.is_host:
-                if self.tempo is not None and abs(current_tempo - self.tempo) > 0.001:
-                    self.publish_global({"type": "tempo", "bpm": current_tempo})
-                    print(f"[sync] tempo envoye : {current_tempo}")
-                    changed += 1
-            elif self.host_tempo is not None and abs(current_tempo - self.host_tempo) > 0.01:
-                self.plugin.cmd_force(f"TEMPO {self.host_tempo:.3f}")
-                print(f"[autorite] tempo ramene a {self.host_tempo} (celui de l'hote)")
-            self.tempo = current_tempo
+            if self.tempo is None:
+                self.tempo = current_tempo
+            elif (abs(current_tempo - self.tempo) > 0.01
+                  and time.monotonic() >= self.tempo_limite):
+                self.publish_global({"type": "tempo", "bpm": current_tempo})
+                print(f"[sync] tempo envoye : {current_tempo}")
+                changed += 1
+                self.tempo = current_tempo
 
         current_playing = st["playing"] if st else None
         if current_playing is not None:
@@ -1920,16 +1914,17 @@ class Sync:
 
         current_pattern = st["pattern"] if st else None
         if current_pattern is not None:
-            if self.is_host:
-                if self.pattern is not None and current_pattern != self.pattern:
-                    self.publish_global({"type": "pattern", "n": current_pattern})
-                    print(f"[sync] pattern envoye : {current_pattern}")
-                    changed += 1
-            elif (self.host_pattern is not None
-                  and current_pattern != self.host_pattern):
-                self.plugin.cmd_force(f"PATTERN {self.host_pattern}")
-                print(f"[autorite] motif ramene a {self.host_pattern}")
-            self.pattern = current_pattern
+            if self.pattern is None:
+                self.pattern = current_pattern
+            elif (current_pattern != self.pattern
+                  and time.monotonic() >= self.pattern_limite):
+                self.publish_global({"type": "pattern", "n": current_pattern})
+                print(f"[sync] pattern envoye : {current_pattern}")
+                changed += 1
+                self.pattern = current_pattern
+                # Autre motif, autres notes : ce n'est pas une modification. Sans
+                # ca, ses notes partiraient chez le pair avant qu'il ait suivi.
+                self.snapshot = current
 
         # horodatage commun a tous les blocs qui suivent
         now = time.time()
