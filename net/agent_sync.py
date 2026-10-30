@@ -958,6 +958,7 @@ class Plugin:
             return None
         tranches = {}
         try:
+            self.nb_tranches = int(line.split()[1])
             for bloc in line.split(" ", 2)[2].split(";"):
                 tete, *slots = bloc.split("/")
                 track, valeurs = tete.split(":")
@@ -1010,6 +1011,9 @@ class Plugin:
         except (ValueError, IndexError):
             return None
         return noms
+
+    def set_mix_count(self, compte):
+        return self.cmd(f"MIXCOUNT {compte}")[0]
 
     def rec_set(self, track, slot, decalage, brut):
         return self.cmd(f"RECSET {track} {slot} {decalage} {brut}")[0]
@@ -1313,6 +1317,7 @@ class Sync:
         self.fx_recu = None
         self.mix_cache = None
         self.mix_tard = None
+        self.compte_tranches = None
         self.envois = None
         self.noms_tranches = None
         self.last_mixeur = 0.0
@@ -1713,6 +1718,14 @@ class Sync:
                 if len(self.fx_recu["recus"]) >= int(self.fx_recu.get("morceaux", 0)):
                     recu, self.fx_recu = self.fx_recu, None
                     self.recevoir_fx(recu)
+                    applied += 1
+
+            elif kind == "mixcount":
+                compte = int(message.get("n", 0))
+                if 2 <= compte <= 126:
+                    self.plugin.set_mix_count(compte)
+                    self.compte_tranches = compte
+                    self.oublier_listes_tranches()
                     applied += 1
 
             elif kind == "mixflag":
@@ -2509,6 +2522,12 @@ class Sync:
             for decalage in ("1F00", "1F01"):
                 self.mix_cache.pop(("rec", track, slot, decalage), None)
 
+    def oublier_listes_tranches(self):
+        """Les colonnes ont change : routage et noms repartent d'une nouvelle
+        reference, sinon les tranches apparues passeraient pour des modifications."""
+        self.envois = None
+        self.noms_tranches = None
+
     def suivre_mixeur(self):
         """Compare tout le mixeur au dernier etat connu et envoie les ecarts."""
         tranches = self.plugin.mix_full()
@@ -2517,6 +2536,14 @@ class Sync:
         premiere = self.mix_cache is None
         if premiere:
             self.mix_cache = {}
+        # Le + du mixeur : avant les valeurs, l'autre doit avoir les colonnes.
+        compte = getattr(self.plugin, "nb_tranches", None)
+        if isinstance(compte, int):
+            if not premiere and compte != self.compte_tranches:
+                self.publish_global({"type": "mixcount", "n": compte})
+                print(f"[sync] mixeur : {compte - 2} tranches, envoye a l'autre")
+                self.oublier_listes_tranches()
+            self.compte_tranches = compte
         vus = {}
         for t, fiche in tranches.items():
             for nom, valeur in fiche["drapeaux"].items():
@@ -2539,12 +2566,12 @@ class Sync:
                               "off": cle[3], "v": valeur})
         # Les tranches suivantes rejoignent le volume, le pan et le mute de STATUS.
         tard = {t: f for t, f in tranches.items() if t > TRANCHES_RAPIDES}
-        if premiere:
-            # Le projet a deja tout amene : la premiere lecture sert de reference.
-            for t, fiche in tard.items():
-                self.mix.setdefault(t, {}).update(
-                    {cle: fiche[cle] for cle in ("vol", "pan", "stereo", "mute")})
-        else:
+        # Une tranche qu'on decouvre (projet deja transmis, ou colonne ajoutee)
+        # sert de reference : l'autre a la meme.
+        for t, fiche in tard.items():
+            if t not in self.mix:
+                self.mix[t] = {cle: fiche[cle] for cle in ("vol", "pan", "stereo", "mute")}
+        if not premiere:
             self.mix_tard = tard
 
     def suivre_routage(self):

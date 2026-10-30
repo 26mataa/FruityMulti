@@ -1178,6 +1178,18 @@ static std::string widePtr (const unsigned char* obj, size_t off, int maxChars)
 	return out;
 }
 
+// Derniere tranche existante : le + du mixeur fait varier ce compte, les
+// fiches au-dela existent mais FL ne les montre pas.
+static int derniereTranche ()
+{
+	if (g_engine == nullptr)
+		return -1;
+	const int* compte = *(const int* const*)((unsigned char*)g_engine + 0x11E2198);
+	if (!isReadable (compte, 4) || *compte < 1)
+		return FM_MIX_MAX;
+	return min (*compte - 1, FM_MIX_MAX);
+}
+
 static std::string utf8Texte (const unsigned short* text)
 {
 	if (text == nullptr || !isReadable (text, 2))
@@ -1277,7 +1289,7 @@ static std::string executeCommand (const std::string& line)
 	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
 	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 47-f";
+		return "VERSION 47-g";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -2803,7 +2815,7 @@ static std::string executeCommand (const std::string& line)
 		std::ostringstream out;
 		int n = 0;
 		std::ostringstream corps;
-		for (int t = 0; t <= FM_MIX_MAX; t++)
+		for (int t = 0; t <= derniereTranche (); t++)
 		{
 			unsigned char* piste = mixerTrack (t);
 			if (piste == nullptr)
@@ -2836,6 +2848,28 @@ static std::string executeCommand (const std::string& line)
 		return out.str ();
 	}
 
+	// Colonnes du mixeur, le + de FL : MIXCOUNT [compte], comme TUndoEvent_FXTrackCount
+	// (FUN_0127cee0 puis le rafraichissement du routage).
+	if (line == "MIXCOUNT" || line.rfind ("MIXCOUNT ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		unsigned char* moteur = (unsigned char*)g_engine;
+		int voulu = -1;
+		if (line.size () > 9)
+		{
+			if (sscanf_s (line.c_str () + 9, "%d", &voulu) != 1 || voulu < 2 || voulu > FM_MIX_MAX + 1)
+				return "ERR syntaxe MIXCOUNT [compte]";
+			void** routage = *(void***)(moteur + 0x11E22D8);
+			if (!isReadable (routage, 8) || *routage == nullptr)
+				return "ERR routage illisible";
+			((void (*) (int))(moteur + 0xE7CEE0)) (voulu);
+			((void (*) (void*, unsigned char))(moteur + 0xE9E890)) (*routage, 4);
+			requestRefresh ();
+		}
+		return "MIXCOUNT " + std::to_string (derniereTranche () + 1);
+	}
+
 	// Routage : ROUTES -> "ROUTES <n> s>c:niveau ...", envois actifs seulement.
 	if (line == "ROUTES")
 	{
@@ -2843,12 +2877,12 @@ static std::string executeCommand (const std::string& line)
 			return "ERR pas d'adresse";
 		std::ostringstream corps;
 		int n = 0;
-		for (int s_ = 0; s_ <= FM_MIX_MAX; s_++)
+		for (int s_ = 0; s_ <= derniereTranche (); s_++)
 		{
 			unsigned char* piste = mixerTrack (s_);
 			if (piste == nullptr)
 				continue;
-			for (int c = 0; c <= FM_MIX_MAX; c++)
+			for (int c = 0; c <= derniereTranche (); c++)
 			{
 				if (piste[(size_t)c * 8 + 0x398] == 0)
 					continue;
@@ -2906,7 +2940,7 @@ static std::string executeCommand (const std::string& line)
 		CouleurFn couleur = (CouleurFn)((unsigned char*)g_engine + 0xEC1930);
 		std::ostringstream corps;
 		int n = 0;
-		for (int t = 0; t <= FM_MIX_MAX; t++)
+		for (int t = 0; t <= derniereTranche (); t++)
 		{
 			unsigned char* piste = mixerTrack (t);
 			if (piste == nullptr)
@@ -3338,7 +3372,7 @@ unsigned char* best = getClipContainer ();
 
 		std::string body;
 		int n = 0;
-		for (int t = 0; t <= FM_MIX_MAX; t++)
+		for (int t = 0; t <= derniereTranche (); t++)
 		{
 			if (mixerTrack (t) == nullptr)
 				continue;
