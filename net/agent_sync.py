@@ -64,6 +64,7 @@ EVT_ETAT_PLUGIN = 0xD5
 PLUGIN_ENVELOPPE = "Fruity Wrapper"   # VST et VST3 : le vrai nom est dans l'etat
 VARIABLE_USINE = "%FLStudioFactoryData%"
 VARIABLE_UTILISATEUR = "%FLStudioUserData%"
+VARIABLE_PARTAGE = "%ILSharedData%"      # Documents\Image-Line : kits de l'utilisateur
 # DELCHANNEL ne sauvegarde pas le canal comme le fait FL : annuler ensuite son
 # insertion plante FL (POUR-CLAUDE, 13.15). Le canal reste chez l'autre.
 SUPPRESSION_RECUE = False
@@ -1109,13 +1110,14 @@ def fichier_sample(chemin):
     les a au meme endroit logique."""
     if not chemin or chemin.startswith(VARIABLE_USINE):
         return None
-    if chemin.startswith(VARIABLE_UTILISATEUR):
-        reste = chemin[len(VARIABLE_UTILISATEUR):].lstrip("\\/")
-        for racine in _racines_image_line():
-            complet = os.path.join(racine, "FL Studio", reste)
-            if os.path.isfile(complet):
-                return complet
-        return None
+    for variable, sous_dossier in ((VARIABLE_UTILISATEUR, "FL Studio"), (VARIABLE_PARTAGE, "")):
+        if chemin.startswith(variable):
+            reste = chemin[len(variable):].lstrip("\\/")
+            for racine in _racines_image_line():
+                complet = os.path.join(racine, sous_dossier, reste)
+                if os.path.isfile(complet):
+                    return complet
+            return None
     return chemin if os.path.isfile(chemin) else None
 
 
@@ -1701,6 +1703,9 @@ class Sync:
                         print(f"[sync] pattern applique : {number}")
                     self.pattern = int(number)
                     self.pattern_limite = time.monotonic() + DELAI_ECHO_TRANSPORT
+                    # compte comme un changement : la relecture de la fin evite
+                    # de prendre les notes de l'autre motif pour des retraits
+                    applied += 1
 
             elif kind == "mouse":
                 # coordonnees proportionnelles (0..1000) : independantes de la
@@ -2348,6 +2353,8 @@ class Sync:
                         son = fichier.read()
                 else:
                     print(f"[canal] sample trop lourd, l'autre ne l'aura pas : {source}")
+            elif original and not original.startswith(VARIABLE_USINE):
+                print(f"[canal] sample introuvable, l'autre ne l'aura pas : {original}")
         except (ValueError, IndexError, OSError) as exc:
             print(f"[canal] sample illisible : {exc}")
 
@@ -3651,10 +3658,11 @@ def surveiller_parent(pid):
 def main():
     # Sortie ligne par ligne : sans ca, lorsque l'agent est lance par la GUI
     # (stdout redirige vers un pipe), Python bufferise par blocs de 8 Ko et
-    # le journal de l'interface reste vide.
+    # le journal de l'interface reste vide. Et un nom de sample en caracteres
+    # exotiques ne doit jamais faire tomber un print.
     try:
-        sys.stdout.reconfigure(line_buffering=True)
-        sys.stderr.reconfigure(line_buffering=True)
+        sys.stdout.reconfigure(line_buffering=True, errors="replace")
+        sys.stderr.reconfigure(line_buffering=True, errors="replace")
     except Exception:
         pass
 
