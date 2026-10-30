@@ -51,6 +51,9 @@ DELAI_RETOUR_PLUGIN = 300.0        # Zenology et consorts : des dizaines de s
 DELAI_STABILITE = 60.0
 DELAI_VEILLE = 5.0                 # le plugin coupe un client muet a 20 s
 DELAI_ECHO_TRANSPORT = 1.0
+# Bouton de tempo tourne a la souris : la derniere valeur suffit, le relais n'a
+# qu'une file et les notes attendent derriere.
+INTERVALLE_TEMPO = 0.25
 TOUCHENT_NOTES = ("add", "del", "pattern", "reset", "delchannels", "racklist",
                   "canal_debut", "canal_morceau")
 # Un canal part en entier : son .fst (reglages du plugin) et son sample.
@@ -1203,6 +1206,7 @@ class Sync:
         # effets du mixeur : etat connu et cadence (une requete par seconde)
         self.role_sent = False
         self.tempo_limite = 0.0
+        self.tempo_prochain = 0.0
         self.pattern_limite = 0.0
         self.transport_limite = 0.0
         self.mode = None             # 0 = PAT, 1 = SONG
@@ -1890,7 +1894,8 @@ class Sync:
             if self.tempo is None:
                 self.tempo = current_tempo
             elif (abs(current_tempo - self.tempo) > 0.01
-                  and time.monotonic() >= self.tempo_limite):
+                  and time.monotonic() >= max(self.tempo_limite, self.tempo_prochain)):
+                self.tempo_prochain = time.monotonic() + INTERVALLE_TEMPO
                 self.publish_global({"type": "tempo", "bpm": current_tempo})
                 print(f"[sync] tempo envoye : {current_tempo}")
                 changed += 1
