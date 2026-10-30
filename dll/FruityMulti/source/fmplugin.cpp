@@ -31,6 +31,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <map>
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -761,6 +762,9 @@ static HANDLE g_cursorThread = nullptr;
 // sur 32 bits jusque-la. MIXFULL couvre toutes les tranches, moins souvent.
 #define FM_MIX_MAX 125
 
+// Derniers parametres lus par PARAMDIFF, par piste*16 + slot.
+static std::map<int, std::vector<int>> g_paramsConnus;
+
 static LRESULT CALLBACK cursorWndProc (HWND h, UINT msg, WPARAM w, LPARAM l)
 {
 	if (msg == WM_CLOSE)
@@ -1289,7 +1293,7 @@ static std::string executeCommand (const std::string& line)
 	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
 	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 47-h";
+		return "VERSION 47-i";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -3329,6 +3333,94 @@ unsigned char* best = getClipContainer ();
 		std::ostringstream out;
 		out << "CLIPDELETED " << pos << " (" << count << " -> " << (count - 1) << ")";
 		return out.str ();
+	}
+
+	// Fenetre active de FL, comme ui.getFocusedFormID.
+	if (line == "FOCUS")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		unsigned char* const* table = *(unsigned char* const* const*)((unsigned char*)g_engine + 0x11E4790);
+		if (!isReadable (table, 8) || !isReadable (*table + 0x54, 8))
+			return "ERR fenetres illisibles";
+		void* fenetres = *(void**)(*table + 0x54);
+		if (!isReadable (fenetres, 8))
+			return "ERR fenetres illisibles";
+		void** vt = *(void***)fenetres;
+		return "FOCUS " + std::to_string (((int (*) (void*))vt[3]) (fenetres));
+	}
+
+	// Parametres d'un effet qui ont bouge depuis le dernier appel, sans limite de
+	// nombre : PARAMDIFF <piste> <slot> [neuf] -> "PARAMDIFF t s nombre neuf i:brut ...".
+	// Avec neuf, ou si le nombre change, repart de zero et rend tout.
+	if (line.rfind ("PARAMDIFF ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		std::istringstream ss (line.substr (10));
+		int track = 0, slot = 0, neuf = 0;
+		if (!(ss >> track >> slot))
+			return "ERR syntaxe PARAMDIFF <piste> <slot> [neuf]";
+		ss >> neuf;
+		if (track < 0 || track > 125 || slot < 0 || slot > 9)
+			return "ERR plage invalide";
+		unsigned char* objet = mixerSlot (track, slot);
+		if (objet == nullptr || !isReadable (objet + 0x68, 4))
+			return "ERR slot vide";
+		const int nombre = *(const int*)(objet + 0x68);
+		if (nombre < 0 || nombre > 0x7FFF)
+			return "ERR nombre de parametres illisible";
+
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+		const long long base =
+			((long long)track * 0x40 + slot) * 0x10000LL + 0x70008000LL;
+
+		std::vector<int>& connus = g_paramsConnus[track * 16 + slot];
+		if (neuf != 0 || (int)connus.size () != nombre)
+		{
+			neuf = 1;
+			connus.assign ((size_t)nombre, 0);
+		}
+		std::ostringstream out;
+		out << "PARAMDIFF " << track << " " << slot << " " << nombre << " " << neuf;
+		for (int k = 0; k < nombre; k++)
+		{
+			const int raw = getter (base + k, 0x7FFFFFFF, 1);
+			if (neuf != 0 || raw != connus[(size_t)k])
+			{
+				connus[(size_t)k] = raw;
+				out << " " << k << ":" << raw;
+			}
+		}
+		return out.str ();
+	}
+
+	// Plusieurs parametres d'un coup : PARAMSET <piste> <slot> i:brut i:brut ...
+	if (line.rfind ("PARAMSET ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		std::istringstream ss (line.substr (9));
+		int track = 0, slot = 0;
+		if (!(ss >> track >> slot) || track < 0 || track > 125 || slot < 0 || slot > 9)
+			return "ERR syntaxe PARAMSET <piste> <slot> i:brut ...";
+		using SetFn = int (*) (int, int, int);
+		SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
+		const long long base =
+			((long long)track * 0x40 + slot) * 0x10000LL + 0x70008000LL;
+		int ecrits = 0;
+		std::string jeton;
+		while (ss >> jeton)
+		{
+			int index = 0;
+			long long raw = 0;
+			if (sscanf_s (jeton.c_str (), "%d:%lld", &index, &raw) != 2 || index < 0 || index > 0x7FFF)
+				return "ERR jeton invalide " + jeton;
+			setter ((int)(base + index), (int)raw, 0x3FD);
+			ecrits++;
+		}
+		return "PARAMSET " + std::to_string (ecrits);
 	}
 
 	// Tous les parametres d'un emplacement, en une seule reponse.

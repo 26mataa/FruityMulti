@@ -61,7 +61,9 @@ INTERVALLE_CLIPS = 0.1
 INTERVALLE_CANAUX = 0.25
 INTERVALLE_REGLAGES_CANAUX = 0.1
 INTERVALLE_EFFETS = 0.5
-INTERVALLE_REGLAGE_EFFET = 0.05       # un effet par passage, chacun son tour
+INTERVALLE_REGLAGE_EFFET = 0.1        # l'effet ouvert : 15 ms pour 4240 parametres
+INTERVALLE_TOUR_EFFETS = 0.25         # les autres, un par un
+PARAMS_PAR_ECRITURE = 512
 TOUCHENT_NOTES = ("add", "del", "pattern", "reset", "delchannels", "racklist",
                   "canal_debut", "canal_morceau", "etat_notes")
 # Un clip recu : FL retouche sa longueur juste apres, ce n'est pas un geste.
@@ -91,7 +93,6 @@ SAUVEGARDES_GARDEES = 10
 # Boucle lente du mixeur : tout ce que STATUS ne donne pas a chaque cycle.
 INTERVALLE_MIXEUR = 0.1
 INTERVALLE_ROUTAGE = 0.5
-PARAMS_PAR_EFFET = 64
 TRANCHES_RAPIDES = 16                 # les suivantes ne passent que par MIXFULL
 DRAPEAUX_TRANCHE = ("polarite", "inversion", "slots")
 DECALAGES_EQ = ("1FD0", "1FD1", "1FD2", "1FD8", "1FD9", "1FDA", "1FE0", "1FE1", "1FE2")
@@ -1063,6 +1064,37 @@ class Plugin:
         """Ecrit un parametre en valeur brute, sans conversion d'echelle."""
         return self.cmd(f"PARAMRAW {track} {slot} {index} {int(raw)}")[0]
 
+    def set_params(self, track, slot, valeurs):
+        """Ecrit des valeurs brutes {index: valeur}, par lots : un changement de
+        preset en touche des milliers."""
+        items = list(valeurs.items())
+        for debut in range(0, len(items), PARAMS_PAR_ECRITURE):
+            lot = items[debut:debut + PARAMS_PAR_ECRITURE]
+            jetons = " ".join(f"{i}:{int(v)}" for i, v in lot)
+            self.cmd(f"PARAMSET {track} {slot} {jetons}")
+
+    def param_diff(self, track, slot, neuf=False):
+        """(tout_relu, {index: valeur}) depuis le dernier appel, ou None."""
+        try:
+            parts = self.cmd(f"PARAMDIFF {track} {slot}" + (" 1" if neuf else ""))[0].split()
+            if len(parts) < 5 or parts[0] != "PARAMDIFF":
+                return None
+            valeurs = {}
+            for jeton in parts[5:]:
+                i, _, v = jeton.partition(":")
+                valeurs[int(i)] = int(v)
+            return parts[4] == "1", valeurs
+        except (OSError, TimeoutError, IndexError, ValueError):
+            return None
+
+    def focus(self):
+        """Fenetre active de FL : effet = (tranche*64 + slot) << 16."""
+        try:
+            parts = self.cmd("FOCUS")[0].split()
+            return int(parts[1]) if parts[0] == "FOCUS" else None
+        except (OSError, TimeoutError, IndexError, ValueError):
+            return None
+
 
 # --------------------------------------------------------------------------
 def canaux_retires(avant, apres):
@@ -1348,6 +1380,8 @@ class Sync:
         self.fx_params = {}
         self.last_fx = 0.0
         self.last_fxparams = 0.0
+        self.last_tour_effets = 0.0
+        self.effet_actif = None
         # Le curseur a besoin d'une cadence bien plus rapide que les notes.
         # le curseur passe par STATUS : plus de thread ni de requete dediee
 
@@ -1870,19 +1904,16 @@ class Sync:
                             print(f"[fx] '{nom}' introuvable sur ce poste")
                     applied += 1
 
-            elif kind == "fxparam":
+            elif kind == "fxparams":
                 t = int(message.get("track", -1))
                 s = int(message.get("slot", -1))
-                i = int(message.get("i", -1))
-                v = int(message.get("v", 0))
-                if 0 <= t <= 125 and 0 <= s <= 9 and i >= 0 and (t, s) not in self.fx_absents:
-                    self.plugin.set_param_raw(t, s, i, v)
+                valeurs = {int(i): int(v) for i, v in message.get("v", {}).items()}
+                if 0 <= t <= 125 and 0 <= s <= 9 and valeurs and (t, s) not in self.fx_absents:
+                    self.plugin.set_params(t, s, valeurs)
                     # on met a jour notre reference : sinon on renverrait au
                     # pair ce qu'il vient de nous envoyer
-                    cache = self.fx_params.setdefault((t, s), [])
-                    while len(cache) <= i:
-                        cache.append(0)
-                    cache[i] = v
+                    if (t, s) in self.fx_params:
+                        self.fx_params[(t, s)].update(valeurs)
                     applied += 1
 
             elif kind == "channeltrack":
@@ -2333,41 +2364,9 @@ class Sync:
         if now - self.last_fxparams >= INTERVALLE_REGLAGE_EFFET:
             self.last_fxparams = now
             if self.fx:
-                # Lire tous les effets d'un coup ferait attendre les notes.
-                self.tour_effet += 1
-                slots = sorted(self.fx)
-                for (t, s) in [slots[self.tour_effet % len(slots)]]:
-                    if (t, s) in self.fx_absents:
-                        continue
-                    detail = self.plugin.effect_detail(t, s)
-                    if not detail or not detail[0]:
-                        continue
-                    if not meme_nom(detail[0], self.fx[(t, s)]):
-                        continue
-                    vals = self.plugin.params(t, s, PARAMS_PAR_EFFET)
-                    if not isinstance(vals, list) or not vals:
-                        continue
-                    cle = (t, s)
-                    connu = self.fx_params.get(cle)
-                    self.fx_params[cle] = list(vals)
-                    if connu is None:
-                        continue
-                    changes = {}
-                    for i, v in enumerate(vals):
-                        if v == -2147483648:        # parametre inexistant
-                            continue
-                        old = connu[i] if i < len(connu) else None
-                        # FL quantifie les valeurs (ecart mesure : ~90 000
-                        # sur les 2^30). En dessous de 2^17 on ne voit rien ;
-                        # au-dessus, c'est un vrai mouvement de potard.
-                        if old is None or abs(v - old) > (1 << 17):
-                            changes[i] = v
-                    for i, v in changes.items():
-                        self.publish({"type": "fxparam", "track": t,
-                                      "slot": s, "i": i, "v": v})
-                    if changes:
-                        print(f"[fx] tranche {t} slot {s} : "
-                              f"{len(changes)} reglage(s) envoye(s)")
+                cible = self.effet_a_lire(now)
+                if cible is not None:
+                    self.suivre_effet(*cible)
 
         # parametres de plugin : DESACTIVES. Sans verification que les deux
         # cotes ont le meme plugin dans le meme emplacement, on ecrasait les
@@ -2638,6 +2637,47 @@ class Sync:
         self.snapshot = decaler_notes(self.snapshot, retires)
         self.channel_mix_state = None
         return True
+
+    def effet_a_lire(self, now):
+        """L'effet ouvert en priorite, et de temps en temps un autre. Il le reste
+        quand on clique ailleurs : c'est souvent lui qu'on ecoute."""
+        fenetre = self.plugin.focus()
+        if isinstance(fenetre, int) and fenetre >= 0x10000:
+            cle = divmod(fenetre >> 16, 64)
+            if cle in self.fx:
+                self.effet_actif = cle
+        if now - self.last_tour_effets >= INTERVALLE_TOUR_EFFETS:
+            self.last_tour_effets = now
+            autres = [cle for cle in sorted(self.fx) if cle != self.effet_actif]
+            if autres:
+                self.tour_effet += 1
+                return autres[self.tour_effet % len(autres)]
+        return self.effet_actif if self.effet_actif in self.fx else None
+
+    def suivre_effet(self, t, s):
+        if (t, s) in self.fx_absents:
+            return
+        detail = self.plugin.effect_detail(t, s)
+        if not detail or not detail[0] or not meme_nom(detail[0], self.fx[(t, s)]):
+            return
+        connus = self.fx_params.get((t, s))
+        lecture = self.plugin.param_diff(t, s, connus is None)
+        if not isinstance(lecture, tuple):
+            return
+        tout, valeurs = lecture
+        if connus is None or tout:
+            self.fx_params[(t, s)] = dict(valeurs)
+            return
+        changes = {}
+        for i, v in valeurs.items():
+            # FL quantifie les valeurs (ecart mesure : ~90 000 sur les 2^30). En
+            # dessous de 2^17 on ne voit rien ; au-dessus, c'est un vrai mouvement.
+            if v != -2147483648 and abs(v - connus.get(i, 0)) > (1 << 17):
+                changes[i] = v
+        if changes:
+            connus.update(changes)
+            self.publish({"type": "fxparams", "track": t, "slot": s, "v": changes})
+            print(f"[fx] tranche {t} slot {s} : {len(changes)} reglage(s) envoye(s)")
 
     def oublier_slot(self, track, slot):
         """L'effet du slot a change : ses reglages connus ne valent plus rien."""
@@ -3676,7 +3716,7 @@ class Link:
             return message.get("ch") in canaux
         if kind in ("channeltrack", "channelmix"):
             return message.get("index") in canaux
-        if kind in ("fx", "fxparam", "mixrec"):
+        if kind in ("fx", "fxparams", "mixrec"):
             return (message.get("track"), message.get("slot")) in effets
         return False
 
