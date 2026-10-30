@@ -246,6 +246,59 @@ static int guardedSaveChannel (ChannelFileFn ecrire, void* chemin, void* channel
 	return -1;
 }
 
+// Effet d'un slot du mixeur : memes fichiers .fst, type 0x30 (FUN_012bb790).
+static int guardedSaveEffect (ChannelFileFn ecrire, void* chemin, void* slot, unsigned long* faute)
+{
+	__try
+	{
+		return ecrire (chemin, 0x30, slot, 0);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		*faute = GetExceptionCode ();
+	}
+	return -1;
+}
+
+// Pose ou retire un effet, l'appel exact de plugins.addEffect (FUN_00d9b930) :
+// une etape d'historique, puis la methode +0xF0 du slot sur le fichier .fst.
+using EtapeSlotFn = void (*) (void*, void*, int, int);
+using ChargerSlotFn = void (*) (void*, int, void*, int, unsigned char, unsigned char);
+
+static unsigned long guardedLoadEffect (EtapeSlotFn etape, void* historique, void* nomEtape,
+                                        int track, int slot, void* objet, void* chemin)
+{
+	__try
+	{
+		etape (historique, nomEtape, track, slot);
+		ChargerSlotFn charger = *(ChargerSlotFn*)(*(unsigned char**)objet + 0xF0);
+		charger (objet, -2, chemin, 0, 1, 1);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return GetExceptionCode ();
+	}
+	return 0;
+}
+
+static unsigned long guardedRouteSet (unsigned char* base, void* routage, int source, int cible,
+                                      int actif, int niveau, unsigned char* piste)
+{
+	__try
+	{
+		if (actif >= 0)
+			((int (*) (void*, int, int, int, int))(base + 0xEA33C0)) (routage, source, cible, actif, 1);
+		if (niveau >= 0)
+			*(int*)(piste + (size_t)cible * 8 + 0x394) = niveau;
+		((void (*) (void*))(base + 0xEA28F0)) (routage);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return GetExceptionCode ();
+	}
+	return 0;
+}
+
 // Bascule PAT/SONG : FUN_00fdd300 (15, 1, drapeau, 15, 0), l'appel exact de
 // transport.setLoopMode. FL l'applique juste apres, pas pendant l'appel.
 static unsigned long guardedToggleLoopMode (unsigned char* base)
@@ -704,6 +757,9 @@ static HANDLE g_cursorThread = nullptr;
 // Nombre de tranches de mixage suivies. FL en propose bien plus, mais chaque
 // tranche coute deux nombres dans STATUS a chaque cycle.
 #define FM_MIX_TRACKS 16
+// Limite de l'identifiant d'automation de FL : (piste * 0x40) << 16 reste
+// sur 32 bits jusque-la. MIXFULL couvre toutes les tranches, moins souvent.
+#define FM_MIX_MAX 125
 
 static LRESULT CALLBACK cursorWndProc (HWND h, UINT msg, WPARAM w, LPARAM l)
 {
@@ -1122,6 +1178,28 @@ static std::string widePtr (const unsigned char* obj, size_t off, int maxChars)
 	return out;
 }
 
+static std::string utf8Texte (const unsigned short* text)
+{
+	if (text == nullptr || !isReadable (text, 2))
+		return std::string ();
+	char tampon[1024];
+	const int n = WideCharToMultiByte (CP_UTF8, 0, (const wchar_t*)text, -1, tampon,
+	                                   sizeof (tampon), nullptr, nullptr);
+	return n > 1 ? std::string (tampon, (size_t)n - 1) : std::string ();
+}
+
+// Un nom peut contenir n'importe quoi : les separateurs du protocole sont retires.
+static std::string utf8Ptr (const unsigned char* obj, size_t off)
+{
+	if (obj == nullptr || !isReadable (obj + off, 8))
+		return std::string ();
+	std::string out = utf8Texte (*(const unsigned short* const*)(obj + off));
+	for (char& c : out)
+		if (c == '|' || c == '\n' || c == '\r')
+			c = ' ';
+	return out;
+}
+
 static std::string slotName (const unsigned char* s)
 {
 	// +0x58 porte le nom affiche. Pour un VST, FL met "Fruity Wrapper" (le
@@ -1199,7 +1277,7 @@ static std::string executeCommand (const std::string& line)
 	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
 	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 47-d";
+		return "VERSION 47-f";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -2663,6 +2741,278 @@ static std::string executeCommand (const std::string& line)
 		return std::string (buf);
 	}
 
+	// Valeurs brutes d'automation : RECGET <piste> <slot> <decalage hexa>...
+	// L'identifiant est celui de FL : ((piste*0x40 + slot) << 16) + 0x70000000 + decalage.
+	//   1F00 mute du slot, 1F01 dry/wet, 1FC0-2 vol/pan/stereo,
+	//   1FD0-2 gain EQ, 1FD8-A frequence EQ, 1FE0-2 largeur EQ.
+	if (line.rfind ("RECGET ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		std::istringstream ss (line.substr (7));
+		int track = -1, slot = -1;
+		if (!(ss >> track >> slot) || track < 0 || track > FM_MIX_MAX || slot < 0 || slot > 9)
+			return "ERR syntaxe RECGET <piste> <slot> <decalage>...";
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+		const long long base = ((long long)track * 0x40 + slot) * 0x10000LL + 0x70000000LL;
+		std::ostringstream out;
+		out << "RECGET";
+		std::string mot;
+		while (ss >> mot)
+			out << " " << getter (base + std::stoll (mot, nullptr, 16), 0x7FFFFFFF, 1);
+		return out.str ();
+	}
+
+	// RECSET <piste> <slot> <decalage hexa> <brut>. Le mute d'un slot passe par
+	// le meme chemin (0 ou 1).
+	if (line.rfind ("RECSET ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		std::istringstream ss (line.substr (7));
+		int track = -1, slot = -1;
+		std::string mot;
+		long long brut = 0;
+		if (!(ss >> track >> slot >> mot >> brut) || track < 0 || track > FM_MIX_MAX
+		    || slot < 0 || slot > 9)
+			return "ERR syntaxe RECSET <piste> <slot> <decalage> <brut>";
+		const long long handle = ((long long)track * 0x40 + slot) * 0x10000LL + 0x70000000LL
+		                         + std::stoll (mot, nullptr, 16);
+		// FUN_01051d60, comme mixer.setPluginMuteState : le dernier argument
+		// flottant est le lissage de FL.
+		using EcrireFn = void (*) (int, int, int, long long, int, float, long long);
+		((EcrireFn)((unsigned char*)g_engine + 0xC51D60)) ((int)handle, (int)brut, 0x3F5, 0, 0,
+		                                                  0.0416666679f, 0);
+		return "RECSET OK";
+	}
+
+	// Tout le mixeur en une reponse, pour la boucle lente de l'agent :
+	//   MIXFULL <n> t:vol,pan,stereo,mute,solo,polarite,inversion,slots,<9 EQ>[/s:mute:drywet...];...
+	// Seuls les slots occupes sont cites.
+	if (line == "MIXFULL")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		unsigned char* moteur = (unsigned char*)g_engine;
+		using GetFn = int (*) (long long, int, int);
+		GetFn getter = (GetFn)(moteur + 0xC51340);
+		using SetFn = int (*) (int, int, int);
+		SetFn lire = (SetFn)(moteur + 0xC46A70);
+
+		std::ostringstream out;
+		int n = 0;
+		std::ostringstream corps;
+		for (int t = 0; t <= FM_MIX_MAX; t++)
+		{
+			unsigned char* piste = mixerTrack (t);
+			if (piste == nullptr)
+				continue;
+			const long long base = ((long long)t * 0x40) * 0x10000LL + 0x70000000LL;
+			if (n > 0)
+				corps << ";";
+			corps << t << ":" << getter (base + 0x1FC0, 0x7FFFFFFF, 1)
+			      << "," << getter (base + 0x1FC1, 0x7FFFFFFF, 1)
+			      << "," << getter (base + 0x1FC2, 0x7FFFFFFF, 1)
+			      << "," << (piste[0x18] != 0 ? 0 : 1)
+			      << "," << (int)piste[0x1A]
+			      << "," << (int)piste[0x390]
+			      << "," << (int)piste[0x391]
+			      << "," << (int)piste[0x13F5];
+			for (int off : { 0x1FD0, 0x1FD1, 0x1FD2, 0x1FD8, 0x1FD9, 0x1FDA, 0x1FE0, 0x1FE1, 0x1FE2 })
+				corps << "," << getter (base + off, 0x7FFFFFFF, 1);
+			for (int sl = 0; sl < 10; sl++)
+			{
+				unsigned char* objet = mixerSlot (t, sl);
+				if (objet == nullptr || slotName (objet).empty ())
+					continue;
+				const long long id = ((long long)t * 0x40 + sl) * 0x10000LL + 0x70001F00LL;
+				corps << "/" << sl << ":" << lire ((int)id, 0, 2)
+				      << ":" << getter (id + 1, 0x7FFFFFFF, 1);
+			}
+			n++;
+		}
+		out << "MIXFULL " << n << " " << corps.str ();
+		return out.str ();
+	}
+
+	// Routage : ROUTES -> "ROUTES <n> s>c:niveau ...", envois actifs seulement.
+	if (line == "ROUTES")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		std::ostringstream corps;
+		int n = 0;
+		for (int s_ = 0; s_ <= FM_MIX_MAX; s_++)
+		{
+			unsigned char* piste = mixerTrack (s_);
+			if (piste == nullptr)
+				continue;
+			for (int c = 0; c <= FM_MIX_MAX; c++)
+			{
+				if (piste[(size_t)c * 8 + 0x398] == 0)
+					continue;
+				corps << " " << s_ << ">" << c << ":"
+				      << *(const int*)(piste + (size_t)c * 8 + 0x394);
+				n++;
+			}
+		}
+		return "ROUTES " + std::to_string (n) + corps.str ();
+	}
+
+	// ROUTESET <source> <cible> <0|1|-1 inchange> <niveau brut | -1 inchange>
+	if (line.rfind ("ROUTESET ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		int source = -1, cible = -1, actif = -1, niveau = -1;
+		if (sscanf_s (line.c_str () + 9, "%d %d %d %d", &source, &cible, &actif, &niveau) != 4
+		    || cible < 0 || cible > FM_MIX_MAX || mixerTrack (source) == nullptr)
+			return "ERR syntaxe ROUTESET <source> <cible> <actif> <niveau>";
+		unsigned char* moteur = (unsigned char*)g_engine;
+		void** global = *(void***)(moteur + 0x11E22D8);
+		if (!isReadable (global, 8) || *global == nullptr)
+			return "ERR routage illisible";
+		const unsigned long faute = guardedRouteSet (moteur, *global, source, cible, actif,
+		                                             niveau, mixerTrack (source));
+		return faute != 0 ? "ERR faute routage" : "ROUTESET OK";
+	}
+
+	// Boutons d'une tranche : TRACKFLAG <piste> <polarite|inversion|slots> <0|1>
+	if (line.rfind ("TRACKFLAG ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		std::istringstream ss (line.substr (10));
+		int track = -1, valeur = 0;
+		std::string nom;
+		if (!(ss >> track >> nom >> valeur) || mixerTrack (track) == nullptr)
+			return "ERR syntaxe TRACKFLAG <piste> <nom> <0|1>";
+		size_t rva = 0;
+		if (nom == "polarite") rva = 0xE7C460;
+		else if (nom == "inversion") rva = 0xE7C550;
+		else if (nom == "slots") rva = 0xE7C3E0;
+		else return "ERR drapeau inconnu";
+		((void (*) (int, unsigned char))((unsigned char*)g_engine + rva)) (track, valeur != 0 ? 1 : 0);
+		return "TRACKFLAG OK";
+	}
+
+	// Noms et couleurs : TRACKNAMES -> "<n> t:couleur:nom|t:couleur:nom..."
+	if (line == "TRACKNAMES")
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		using CouleurFn = unsigned (*) (void*);
+		CouleurFn couleur = (CouleurFn)((unsigned char*)g_engine + 0xEC1930);
+		std::ostringstream corps;
+		int n = 0;
+		for (int t = 0; t <= FM_MIX_MAX; t++)
+		{
+			unsigned char* piste = mixerTrack (t);
+			if (piste == nullptr)
+				continue;
+			if (n > 0)
+				corps << "|";
+			corps << t << ":" << couleur (piste) << ":" << utf8Ptr (piste, 0x0C);
+			n++;
+		}
+		return "TRACKNAMES " + std::to_string (n) + " " + corps.str ();
+	}
+
+	// TRACKNAME <piste> <nom>   TRACKCOLOR <piste> <couleur brute>
+	if (line.rfind ("TRACKNAME ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		int track = -1, lu = 0;
+		if (sscanf_s (line.c_str () + 10, "%d %n", &track, &lu) != 1 || mixerTrack (track) == nullptr)
+			return "ERR syntaxe TRACKNAME <piste> <nom>";
+		using ToDelphi = void* (*) (void*, const char*);
+		void* nom = nullptr;
+		((ToDelphi)((unsigned char*)g_engine + 0x1C6E0)) (&nom, line.c_str () + 10 + lu);
+		((void (*) (int, void*, int))((unsigned char*)g_engine + 0xEBE6F0)) (track, nom, 1);
+		return "TRACKNAME OK";
+	}
+
+	if (line.rfind ("TRACKCOLOR ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		int track = -1;
+		unsigned valeur = 0;
+		if (sscanf_s (line.c_str () + 11, "%d %u", &track, &valeur) != 2 || mixerTrack (track) == nullptr)
+			return "ERR syntaxe TRACKCOLOR <piste> <couleur>";
+		((void (*) (void*, unsigned))((unsigned char*)g_engine + 0xEC17E0)) (mixerTrack (track), valeur);
+		((void (*) (int, int))((unsigned char*)g_engine + 0x7D68E0)) (0x18, 0);
+		return "TRACKCOLOR OK";
+	}
+
+	// Effet entier dans un .fst : FXSAVE <piste> <slot> <chemin>
+	if (line.rfind ("FXSAVE ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		int track = -1, slot = -1, lu = 0;
+		if (sscanf_s (line.c_str () + 7, "%d %d %n", &track, &slot, &lu) != 2 || lu == 0)
+			return "ERR syntaxe FXSAVE <piste> <slot> <chemin>";
+		unsigned char* objet = mixerSlot (track, slot);
+		if (objet == nullptr)
+			return "ERR slot introuvable";
+		unsigned char* base = (unsigned char*)g_engine;
+		using ToDelphi = void* (*) (void*, const char*);
+		void* chemin = nullptr;
+		((ToDelphi)(base + 0x1C6E0)) (&chemin, line.c_str () + 7 + lu);
+		unsigned long faute = 0;
+		const int rc = guardedSaveEffect ((ChannelFileFn)(base + 0xB54570), chemin, objet, &faute);
+		if (faute != 0)
+			return "ERR FXSAVE faute";
+		return "FXSAVE OK " + std::to_string (rc);
+	}
+
+	// FXLOAD <piste> <slot> [chemin] : pose un .fst, ou retire l'effet sans chemin.
+	if (line.rfind ("FXLOAD ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+		int track = -1, slot = -1, lu = 0;
+		if (sscanf_s (line.c_str () + 7, "%d %d %n", &track, &slot, &lu) != 2 || lu == 0)
+			return "ERR syntaxe FXLOAD <piste> <slot> [chemin]";
+		unsigned char* objet = mixerSlot (track, slot);
+		if (objet == nullptr || slot > 9)
+			return "ERR slot introuvable";
+		unsigned char* base = (unsigned char*)g_engine;
+		void** global = *(void***)(base + 0x11E1C78);
+		if (!isReadable (global, 8) || *global == nullptr)
+			return "ERR historique illisible";
+
+		using ToDelphi = void* (*) (void*, const char*);
+		ToDelphi toDelphi = (ToDelphi)(base + 0x1C6E0);
+		std::string fichier = line.substr (7 + (size_t)lu);
+		const bool retrait = fichier.empty ();
+		if (retrait)
+		{
+			// Le preset vide de FL, a la place que lui donne plugins.addEffect.
+			void* dossier = nullptr;
+			unsigned char** globalFl = *(unsigned char***)(base + 0x11E4790);
+			if (!isReadable (globalFl, 8) || !isReadable (*globalFl + 0x30, 8))
+				return "ERR dossier des presets illisible";
+			void* usine = *(void**)(*globalFl + 0x30);
+			((void (*) (void*, void**, int, int))(base + 0x35B410)) (usine, &dossier, 0x401, 1);
+			fichier = utf8Texte ((const unsigned short*)dossier) + "(delete) effect.fst";
+		}
+		void* chemin = nullptr;
+		void* nomEtape = nullptr;
+		toDelphi (&chemin, fichier.c_str ());
+		toDelphi (&nomEtape, retrait ? "remove effect plugin" : "insert effect plugin");
+		const unsigned long faute = guardedLoadEffect (
+			(EtapeSlotFn)(base + (retrait ? 0xC19570 : 0xC187D0)), *global, nomEtape,
+			track, slot, objet, chemin);
+		if (faute != 0)
+			return "ERR FXLOAD faute";
+		requestRefresh ();
+		return "FXLOAD OK " + slotName (objet);
+	}
+
 	// Liste de TOUS les conteneurs : outil de diagnostic.
 	if (line == "CLIPS")
 	{
@@ -2988,7 +3338,7 @@ unsigned char* best = getClipContainer ();
 
 		std::string body;
 		int n = 0;
-		for (int t = 0; t <= 16; t++)
+		for (int t = 0; t <= FM_MIX_MAX; t++)
 		{
 			if (mixerTrack (t) == nullptr)
 				continue;

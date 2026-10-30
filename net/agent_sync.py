@@ -54,6 +54,7 @@ DELAI_ECHO_TRANSPORT = 1.0
 # Bouton de tempo tourne a la souris : la derniere valeur suffit, le relais n'a
 # qu'une file et les notes attendent derriere.
 INTERVALLE_TEMPO = 0.25
+INTERVALLE_POTARD = 0.1               # volume, pan, stereo d'une tranche
 TOUCHENT_NOTES = ("add", "del", "pattern", "reset", "delchannels", "racklist",
                   "canal_debut", "canal_morceau")
 # Un canal part en entier : son .fst (reglages du plugin) et son sample.
@@ -72,6 +73,14 @@ VARIABLE_PARTAGE = "%ILSharedData%"      # Documents\Image-Line : kits de l'util
 # Ctrl+Z rend le canal et ses notes au lieu de planter (POUR-CLAUDE, 13.15).
 SUPPRESSION_RECUE = True
 SAUVEGARDES_GARDEES = 10
+# Boucle lente du mixeur : tout ce que STATUS ne donne pas a chaque cycle.
+INTERVALLE_MIXEUR = 0.5
+INTERVALLE_ROUTAGE = 2.0
+PARAMS_PAR_EFFET = 64
+TRANCHES_RAPIDES = 16                 # les suivantes ne passent que par MIXFULL
+DRAPEAUX_TRANCHE = ("polarite", "inversion", "slots")
+DECALAGES_EQ = ("1FD0", "1FD1", "1FD2", "1FD8", "1FD9", "1FDA", "1FE0", "1FE1", "1FE2")
+TOLERANCE_REC = 1 << 17               # FL quantifie : en dessous, ce n'est pas un geste
 
 
 # --------------------------------------------------------------------------
@@ -939,6 +948,91 @@ class Plugin:
     def set_param(self, track, slot, index, value):
         return self.cmd(f"PARAM {track} {slot} {index} {value:.6f}")[0]
 
+    def mix_full(self):
+        """Tout le mixeur : {tranche: fiche}, ou None."""
+        try:
+            line = self.cmd("MIXFULL")[0]
+        except (OSError, TimeoutError, IndexError):
+            return None
+        if not line.startswith("MIXFULL "):
+            return None
+        tranches = {}
+        try:
+            for bloc in line.split(" ", 2)[2].split(";"):
+                tete, *slots = bloc.split("/")
+                track, valeurs = tete.split(":")
+                v = [int(x) for x in valeurs.split(",")]
+                tranches[int(track)] = {
+                    "vol": v[0] / 1073741824.0,
+                    "pan": (v[1] / 1073741824.0) * 2.0 - 1.0,
+                    "stereo": (v[2] / 1073741824.0) * 2.0 - 1.0,
+                    "mute": v[3],
+                    "drapeaux": dict(zip(DRAPEAUX_TRANCHE, v[5:8])),
+                    "eq": dict(zip(DECALAGES_EQ, v[8:17])),
+                    "slots": {int(a): (int(b), int(c)) for a, b, c in
+                              (x.split(":") for x in slots)},
+                }
+        except (ValueError, IndexError):
+            return None
+        return tranches
+
+    def routes(self):
+        """Envois actifs : {(source, cible): niveau}, ou None."""
+        try:
+            line = self.cmd("ROUTES")[0]
+        except (OSError, TimeoutError, IndexError):
+            return None
+        if not line.startswith("ROUTES "):
+            return None
+        envois = {}
+        try:
+            for mot in line.split()[2:]:
+                source, reste = mot.split(">")
+                cible, niveau = reste.split(":")
+                envois[(int(source), int(cible))] = int(niveau)
+        except ValueError:
+            return None
+        return envois
+
+    def track_names(self):
+        """{tranche: (couleur, nom)}, ou None."""
+        try:
+            line = self.cmd("TRACKNAMES")[0]
+        except (OSError, TimeoutError, IndexError):
+            return None
+        if not line.startswith("TRACKNAMES "):
+            return None
+        noms = {}
+        try:
+            for bloc in line.split(" ", 2)[2].split("|"):
+                track, couleur, nom = bloc.split(":", 2)
+                noms[int(track)] = (int(couleur), nom)
+        except (ValueError, IndexError):
+            return None
+        return noms
+
+    def rec_set(self, track, slot, decalage, brut):
+        return self.cmd(f"RECSET {track} {slot} {decalage} {brut}")[0]
+
+    def track_flag(self, track, nom, valeur):
+        return self.cmd(f"TRACKFLAG {track} {nom} {1 if valeur else 0}")[0]
+
+    def route_set(self, source, cible, actif, niveau):
+        return self.cmd(f"ROUTESET {source} {cible} {actif} {niveau}")[0]
+
+    def set_track_name(self, track, nom):
+        return self.cmd(f"TRACKNAME {track} {nom}")[0]
+
+    def set_track_color(self, track, couleur):
+        return self.cmd(f"TRACKCOLOR {track} {couleur}")[0]
+
+    def fx_save(self, track, slot, chemin):
+        return self.cmd(f"FXSAVE {track} {slot} {chemin}")[0]
+
+    def fx_load(self, track, slot, chemin=""):
+        """Pose un .fst dans le slot, ou le vide sans chemin."""
+        return self.cmd(f"FXLOAD {track} {slot} {chemin}")[0]
+
     def cmd_force(self, texte):
         """Ordre de l'hote : s'execute meme chez l'invite.
 
@@ -1207,6 +1301,7 @@ class Sync:
         self.role_sent = False
         self.tempo_limite = 0.0
         self.tempo_prochain = 0.0
+        self.potard_prochain = {}
         self.pattern_limite = 0.0
         self.transport_limite = 0.0
         self.mode = None             # 0 = PAT, 1 = SONG
@@ -1215,6 +1310,13 @@ class Sync:
         self.notes_retenues = []
         self.fx = None
         self.fx_attendus = {}
+        self.fx_recu = None
+        self.mix_cache = None
+        self.mix_tard = None
+        self.envois = None
+        self.noms_tranches = None
+        self.last_mixeur = 0.0
+        self.last_routage = 0.0
         self.fx_params = {}
         self.last_fx = 0.0
         self.last_fxparams = 0.0
@@ -1603,6 +1705,60 @@ class Sync:
             elif kind == "canal_debut":
                 self.canal_recu = dict(message, recus=[])
 
+            elif kind == "fx_debut":
+                self.fx_recu = dict(message, recus=[])
+
+            elif kind == "fx_morceau" and self.fx_recu:
+                self.fx_recu["recus"].append(base64.b64decode(message.get("d", "")))
+                if len(self.fx_recu["recus"]) >= int(self.fx_recu.get("morceaux", 0)):
+                    recu, self.fx_recu = self.fx_recu, None
+                    self.recevoir_fx(recu)
+                    applied += 1
+
+            elif kind == "mixflag":
+                t, nom = int(message.get("track", -1)), str(message.get("nom", ""))
+                if 0 <= t <= 125 and nom in DRAPEAUX_TRANCHE:
+                    valeur = int(message.get("v", 0))
+                    self.plugin.track_flag(t, nom, valeur)
+                    if self.mix_cache is not None:
+                        self.mix_cache[("drapeau", t, nom)] = valeur
+                    applied += 1
+
+            elif kind == "mixrec":
+                t, s = int(message.get("track", -1)), int(message.get("slot", -1))
+                decalage = str(message.get("off", ""))
+                if 0 <= t <= 125 and 0 <= s <= 9 and re.fullmatch("[0-9A-F]{4}", decalage):
+                    valeur = int(message.get("v", 0))
+                    # MIXFULL lit le bouton du slot en 0/1, FL l'ecrit sur 2^30
+                    brut = (1 << 30 if valeur else 0) if decalage == "1F00" else valeur
+                    self.plugin.rec_set(t, s, decalage, brut)
+                    if self.mix_cache is not None:
+                        self.mix_cache[("rec", t, s, decalage)] = valeur
+                    applied += 1
+
+            elif kind == "route":
+                source, cible = int(message.get("source", -1)), int(message.get("cible", -1))
+                if 0 <= source <= 125 and 0 <= cible <= 125:
+                    niveau = int(message.get("niveau", -1))
+                    self.plugin.route_set(source, cible, 1 if niveau >= 0 else 0, niveau)
+                    if self.envois is not None:
+                        if niveau >= 0:
+                            self.envois[(source, cible)] = niveau
+                        else:
+                            self.envois.pop((source, cible), None)
+                    applied += 1
+
+            elif kind == "tranche_nom":
+                t = int(message.get("track", -1))
+                if 0 <= t <= 125:
+                    couleur, nom = int(message.get("couleur", 0)), str(message.get("nom", ""))
+                    if "\n" not in nom:
+                        self.plugin.set_track_name(t, nom)
+                        self.plugin.set_track_color(t, couleur)
+                        if self.noms_tranches is not None:
+                            self.noms_tranches[t] = (couleur, nom)
+                    applied += 1
+
             elif kind == "canal_morceau" and self.canal_recu:
                 self.canal_recu["recus"].append(base64.b64decode(message.get("d", "")))
                 if len(self.canal_recu["recus"]) >= int(self.canal_recu.get("morceaux", 0)):
@@ -1645,8 +1801,12 @@ class Sync:
                 if t < 0 or s < 0:
                     pass
                 elif not nom:
-                    print(f"[fx] l'hote a retire l'effet de la tranche {t} "
-                          f"slot {s}")
+                    print(f"[fx] l'autre a retire l'effet de la tranche {t} slot {s}")
+                    self.plugin.fx_load(t, s)
+                    if self.fx is not None:
+                        self.fx.pop((t, s), None)
+                    self.oublier_slot(t, s)
+                    applied += 1
                 else:
                     preset = str(message.get("preset", ""))
                     detail = self.plugin.effect_detail(t, s)
@@ -2073,6 +2233,9 @@ class Sync:
                     for (t, s), nom in courants.items():
                         if self.fx.get((t, s)) == nom:
                             continue
+                        self.oublier_slot(t, s)
+                        if self.publier_fx(t, s, nom):
+                            continue
                         detail = self.plugin.effect_detail(t, s)
                         preset = detail[2] if detail else ""
                         self.publish_global({"type": "fx", "track": t,
@@ -2084,6 +2247,7 @@ class Sync:
                     for (t, s) in list(self.fx.keys()):
                         if (t, s) in courants:
                             continue
+                        self.oublier_slot(t, s)
                         self.publish_global({"type": "fx", "track": t,
                                              "slot": s, "name": "",
                                              "preset": ""})
@@ -2103,6 +2267,13 @@ class Sync:
                             print(f"[fx] tranche {t} slot {s} : '{pose}' pose "
                                   f"a la place de '{nom}'")
 
+        if now - self.last_mixeur >= INTERVALLE_MIXEUR:
+            self.last_mixeur = now
+            self.suivre_mixeur()
+        if now - self.last_routage >= INTERVALLE_ROUTAGE:
+            self.last_routage = now
+            self.suivre_routage()
+
         # Reglages des effets : uniquement pour un effet PRESENT DES DEUX COTES
         # et du meme nom. On compare des valeurs BRUTES (PARAMS / PARAMRAW),
         # donc aucune echelle a supposer.
@@ -2115,7 +2286,7 @@ class Sync:
                         continue
                     if not meme_nom(detail[0], self.fx[(t, s)]):
                         continue
-                    vals = self.plugin.params(t, s, 16)
+                    vals = self.plugin.params(t, s, PARAMS_PAR_EFFET)
                     if not isinstance(vals, list) or not vals:
                         continue
                     cle = (t, s)
@@ -2194,16 +2365,24 @@ class Sync:
         # mixeur : deja present dans STATUS, donc plus aucune requete dediee
         if st:
             sent = 0
-            for track, snapshot in st["mix"].items():
+            tranches = dict(st["mix"])
+            tranches.update(self.mix_tard or {})
+            self.mix_tard = None
+            for track, snapshot in tranches.items():
                 state = self.mix.setdefault(track, {})
                 changes = {}
-                for key, tolerance in (("vol", 0.004), ("pan", 0.01),
-                                       ("stereo", 0.01)):
-                    value = snapshot[key]
-                    old = state.get(key)
-                    if old is None or abs(value - old) > tolerance:
-                        state[key] = value
-                        changes[key] = value
+                # Pas d'ecart note pendant l'attente : la derniere valeur part au
+                # tour suivant.
+                if time.monotonic() >= self.potard_prochain.get(track, 0.0):
+                    for key, tolerance in (("vol", 0.004), ("pan", 0.01),
+                                           ("stereo", 0.01)):
+                        value = snapshot[key]
+                        old = state.get(key)
+                        if old is None or abs(value - old) > tolerance:
+                            state[key] = value
+                            changes[key] = value
+                    if changes:
+                        self.potard_prochain[track] = time.monotonic() + INTERVALLE_POTARD
                 mute = snapshot["mute"]
                 if mute >= 0 and state.get("mute") != mute:
                     state["mute"] = mute
@@ -2322,6 +2501,133 @@ class Sync:
         self.snapshot = decaler_notes(self.snapshot, retires)
         self.channel_mix_state = None
         return True
+
+    def oublier_slot(self, track, slot):
+        """L'effet du slot a change : ses reglages connus ne valent plus rien."""
+        self.fx_params.pop((track, slot), None)
+        if self.mix_cache is not None:
+            for decalage in ("1F00", "1F01"):
+                self.mix_cache.pop(("rec", track, slot, decalage), None)
+
+    def suivre_mixeur(self):
+        """Compare tout le mixeur au dernier etat connu et envoie les ecarts."""
+        tranches = self.plugin.mix_full()
+        if not isinstance(tranches, dict):
+            return
+        premiere = self.mix_cache is None
+        if premiere:
+            self.mix_cache = {}
+        vus = {}
+        for t, fiche in tranches.items():
+            for nom, valeur in fiche["drapeaux"].items():
+                vus[("drapeau", t, nom)] = valeur
+            for decalage, valeur in fiche["eq"].items():
+                vus[("rec", t, 0, decalage)] = valeur
+            for s, (mute, niveau) in fiche["slots"].items():
+                vus[("rec", t, s, "1F00")] = mute
+                vus[("rec", t, s, "1F01")] = niveau
+        for cle, valeur in vus.items():
+            connu = self.mix_cache.get(cle)
+            self.mix_cache[cle] = valeur
+            if premiere or connu is None:
+                continue
+            if cle[0] == "drapeau":
+                if valeur != connu:
+                    self.publish({"type": "mixflag", "track": cle[1], "nom": cle[2], "v": valeur})
+            elif abs(valeur - connu) > (TOLERANCE_REC if cle[3] != "1F00" else 0):
+                self.publish({"type": "mixrec", "track": cle[1], "slot": cle[2],
+                              "off": cle[3], "v": valeur})
+        # Les tranches suivantes rejoignent le volume, le pan et le mute de STATUS.
+        tard = {t: f for t, f in tranches.items() if t > TRANCHES_RAPIDES}
+        if premiere:
+            # Le projet a deja tout amene : la premiere lecture sert de reference.
+            for t, fiche in tard.items():
+                self.mix.setdefault(t, {}).update(
+                    {cle: fiche[cle] for cle in ("vol", "pan", "stereo", "mute")})
+        else:
+            self.mix_tard = tard
+
+    def suivre_routage(self):
+        """Envois entre tranches, noms et couleurs : ca bouge peu."""
+        envois = self.plugin.routes()
+        if isinstance(envois, dict):
+            if self.envois is not None:
+                for cle in set(envois) | set(self.envois):
+                    niveau = envois.get(cle, -1)
+                    if self.envois.get(cle, -1) != niveau:
+                        self.publish({"type": "route", "source": cle[0], "cible": cle[1],
+                                      "niveau": niveau})
+            self.envois = envois
+        noms = self.plugin.track_names()
+        if isinstance(noms, dict):
+            if self.noms_tranches is not None:
+                for t, (couleur, nom) in noms.items():
+                    if self.noms_tranches.get(t) != (couleur, nom):
+                        self.publish({"type": "tranche_nom", "track": t, "couleur": couleur,
+                                      "nom": nom})
+            self.noms_tranches = noms
+
+    def publier_fx(self, track, slot, nom):
+        """Envoie l'effet avec ses reglages. Faux si ca n'a pas pu partir."""
+        chemin = os.path.join(sous_dossier_local("canaux"), f"effet-{os.getpid()}.fst")
+        brut = None
+        try:
+            if self.plugin.fx_save(track, slot, chemin).startswith("FXSAVE OK"):
+                with open(chemin, "rb") as fichier:
+                    brut = fichier.read()
+        except (OSError, TimeoutError, IndexError, AttributeError) as exc:
+            print(f"[fx] sauvegarde impossible : {exc}")
+        try:
+            os.remove(chemin)
+        except OSError:
+            pass
+        if not brut or len(brut) > TAILLE_CANAL_MAX:
+            return False
+        paquet = zlib.compress(brut, 6)
+        nombre = max(1, (len(paquet) + MORCEAU_PROJET - 1) // MORCEAU_PROJET)
+        self.publish_global({"type": "fx_debut", "track": track, "slot": slot, "nom": nom,
+                             "sha256": hashlib.sha256(brut).hexdigest(), "morceaux": nombre})
+        for i in range(nombre):
+            morceau = paquet[i * MORCEAU_PROJET:(i + 1) * MORCEAU_PROJET]
+            self.publish_global({"type": "fx_morceau", "i": i,
+                                 "d": base64.b64encode(morceau).decode("ascii")})
+        print(f"[fx] '{nom}' envoye avec ses reglages : {len(brut)} octets")
+        return True
+
+    def recevoir_fx(self, recu):
+        """Le pair a pose un effet : on en fait une copie dans le meme slot."""
+        t, s, nom = int(recu.get("track", -1)), int(recu.get("slot", -1)), str(recu.get("nom", ""))
+        if not (0 <= t <= 125 and 0 <= s <= 9):
+            return
+        chemin = os.path.join(sous_dossier_local("canaux"), f"effet-recu-{os.getpid()}.fst")
+        try:
+            brut = zlib.decompress(b"".join(recu["recus"]))
+            if hashlib.sha256(brut).hexdigest() != recu.get("sha256"):
+                print(f"[fx] '{nom}' recu abime : ignore")
+                return
+            requis = plugin_requis(brut)
+            if requis and not (self.plugin_present(*requis)
+                                or self.plugin.find_effect(requis[0])):
+                print(f"[fx] effet '{requis[0]}' absent de ce poste : tranche {t} slot {s} vide")
+                return
+            with open(chemin, "wb") as fichier:
+                fichier.write(brut)
+            reponse = self.plugin.fx_load(t, s, chemin)
+        except (OSError, ValueError, IndexError, zlib.error) as exc:
+            print(f"[fx] '{nom}' illisible : {exc}")
+            return
+        finally:
+            try:
+                os.remove(chemin)
+            except OSError:
+                pass
+        if not reponse.startswith("FXLOAD OK"):
+            print(f"[fx] '{nom}' refuse : {reponse}")
+            return
+        print(f"[fx] tranche {t} slot {s} : '{nom}' pose")
+        self.oublier_slot(t, s)
+        if self.fx is not None:
+            self.fx[(t, s)] = reponse[len("FXLOAD OK "):]
 
     def publier_canal(self, index, nom, remplace=False, revenu=False):
         """Envoie le canal entier, sample compris : le pair en a une copie
