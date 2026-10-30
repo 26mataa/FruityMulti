@@ -29,7 +29,7 @@ from collections import Counter
 # Le depot public qui heberge les versions. L'agent y lit la derniere release
 # et telecharge le plugin + lui-meme. A incrementer a chaque publication.
 DEPOT = "26mataa/FruityMulti"
-AGENT_VERSION = 29
+AGENT_VERSION = 30
 ADRESSE_RELEASES = f"https://github.com/{DEPOT}/releases/latest"
 
 PLUGIN_HOST = "127.0.0.1"
@@ -1893,7 +1893,7 @@ class Sync:
 # les trames, pas les messages.
 
 PROTO = 1
-RELAIS = os.environ.get("FM_RELAIS", "wss://fruitymulti-relais.26mataa.workers.dev")
+RELAIS = os.environ.get("FM_RELAIS", "wss://fruitymulti-relais.fruitymulti-relais.workers.dev")
 PORT_DIRECT = 5000
 ALPHABET_CODE = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # ni I, ni O, ni 0, ni 1
 

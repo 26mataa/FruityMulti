@@ -1042,7 +1042,7 @@ static std::string executeCommand (const std::string& line)
 	// Identifiant de build : permet de savoir quelle version tourne
 	// chez chacun, sans ambiguite.
 	if (line == "VERSION")
-		return "VERSION 29-codes";
+		return "VERSION 30-relais";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)

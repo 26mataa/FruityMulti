@@ -73,10 +73,10 @@ La fenêtre se pilote aussi au clavier : flèches pour se déplacer, Entrée pou
 valider.
 
 > [!NOTE]
-> **Connexion.** Le relais qui évite d'ouvrir un port n'est pas encore en ligne.
-> En attendant, l'hôte passe en connexion directe et reçoit une adresse de la
-> forme `82.64.12.7:5000/K7P2QX`, à coller telle quelle chez l'invité. Cela demande
-> une box compatible UPnP ou le port 5000 ouvert.
+> **Connexion.** Aucun port à ouvrir : le code passe par un relais. Si le relais
+> est injoignable, l'hôte bascule en connexion directe et reçoit une adresse de la
+> forme `82.64.12.7:5000/K7P2QX`, à coller telle quelle chez l'invité. Ce repli
+> demande une box compatible UPnP ou le port 5000 ouvert.
 
 ## Mises à jour
 
