@@ -54,12 +54,18 @@ DELAI_VEILLE = 5.0                 # le plugin coupe un client muet a 20 s
 DELAI_ECHO_TRANSPORT = 1.0
 # Bouton de tempo tourne a la souris : la derniere valeur suffit, le relais n'a
 # qu'une file et les notes attendent derriere.
-INTERVALLE_TEMPO = 0.25
-INTERVALLE_POTARD = 0.1               # volume, pan, stereo d'une tranche
+INTERVALLE_TEMPO = 0.1
+INTERVALLE_POTARD = 0.04              # volume, pan, stereo d'une tranche
+INTERVALLE_GESTE = 0.08               # notes pendant que la souris est tenue
+INTERVALLE_CLIPS = 0.1
+INTERVALLE_CANAUX = 0.25
+INTERVALLE_REGLAGES_CANAUX = 0.1
+INTERVALLE_EFFETS = 0.5
+INTERVALLE_REGLAGE_EFFET = 0.05       # un effet par passage, chacun son tour
 TOUCHENT_NOTES = ("add", "del", "pattern", "reset", "delchannels", "racklist",
                   "canal_debut", "canal_morceau", "etat_notes")
 # Un clip recu : FL retouche sa longueur juste apres, ce n'est pas un geste.
-DELAI_ECHO_CLIPS = 1.0
+DELAI_ECHO_CLIPS = 0.3
 # L'hote compare regulierement notes et clips : deux gestes croises peuvent
 # laisser un ecart que plus rien ne corrigerait.
 INTERVALLE_CONTROLE = 2.0
@@ -83,8 +89,8 @@ VARIABLE_PARTAGE = "%ILSharedData%"      # Documents\Image-Line : kits de l'util
 SUPPRESSION_RECUE = True
 SAUVEGARDES_GARDEES = 10
 # Boucle lente du mixeur : tout ce que STATUS ne donne pas a chaque cycle.
-INTERVALLE_MIXEUR = 0.5
-INTERVALLE_ROUTAGE = 2.0
+INTERVALLE_MIXEUR = 0.1
+INTERVALLE_ROUTAGE = 0.5
 PARAMS_PAR_EFFET = 64
 TRANCHES_RAPIDES = 16                 # les suivantes ne passent que par MIXFULL
 DRAPEAUX_TRANCHE = ("polarite", "inversion", "slots")
@@ -1290,6 +1296,8 @@ class Sync:
         self.params = {}             # (piste, slot) -> [valeurs brutes]
         self.last_params = 0.0
         self.last_clips = 0.0
+        self.last_geste = 0.0
+        self.tour_effet = 0
         self.last_mouse = None
         self.clip_lengths = None
         self.clips_key = None
@@ -2142,7 +2150,7 @@ class Sync:
         # Le suivi position par position laissait des copies orphelines des
         # qu'une suppression ne tombait pas juste (glissement rapide) : c'est
         # l'escalier de clips qu'on voyait dans la playlist.
-        if now - self.last_clips >= 0.25:
+        if now - self.last_clips >= INTERVALLE_CLIPS:
             self.last_clips = now
             current_clips = self.plugin.clips()
             if current_clips is not None:
@@ -2159,7 +2167,7 @@ class Sync:
                     # On ne met a jour l'etat de reference QUE si l'envoi a
                     # vraiment eu lieu. Sinon un changement bloque par la
                     # limitation etait perdu pour de bon.
-                    if now - self.last_clipsync >= 0.25:
+                    if now - self.last_clipsync >= INTERVALLE_CLIPS:
                         self.last_clipsync = now
                         self.publish_global({"type": "clipsync",
                                              "clips": snapshot})
@@ -2173,8 +2181,9 @@ class Sync:
         # channel rack : assignation canal -> tranche (cadence lente). Des notes
         # qui changent peuvent venir d'un canal supprime : les index ont glisse,
         # et il faut le savoir AVANT de comparer les notes.
-        if (now - self.last_channels >= 1.0
-                or (not self.clic and current != self.snapshot)):
+        notes_pretes = not self.clic or now - self.last_geste >= INTERVALLE_GESTE
+        if (now - self.last_channels >= INTERVALLE_CANAUX
+                or (notes_pretes and current != self.snapshot)):
             self.last_channels = now
             current_channels = self.plugin.channels()
             if current_channels is not None:
@@ -2236,7 +2245,7 @@ class Sync:
                     self.channels_state = {i: t for i, t, _ in current_channels}
 
         # niveaux des canaux du channel rack (volume et panoramique)
-        if now - self.last_channel_mix >= 0.3:
+        if now - self.last_channel_mix >= INTERVALLE_REGLAGES_CANAUX:
             self.last_channel_mix = now
             niveaux = self.plugin.channel_mix()
             if isinstance (niveaux, list):
@@ -2262,7 +2271,7 @@ class Sync:
                                               for i, v, p, m in niveaux}
 
         # effets du mixeur : un seul FXALL par seconde (17 tranches d'un coup)
-        if now - self.last_fx >= 1.0:
+        if now - self.last_fx >= INTERVALLE_EFFETS:
             self.last_fx = now
             courants = self.plugin.effects()
             if isinstance (courants, dict):
@@ -2321,10 +2330,13 @@ class Sync:
         # Reglages des effets : uniquement pour un effet PRESENT DES DEUX COTES
         # et du meme nom. On compare des valeurs BRUTES (PARAMS / PARAMRAW),
         # donc aucune echelle a supposer.
-        if now - self.last_fxparams >= 1.0:
+        if now - self.last_fxparams >= INTERVALLE_REGLAGE_EFFET:
             self.last_fxparams = now
             if self.fx:
-                for (t, s) in sorted(self.fx):
+                # Lire tous les effets d'un coup ferait attendre les notes.
+                self.tour_effet += 1
+                slots = sorted(self.fx)
+                for (t, s) in [slots[self.tour_effet % len(slots)]]:
                     if (t, s) in self.fx_absents:
                         continue
                     detail = self.plugin.effect_detail(t, s)
@@ -2443,8 +2455,10 @@ class Sync:
             if sent:
                 print(f"[sync] {sent} piste(s) de mixage envoyee(s)")
 
-        # Note tenue : on n'envoie qu'au relachement, le geste en une seule fois.
-        if not self.clic:
+        # Note tenue : l'autre voit le geste, sans une relecture de FL par pixel.
+        if notes_pretes:
+            if self.clic and current != self.snapshot:
+                self.last_geste = now
             changed += self.envoyer_notes(current)
 
         if self.is_host and now - self.last_controle >= INTERVALLE_CONTROLE:
