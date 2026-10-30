@@ -42,6 +42,7 @@ POLL = 0.005
 
 # Echange du projet : l'invite charge le .flp de l'hote a la connexion.
 MORCEAU_PROJET = 128 * 1024        # deux morceaux tiennent dans une trame
+MORCEAU_CANAL = 32 * 1024          # une note peut se glisser entre deux morceaux
 TAILLE_PROJET_MAX = 64 * 1024 * 1024
 TAILLE_PROJET_MIN = 4096           # en dessous : pas un vrai projet (voir plus bas)
 DELAI_SAUVEGARDE = 60.0            # gros projet : FL peut mettre du temps
@@ -59,7 +60,7 @@ TOUCHENT_NOTES = ("add", "del", "pattern", "reset", "delchannels", "racklist",
                   "canal_debut", "canal_morceau")
 # Un canal part en entier : son .fst (reglages du plugin) et son sample.
 TAILLE_CANAL_MAX = 8 * 1024 * 1024
-TAILLE_SAMPLE_MAX = 4 * 1024 * 1024   # le relais passe 3 Mo en 47 s, les notes attendent
+TAILLE_SAMPLE_MAX = 4 * 1024 * 1024   # 3 Mo prennent 47 s a 66 ko/s en montee
 EVT_SAMPLE = 0xC4
 EVT_TYPE_CANAL = 0x15
 EVT_NOM_PLUGIN = 0xC9
@@ -2611,12 +2612,12 @@ class Sync:
         if not brut or len(brut) > TAILLE_CANAL_MAX:
             return False
         paquet = zlib.compress(brut, 6)
-        nombre = max(1, (len(paquet) + MORCEAU_PROJET - 1) // MORCEAU_PROJET)
+        nombre = max(1, (len(paquet) + MORCEAU_CANAL - 1) // MORCEAU_CANAL)
         self.publish_global({"type": "fx_debut", "track": track, "slot": slot, "nom": nom,
                              "sha256": hashlib.sha256(brut).hexdigest(), "morceaux": nombre})
         for i in range(nombre):
-            morceau = paquet[i * MORCEAU_PROJET:(i + 1) * MORCEAU_PROJET]
-            self.publish_global({"type": "fx_morceau", "i": i,
+            morceau = paquet[i * MORCEAU_CANAL:(i + 1) * MORCEAU_CANAL]
+            self.publish_global({"type": "fx_morceau", "track": track, "slot": slot, "i": i,
                                  "d": base64.b64encode(morceau).decode("ascii")})
         print(f"[fx] '{nom}' envoye avec ses reglages : {len(brut)} octets")
         return True
@@ -2698,7 +2699,7 @@ class Sync:
 
         contenu = brut + son
         paquet = zlib.compress(contenu, 1 if son else 6)
-        nombre = max(1, (len(paquet) + MORCEAU_PROJET - 1) // MORCEAU_PROJET)
+        nombre = max(1, (len(paquet) + MORCEAU_CANAL - 1) // MORCEAU_CANAL)
         cible = self.index_hote(index)
         self.publish_global({"type": "canal_debut",
                              "index": index if cible is None else cible,
@@ -2708,8 +2709,9 @@ class Sync:
                              "sha256": hashlib.sha256(contenu).hexdigest(),
                              "morceaux": nombre})
         for i in range(nombre):
-            morceau = paquet[i * MORCEAU_PROJET:(i + 1) * MORCEAU_PROJET]
-            self.publish_global({"type": "canal_morceau", "i": i,
+            morceau = paquet[i * MORCEAU_CANAL:(i + 1) * MORCEAU_CANAL]
+            self.publish_global({"type": "canal_morceau",
+                                 "index": index if cible is None else cible, "i": i,
                                  "d": base64.b64encode(morceau).decode("ascii")})
         print(f"[canal] '{nom}' envoye : {len(brut)} octets"
               + (f" + sample de {len(son)} octets" if son else ""))
@@ -3482,6 +3484,11 @@ class Link:
     Sans nouvelles du pair pendant SILENCE_MAX, la liaison est declaree morte :
     une coupure Wi-Fi ne ferme pas toujours la connexion proprement, et la
     session restait figee indefiniment.
+
+    Deux files : un gros canal, un effet ou le projet passent morceau par
+    morceau dans la file lente, et les notes des autres canaux les doublent. Ce
+    qui depend de ce transfert reste derriere lui : le pair jette une note dont
+    il n'a pas encore le canal.
     """
 
     LOT = 0.04
@@ -3494,6 +3501,7 @@ class Link:
         self.on_message = on_message
         self.alive = True
         self.file = []
+        self.lente = []
         self.cond = threading.Condition()
         self.dernier_recu = time.monotonic()
         threading.Thread(target=self._lecteur, daemon=True).start()
@@ -3503,8 +3511,46 @@ class Link:
         if not self.alive:
             return
         with self.cond:
-            self.file.append(message)
+            (self.lente if self._attend(message) else self.file).append(message)
             self.cond.notify()
+
+    def _attend(self, message):
+        """Vrai si ce message doit passer apres les transferts en cours."""
+        kind = str(message.get("type", ""))
+        if kind in ("canal_debut", "canal_morceau", "fx_debut", "fx_morceau",
+                    "delchannels", "reset") or kind.startswith("projet_"):
+            return True
+        if not self.lente:
+            return False
+        canaux, effets = set(), set()
+        for attente in self.lente:
+            genre = str(attente.get("type", ""))
+            # Apres eux, tous les index et tout l'ordre d'arrivee comptent.
+            if genre in ("delchannels", "reset") or genre.startswith("projet_"):
+                return True
+            if genre in ("canal_debut", "canal_morceau"):
+                canaux.add(attente.get("index"))
+            elif genre in ("fx_debut", "fx_morceau"):
+                effets.add((attente.get("track"), attente.get("slot")))
+        if kind in ("racklist", "channelcount", "addchannel"):
+            return True
+        if kind in ("add", "del"):
+            return message.get("ch") in canaux
+        if kind in ("channeltrack", "channelmix"):
+            return message.get("index") in canaux
+        if kind in ("fx", "fxparam", "mixrec"):
+            return (message.get("track"), message.get("slot")) in effets
+        return False
+
+    def _pris_lente(self):
+        """Le prochain morceau de la file lente, et ce qui le precede."""
+        lot = []
+        while self.lente:
+            message = self.lente.pop(0)
+            lot.append(message)
+            if "d" in message:
+                break
+        return lot
 
     def _mort(self, raison):
         if self.alive:
@@ -3531,14 +3577,16 @@ class Link:
         dernier_envoi = 0.0
         while self.alive:
             with self.cond:
-                if not self.file:
+                if not self.file and not self.lente:
                     self.cond.wait(timeout=self.BATTEMENT)
+                rafale = bool(self.file)
             # laisse les messages d'une meme rafale rejoindre la trame
             attente = self.LOT - (time.monotonic() - dernier_envoi)
-            if attente > 0:
+            if rafale and attente > 0:
                 time.sleep(attente)
             with self.cond:
                 lot, self.file = self.file, []
+                lot.extend(self._pris_lente())
             if not self.alive:
                 return
             if not lot:
