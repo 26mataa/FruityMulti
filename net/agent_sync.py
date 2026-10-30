@@ -2307,7 +2307,9 @@ def numero_release_latest():
     ouvreur = urllib.request.build_opener(SansRedirection)
     requete = urllib.request.Request(
         f"https://github.com/{DEPOT}/releases/latest",
-        headers={"User-Agent": "FruityMulti"})
+        # sans Accept, GitHub peut servir une redirection perimee
+        # (l'ancienne version, longtemps apres la publication)
+        headers={"User-Agent": "FruityMulti", "Accept": "*/*"})
     adresse = ""
     try:
         with ouvreur.open(requete, timeout=20) as reponse:
