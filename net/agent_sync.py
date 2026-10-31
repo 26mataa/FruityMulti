@@ -68,6 +68,14 @@ INTERVALLE_TOUR_EFFETS = 0.25         # les autres, un par un
 INTERVALLE_SAMPLER_OUVERT = 0.2       # un Sampler se relit par son .fst : ~15 ms
 INTERVALLE_TOUR_SAMPLERS = 1.0        # les autres, un par un
 DELAI_FENETRE_SAMPLER = 0.4           # sa fenetre se rafraichit quand ca se calme
+# Un preset ou une wavetable ne bouge aucun parametre : seul l'etat complet le dit.
+INTERVALLE_INSTRUMENT_OUVERT = 0.3    # ~20 ms par lecture, meme Zenology (165 Ko)
+INTERVALLE_TOUR_INSTRUMENTS = 2.0     # les autres, un par un
+CALME_INSTRUMENT = 0.6                # on envoie quand l'etat ne bouge plus
+PARAMS_PRESET = 16                    # autant d'un coup : ce n'est pas un potard
+MUET_APRES_POSE = 2.0                 # le temps qu'un etat recu se pose
+LECTURES_BRUIT = 4                    # lectures au repos pour mesurer le bruit
+ENTETE_ETAT = 32                      # debut du bloc : des tailles, qui bougent
 PARAMS_PAR_ECRITURE = 512
 TOUCHENT_NOTES = ("add", "del", "pattern", "reset", "delchannels", "racklist",
                   "canal_debut", "canal_morceau", "etat_notes")
@@ -406,7 +414,7 @@ class Plugin:
         while b"\n" not in self.buf:
             chunk = self.sock.recv(4096)
             if not chunk:
-                raise ConnectionError("plugin ferme")
+                raise ConnectionError("plugin closed")
             self.buf += chunk
         line, _, rest = self.buf.partition(b"\n")
         self.buf = rest
@@ -466,11 +474,11 @@ class Plugin:
                 entete = fichier.read(4)
             taille = os.path.getsize(chemin)
         except OSError as exc:
-            return f"fichier illisible ({exc})"
+            return f"unreadable file ({exc})"
         if entete != b"FLhd":
             return "ce n'est pas un projet FL"
         if taille < TAILLE_PROJET_MIN:
-            return f"fichier incomplet ({taille} octets)"
+            return f"incomplete file ({taille} bytes)"
         return None
 
     def state(self):
@@ -1184,10 +1192,10 @@ def canaux_absents(voulus, locaux):
 def evenements_fl(brut):
     """Evenements d'un .fst ou .flp : (identifiant, debut, valeur, fin)."""
     if brut[:4] != b"FLhd":
-        raise ValueError("pas un fichier FL")
+        raise ValueError("not an FL file")
     pos = 8 + int.from_bytes(brut[4:8], "little")
     if brut[pos:pos + 4] != b"FLdt":
-        raise ValueError("pas de bloc FLdt")
+        raise ValueError("no FLdt block")
     pos += 8
     while pos < len(brut):
         debut = pos
@@ -1294,6 +1302,77 @@ def plugin_requis(brut):
             chemin = contenu.decode("utf-8", "replace")
         pos += 12 + taille
     return nom, chemin
+
+
+def etat_plugin(brut):
+    """L'etat du plugin d'un canal, b"" s'il n'en a pas. Dans l'enveloppe de FL,
+    c'est le plus gros bloc : les autres sont son nom, son chemin, etc."""
+    nom = etat = None
+    for ev, _debut, valeur, fin in evenements_fl(brut):
+        if ev == EVT_NOM_PLUGIN:
+            nom = brut[valeur:fin].decode("utf-16-le", "replace").rstrip("\0")
+        elif ev == EVT_ETAT_PLUGIN:
+            etat = brut[valeur:fin]
+    if etat is None:
+        return b""
+    if nom != PLUGIN_ENVELOPPE:
+        return etat
+    plus_gros = b""
+    pos = 4
+    while pos + 12 <= len(etat):
+        taille = int.from_bytes(etat[pos + 4:pos + 12], "little")
+        if taille > len(plus_gros):
+            plus_gros = etat[pos + 12:pos + 12 + taille]
+        pos += 12 + taille
+    return plus_gros[ENTETE_ETAT:]
+
+
+def premier_ecart(x, y):
+    n = min(len(x), len(y))
+    return next((i for i in range(n) if x[i] != y[i]), n)
+
+
+class SuiviEtat:
+    """Dit si l'etat d'un instrument a vraiment change. Certains bougent tout seuls
+    (Hive reecrit la fin du sien en permanence) : les premieres lectures mesurent
+    cette zone, comptee depuis la fin. Un ecart a moins de deux fois sa longueur de
+    la fin l'agrandit : elle remonte parfois plus haut que ce qu'on a vu."""
+
+    def __init__(self, etat):
+        self.etat = etat
+        self.reste = 0
+        self.lectures = 0
+        self.a_voir = None
+        self.muet = 0.0
+
+    def pareil(self, x, y):
+        if x == y:
+            return True
+        if not self.reste:
+            return False
+        i = premier_ecart(x, y)
+        if i < len(x) - 2 * self.reste:
+            return False
+        self.reste = max(self.reste, len(x) - i)
+        return True
+
+    def mesurer(self, etat):
+        if etat != self.etat:
+            self.reste = max(self.reste, len(self.etat) - premier_ecart(etat, self.etat))
+        self.etat = etat
+        self.lectures += 1
+        if self.lectures >= LECTURES_BRUIT and self.reste * 2 > len(etat):
+            # Presque tout a bouge : c'etait un geste, pas du bruit
+            self.reste = self.lectures = 0
+
+    def voir(self, etat):
+        """Vrai si cet etat est nouveau."""
+        if self.lectures < LECTURES_BRUIT:
+            self.mesurer(etat)
+            return False
+        neuf = not self.pareil(self.etat, etat)
+        self.etat = etat
+        return neuf
 
 
 def sans_plugin(brut):
@@ -1447,6 +1526,13 @@ class Sync:
         self.ch_signature = None
         self.ch_sans_plugin = set()
         self.canal_ouvert = None
+        self.ins = {}                   # canal -> SuiviEtat
+        self.ins_bouge = {}             # canal -> dernier reglage bouge
+        self.ins_massif = set()
+        self.ins_prochain = 0.0
+        self.last_ins = 0.0
+        self.last_tour_ins = 0.0
+        self.tour_ins = 0
         self.smp_connus = {}
         self.smp_autres = set()
         self.smp_fenetres = {}
@@ -1466,7 +1552,7 @@ class Sync:
                 return
             except Exception as exc:
                 # toute autre erreur ne doit pas tuer le thread en silence
-                print(f"[curseur] lecture impossible : {exc}")
+                print(f"[cursor] cannot read: {exc}")
                 return
             if pos != last:
                 last = pos
@@ -1481,7 +1567,7 @@ class Sync:
         try:
             self.link.send(message)
         except OSError as exc:
-            print(f"[reseau] envoi impossible : {exc}")
+            print(f"[net] send failed: {exc}")
 
     def publish_global(self, message):
         """Tempo, transport, pattern : bidirectionnels.
@@ -1515,12 +1601,12 @@ class Sync:
         try:
             inventaire = scan_plugins()
         except OSError as exc:
-            print(f"[plugins] analyse impossible : {exc}")
+            print(f"[plugins] scan failed: {exc}")
             return
         inventaire["poste"] = socket.gethostname().upper()
         self.my_plugins = inventaire
         total = sum(len(inventaire[k]) for k in ("fl", "vst3", "vst2"))
-        print(f"[plugins] {total} plugin(s) sur ce poste")
+        print(f"[plugins] {total} plugin(s) on this PC")
         self.publish_global({"type": "plugins", "inventaire": inventaire})
 
     def publier_reglages(self):
@@ -1550,7 +1636,7 @@ class Sync:
         que l'hote lui envoie (notes, tempo, pattern, transport, mixage).
         """
         if not self.is_host:
-            print("[sync] invite : on reprend l'etat de l'hote")
+            print("[sync] guest: taking the host's state")
             return
 
         # l'inventaire part en premier : c'est ce qui permet de savoir ce que
@@ -1577,7 +1663,7 @@ class Sync:
             for index, track, name in channels:
                 self.publish_global({"type": "channeltrack", "index": index,
                                      "track": track})
-                print(f"[sync] canal {index} : '{name}' sur tranche {track}")
+                print(f"[sync] channel {index}: '{name}' on track {track}")
 
         # la playlist fait partie de l'etat initial : sans elle, l'invite
         # arrive sur un arrangement vide alors que l'hote en a un.
@@ -1603,7 +1689,7 @@ class Sync:
             payload.update(state)
             self.publish(payload)
 
-        print(f"[sync] etat initial envoye ({total} notes, tempo {tempo})")
+        print(f"[sync] initial state sent ({total} notes, tempo {tempo})")
 
     def on_message(self, message):
         with self.incoming_lock:
@@ -1668,7 +1754,7 @@ class Sync:
                 self.clips = None
                 self.clip_lengths = None
                 self.clips_key = None
-                print(f"[sync] projet de l'hote repris : {cleared} canal(aux) efface(s)")
+                print(f"[sync] host project taken: {cleared} channel(s) cleared")
 
             elif kind == "add":
                 notes = [tuple(n) for n in message.get("notes", [])]
@@ -1677,8 +1763,8 @@ class Sync:
                     nom = self.nom_hote(int(index))
                     if nom not in self.averti_noms:
                         self.averti_noms.add(nom)
-                        print(f"[rack] canal '{nom or index}' absent ici : "
-                              f"ses notes ne sont pas ecrites")
+                        print(f"[rack] channel '{nom or index}' is missing here: "
+                              f"its notes are not written")
                 elif notes:
                     self.plugin.add_many(int(cible), notes)
                     applied += len(notes)
@@ -1695,11 +1781,11 @@ class Sync:
                 if bpm:
                     reply = self.plugin.cmd_force(f"TEMPO {float(bpm):.3f}")[0]
                     if reply.startswith("ERR"):
-                        print(f"[sync] TEMPO REFUSE par le plugin : {reply}")
-                        print("[sync] -> le plugin de ce cote est trop ancien")
-                        print("       (il faut FruityMultiBridge.vst3 de 503 Ko)")
+                        print(f"[sync] tempo refused by the plugin: {reply}")
+                        print("[sync] -> the plugin on this PC is too old")
+                        print("       (update FruityMulti)")
                     else:
-                        print(f"[sync] tempo applique : {bpm}  [{reply}]")
+                        print(f"[sync] tempo set: {bpm}  [{reply}]")
                     # vient du pair : detect_local ne doit pas le lui renvoyer
                     self.tempo = float(bpm)
                     self.tempo_limite = time.monotonic() + DELAI_ECHO_TRANSPORT
@@ -1708,9 +1794,9 @@ class Sync:
                 want = bool(message.get("playing"))
                 reply = self.plugin.cmd_force("PLAY" if want else "STOP")[0]
                 if reply.startswith("ERR"):
-                    print(f"[sync] transport refuse : {reply}")
+                    print(f"[sync] transport refused: {reply}")
                 else:
-                    print(f"[sync] transport applique : {'lecture' if want else 'arret'}")
+                    print(f"[sync] transport set: {'play' if want else 'stop'}")
                 # ce changement vient du pair : detect_local ne doit pas le lui
                 # renvoyer, ni la position que l'arret vient de remettre au debut
                 self.playing = want
@@ -1720,9 +1806,9 @@ class Sync:
                 mode = int(message.get("mode", 0))
                 reply = self.plugin.cmd_force(f"SONGMODE {mode}")[0]
                 if reply.startswith("ERR"):
-                    print(f"[sync] mode refuse : {reply}")
+                    print(f"[sync] mode refused: {reply}")
                 else:
-                    print(f"[sync] mode applique : {'SONG' if mode else 'PAT'}")
+                    print(f"[sync] mode set: {'SONG' if mode else 'PAT'}")
                 # FL l'applique un peu apres : le STATUS suivant dit encore l'ancien
                 self.mode = mode
                 self.mode_limite = time.monotonic() + DELAI_ECHO_TRANSPORT
@@ -1735,7 +1821,7 @@ class Sync:
 
             elif kind == "channelcount":
                 self.peer_channels = int(message.get("n", -1))
-                print(f"[sync] l'autre a {self.peer_channels} canal(aux)")
+                print(f"[sync] the other PC has {self.peer_channels} channel(s)")
 
             elif kind == "channelmix":
                 index = self.index_local(int(message.get("index", -1)))
@@ -1775,14 +1861,14 @@ class Sync:
                 ecrire_compat(commun, ici_seul, autre_seul)
                 print()
                 print(f"[plugins] {autre.get('poste', 'pair')} : "
-                      f"{len(commun)} en commun, "
-                      f"{len(ici_seul)} seulement ici, "
-                      f"{len(autre_seul)} seulement chez lui")
+                      f"{len(commun)} in common, "
+                      f"{len(ici_seul)} only here, "
+                      f"{len(autre_seul)} only on their PC")
                 if autre_seul:
                     apercu = ", ".join(autre_seul[:8])
-                    print(f"[plugins] presents chez lui et pas ici : {apercu}"
+                    print(f"[plugins] they have, you do not: {apercu}"
                           + (" ..." if len(autre_seul) > 8 else ""))
-                print(f"[plugins] fichier ecrit : {chemin_inventaire}")
+                print(f"[plugins] file written: {chemin_inventaire}")
                 print()
                 self.send_plugins ()
                 applied += 1
@@ -1795,8 +1881,8 @@ class Sync:
                 self.nb_canaux_hote = len(wanted)
                 self.rack_hote = wanted
                 local = self.plugin.channels() or []
-                print(f"[rack] l'hote a {len(wanted)} canal(aux), "
-                      f"j'en ai {len(local)}")
+                print(f"[rack] the host has {len(wanted)} channel(s), "
+                      f"you have {len(local)}")
                 crees = 0
                 manque = len(wanted) - len(local)
                 # Pas forcement les derniers : Ctrl+Z ramene un canal au milieu.
@@ -1804,7 +1890,7 @@ class Sync:
                 for index, track, name in a_creer:
                     chemin = self.plugin.find_preset(name) if name else None
                     if chemin:
-                        print(f"[rack] creation de '{name}' "
+                        print(f"[rack] creating '{name}' "
                               f"(position {index})")
                         self.plugin.load_plugin(chemin)
                         crees += 1
@@ -1814,12 +1900,12 @@ class Sync:
                         try:
                             self.plugin.new_channel()
                             crees += 1
-                            print(f"[rack] '{name}' absent de ce poste — "
-                                  f"canal vide cree pour garder la position")
+                            print(f"[rack] '{name}' is not on this PC: "
+                                  f"empty channel created to keep the order")
                         except (OSError, TimeoutError, IndexError):
-                            print(f"[rack] '{name}' absent et canal vide "
-                                  f"impossible : les positions suivantes "
-                                  f"seront decalees")
+                            print(f"[rack] '{name}' is missing and no empty channel "
+                                  f"could be made: the next channels "
+                                  f"will be shifted")
                 fresh = self.plugin.channels() or []
                 self.construire_carte(wanted, fresh)
                 tranches = {i: t for i, t, _ in fresh}
@@ -1831,8 +1917,8 @@ class Sync:
                 self.channels_state = tranches
                 self.signature_rack = [(i, n) for i, _t, n in fresh]
                 if crees:
-                    print(f"[rack] {crees} canal(aux) cree(s) — "
-                          f"verifie l'ordre a l'ecran")
+                    print(f"[rack] {crees} channel(s) created: "
+                          f"check the order on screen")
                 applied += 1
 
             elif kind == "canal_debut":
@@ -1912,7 +1998,7 @@ class Sync:
                 if nom:
                     chemin = self.plugin.find_preset(nom)
                     if chemin:
-                        print(f"[plugins] creation de '{nom}' depuis "
+                        print(f"[plugins] creating '{nom}' from "
                               f"{os.path.basename(chemin)}")
                         self.plugin.load_plugin(chemin)
                         # on relit l'etat pour ne pas renvoyer ce qu'on vient
@@ -1924,12 +2010,12 @@ class Sync:
                             obtenu = fresh[-1][0] if fresh else None
                             if (voulu is not None and obtenu is not None
                                     and int(voulu) != obtenu):
-                                print(f"[plugins] ATTENTION : cree en position "
-                                      f"{obtenu} alors que l'hote l'a en "
-                                      f"position {voulu} — les reglages de ce "
-                                      f"canal peuvent viser le mauvais.")
+                                print(f"[plugins] WARNING: created at position "
+                                      f"{obtenu} but the host has it at "
+                                      f"position {voulu}: the settings of this "
+                                      f"channel may go to the wrong place.")
                     else:
-                        print(f"[plugins] '{nom}' introuvable sur ce poste")
+                        print(f"[plugins] '{nom}' not found on this PC")
                     applied += 1
 
             elif kind == "delchannels":
@@ -1942,7 +2028,7 @@ class Sync:
                 if t < 0 or s < 0:
                     pass
                 elif not nom:
-                    print(f"[fx] l'autre a retire l'effet de la tranche {t} slot {s}")
+                    print(f"[fx] the other PC removed the effect on track {t} slot {s}")
                     self.plugin.fx_load(t, s)
                     self.fx_absents.discard((t, s))
                     if self.fx is not None:
@@ -1954,10 +2040,10 @@ class Sync:
                     detail = self.plugin.effect_detail(t, s)
                     deja = bool(detail and detail[0])
                     if deja:
-                        print(f"[fx] tranche {t} slot {s} : l'hote a "
-                              f"'{nom}', moi '{detail[0]}' — a verifier")
+                        print(f"[fx] track {t} slot {s}: the host has "
+                              f"'{nom}', you have '{detail[0]}'")
                     else:
-                        print(f"[fx] l'hote a mis '{nom}' sur la tranche "
+                        print(f"[fx] the host put '{nom}' on track "
                               f"{t} slot {s}")
                         # FL n'expose pas (encore) de fonction d'insertion
                         # d'effet : on guide, et on met le chemin dans le
@@ -1965,14 +2051,14 @@ class Sync:
                         cible = preset or self.plugin.find_effect(nom) or ""
                         if cible:
                             if copier_presse_papier(cible):
-                                print("[fx] chemin copie dans le presse-papiers")
-                            print(f"[fx] a poser a la main : glisse "
-                                  f"'{os.path.basename(cible)}' (ou colle le "
-                                  f"chemin dans le navigateur de FL) sur la "
-                                  f"tranche {t}, slot {s}")
+                                print("[fx] path copied to the clipboard")
+                            print(f"[fx] add it by hand: drag "
+                                  f"'{os.path.basename(cible)}' (or paste the "
+                                  f"path in the FL browser) onto "
+                                  f"track {t}, slot {s}")
                             self.fx_attendus[(t, s)] = nom
                         else:
-                            print(f"[fx] '{nom}' introuvable sur ce poste")
+                            print(f"[fx] '{nom}' not found on this PC")
                     applied += 1
 
             elif kind == "fxparams":
@@ -1997,6 +2083,7 @@ class Sync:
                 valeurs = {int(i): int(v) for i, v in message.get("v", {}).items()}
                 if cible is not None and valeurs:
                     self.plugin.set_channel_params(cible, valeurs)
+                    self.ins_bouge[cible] = time.monotonic()
                     if cible in self.ch_params:
                         self.ch_params[cible].update(valeurs)
                     applied += 1
@@ -2015,9 +2102,9 @@ class Sync:
                 if number:
                     reply = self.plugin.cmd_force(f"PATTERN {number}")[0]
                     if reply.startswith("ERR"):
-                        print(f"[sync] pattern refuse : {reply}")
+                        print(f"[sync] pattern refused: {reply}")
                     else:
-                        print(f"[sync] pattern applique : {number}")
+                        print(f"[sync] pattern set: {number}")
                     self.pattern = int(number)
                     self.pattern_limite = time.monotonic() + DELAI_ECHO_TRANSPORT
                     # compte comme un changement : la relecture de la fin evite
@@ -2125,9 +2212,9 @@ class Sync:
                 self.clips_limite = time.time() + DELAI_ECHO_CLIPS
                 applied += 1 + added + resized + removed
                 if added or resized or removed:
-                    print(f"[sync] playlist : {added} ajout(s), "
-                          f"{resized} redimensionnement(s), "
-                          f"{removed} suppression(s)")
+                    print(f"[sync] playlist: {added} added, "
+                          f"{resized} resized, "
+                          f"{removed} removed")
 
             elif kind == "controle":
                 self.comparer_controle(message)
@@ -2181,7 +2268,7 @@ class Sync:
                 self.clip_lengths = {(pos, pat, track): length
                                      for pos, length, pat, track in clips}
 
-            print(f"[sync] {applied} changement(s) recu(s)")
+            print(f"[sync] {applied} change(s) received")
         return applied
 
     def detect_local(self):
@@ -2199,7 +2286,7 @@ class Sync:
                 self.supports_poll = True
             else:
                 if self.supports_poll is None:
-                    print("[sync] plugin sans POLL : deux requetes par cycle")
+                    print("[sync] plugin without POLL: two requests per cycle")
                 self.supports_poll = False
 
         if current is None:
@@ -2220,7 +2307,7 @@ class Sync:
                   and time.monotonic() >= max(self.tempo_limite, self.tempo_prochain)):
                 self.tempo_prochain = time.monotonic() + INTERVALLE_TEMPO
                 self.publish_global({"type": "tempo", "bpm": current_tempo})
-                print(f"[sync] tempo envoye : {current_tempo}")
+                print(f"[sync] tempo sent: {current_tempo}")
                 changed += 1
                 self.tempo = current_tempo
 
@@ -2231,7 +2318,7 @@ class Sync:
             elif (current_playing != self.playing
                   and time.monotonic() >= self.transport_limite):
                 self.publish_global({"type": "transport", "playing": current_playing})
-                print(f"[sync] transport envoye : {'lecture' if current_playing else 'arret'}")
+                print(f"[sync] transport sent: {'play' if current_playing else 'stop'}")
                 changed += 1
                 self.playing = current_playing
 
@@ -2241,7 +2328,7 @@ class Sync:
                 self.mode = current_mode
             elif current_mode != self.mode and time.monotonic() >= self.mode_limite:
                 self.publish_global({"type": "songmode", "mode": current_mode})
-                print(f"[sync] mode envoye : {'SONG' if current_mode else 'PAT'}")
+                print(f"[sync] mode sent: {'SONG' if current_mode else 'PAT'}")
                 changed += 1
                 self.mode = current_mode
 
@@ -2252,7 +2339,7 @@ class Sync:
             elif (current_pattern != self.pattern
                   and time.monotonic() >= self.pattern_limite):
                 self.publish_global({"type": "pattern", "n": current_pattern})
-                print(f"[sync] pattern envoye : {current_pattern}")
+                print(f"[sync] pattern sent: {current_pattern}")
                 changed += 1
                 self.pattern = current_pattern
                 # Autre motif, autres notes : ce n'est pas une modification. Sans
@@ -2287,7 +2374,7 @@ class Sync:
                         self.last_clipsync = now
                         self.publish_global({"type": "clipsync",
                                              "clips": snapshot})
-                        print(f"[sync] playlist envoyee "
+                        print(f"[sync] playlist sent "
                               f"({len(snapshot)} clip(s))")
                         self.clips_key = key
                         self.clips = Counter((p, m, t) for p, l, m, t in snapshot)
@@ -2309,9 +2396,9 @@ class Sync:
                         and len(current_channels) != self.peer_channels):
                     if self.channels_warned != self.peer_channels:
                         self.channels_warned = self.peer_channels
-                        print(f"[sync] ATTENTION : {len(current_channels)} canal(aux) "
-                              f"chez moi contre {self.peer_channels} chez l'autre. "
-                              f"Chargez le meme projet des deux cotes.")
+                        print(f"[sync] WARNING: {len(current_channels)} channel(s) "
+                              f"here, {self.peer_channels} on the other PC. "
+                              f"Load the same project on both.")
                 if self.channels_state is None:
                     self.channels_state = {i: t for i, t, _ in current_channels}
                 else:
@@ -2325,7 +2412,7 @@ class Sync:
                         if (index not in revenus if revenus
                                 else index in self.channels_state):
                             continue
-                        print(f"[sync] canal ajoute : '{name}' (index {index})")
+                        print(f"[sync] channel added: '{name}' (index {index})")
                         if self.publier_canal(index, name, revenu=index in revenus):
                             continue
                         if not name or name.strip().lower().startswith("sampler"):
@@ -2341,7 +2428,7 @@ class Sync:
                         for (_i, ancien), (index, _t, name) in zip(self.signature_rack,
                                                                    current_channels):
                             if ancien != name:
-                                print(f"[sync] canal {index} : '{ancien}' -> '{name}'")
+                                print(f"[sync] channel {index}: '{ancien}' -> '{name}'")
                                 self.publier_canal(index, name, remplace=True)
 
                     if self.publier_retraits(current_channels):
@@ -2357,7 +2444,7 @@ class Sync:
                                     and cible is not None):
                                 self.publish_global({"type": "channeltrack",
                                                      "index": cible, "track": track})
-                                print(f"[sync] canal {index} ('{name}') -> tranche {track}")
+                                print(f"[sync] channel {index} ('{name}') -> track {track}")
                     self.channels_state = {i: t for i, t, _ in current_channels}
 
         # niveaux des canaux du channel rack (volume et panoramique)
@@ -2406,7 +2493,7 @@ class Sync:
                         self.publish_global({"type": "fx", "track": t,
                                              "slot": s, "name": nom,
                                              "preset": preset})
-                        print(f"[fx] tranche {t} slot {s} : '{nom}'"
+                        print(f"[fx] track {t} slot {s}: '{nom}'"
                               + (f"  [{os.path.basename(preset)}]"
                                  if preset else ""))
                     for (t, s) in list(self.fx.keys()):
@@ -2420,7 +2507,7 @@ class Sync:
                         self.publish_global({"type": "fx", "track": t,
                                              "slot": s, "name": "",
                                              "preset": ""})
-                        print(f"[fx] tranche {t} slot {s} : retire")
+                        print(f"[fx] track {t} slot {s}: removed")
                     self.fx = dict(courants)
 
                     # confirmation de ce qu'on avait demande a l'utilisateur
@@ -2430,11 +2517,11 @@ class Sync:
                             continue
                         self.fx_attendus.pop((t, s), None)
                         if meme_nom(pose, nom):
-                            print(f"[fx] tranche {t} slot {s} : '{pose}' en "
-                                  f"place — c'est bon")
+                            print(f"[fx] track {t} slot {s}: '{pose}' "
+                                  f"is in place")
                         else:
-                            print(f"[fx] tranche {t} slot {s} : '{pose}' pose "
-                                  f"a la place de '{nom}'")
+                            print(f"[fx] track {t} slot {s}: '{pose}' used "
+                                  f"instead of '{nom}'")
 
         if now - self.last_mixeur >= INTERVALLE_MIXEUR:
             self.last_mixeur = now
@@ -2454,6 +2541,7 @@ class Sync:
             elif source is not None:
                 self.suivre_canal(source[1])
             self.suivre_samplers(now)
+            self.suivre_instruments(now)
 
         # parametres de plugin : DESACTIVES. Sans verification que les deux
         # cotes ont le meme plugin dans le meme emplacement, on ecrasait les
@@ -2478,7 +2566,7 @@ class Sync:
                             param_changed += 1
                     self.params[key] = values
             if param_changed:
-                print(f"[sync] {param_changed} parametre(s) envoye(s)")
+                print(f"[sync] {param_changed} parameter(s) sent")
 
         # position de lecture : diffusee seulement a l'arret. Pendant la
         # lecture elle avance toute seule, la synchroniser ferait des combats.
@@ -2488,7 +2576,7 @@ class Sync:
                     and abs(position - self.position) > 8
                     and time.monotonic() >= self.transport_limite):
                 self.publish_global({"type": "songpos", "pos": position})
-                print(f"[sync] position envoyee : {position}")
+                print(f"[sync] position sent: {position}")
             self.position = position
         elif st:
             self.position = st["position"]
@@ -2539,7 +2627,7 @@ class Sync:
                     sent += 1
 
             if sent:
-                print(f"[sync] {sent} piste(s) de mixage envoyee(s)")
+                print(f"[sync] {sent} mixer track(s) sent")
 
         # Note tenue : l'autre voit le geste, sans une relecture de FL par pixel.
         if notes_pretes:
@@ -2552,7 +2640,7 @@ class Sync:
             self.publier_controle(current)
 
         if changed:
-            print(f"[sync] {changed} changement(s) local(aux) envoye(s)")
+            print(f"[sync] {changed} local change(s) sent")
         return changed
 
     def empreintes(self, notes, clips):
@@ -2599,7 +2687,7 @@ class Sync:
         if self.reparations >= REPARATIONS_MAX:
             return
         self.reparations += 1
-        print(f"[controle] ecart avec l'hote : canaux {ecart[0]}, clips {ecart[1]}")
+        print(f"[check] differs from the host: channels {ecart[0]}, clips {ecart[1]}")
         self.publish({"type": "controle_demande", "canaux": ecart[0], "clips": ecart[1]})
 
     def envoyer_reparation(self, message):
@@ -2624,8 +2712,8 @@ class Sync:
             self.plugin.del_many(cible, retirees)
         if ajoutees:
             self.plugin.add_many(cible, ajoutees)
-        print(f"[controle] canal {cible} : {len(retirees)} retiree(s), "
-              f"{len(ajoutees)} ajoutee(s)")
+        print(f"[check] channel {cible}: {len(retirees)} removed, "
+              f"{len(ajoutees)} added")
         return len(retirees) + len(ajoutees)
 
     def envoyer_notes(self, current):
@@ -2641,8 +2729,8 @@ class Sync:
                                  and cible >= self.nb_canaux_hote):
                 if not self.averti_canaux:
                     self.averti_canaux = True
-                    print(f"[rack] ton canal {channel + 1} n'existe pas chez "
-                          f"l'hote : ses notes ne seront pas envoyees")
+                    print(f"[rack] your channel {channel + 1} does not exist on "
+                          f"the host: its notes are not sent")
                 continue
 
             old = self.snapshot.get(channel, [])
@@ -2672,7 +2760,7 @@ class Sync:
         """La session est finie : on rend a FL ses menus."""
         try:
             self.plugin.cmd("ROLE aucun")
-            print("[autorite] actions de l'hote rendues")
+            print("[role] host actions restored")
         except (OSError, TimeoutError, IndexError):
             pass
 
@@ -2717,8 +2805,8 @@ class Sync:
             cible = self.index_hote(position)
             if cible is not None:
                 cibles.append(cible)
-            print(f"[rack] canal supprime : '{avant[position][0]}'"
-                  + ("" if cible is not None else " (absent chez l'hote)"))
+            print(f"[rack] channel deleted: '{avant[position][0]}'"
+                  + ("" if cible is not None else " (not on the host)"))
         if cibles:
             self.publish_global({"type": "delchannels", "indices": cibles})
         self.snapshot = decaler_notes(self.snapshot, retires)
@@ -2736,6 +2824,7 @@ class Sync:
             self.smp_connus = {}
             self.smp_autres = set()
             self.smp_fenetres = {}
+            self.ins = {}
         fenetre = self.plugin.focus()
         if isinstance(fenetre, int) and 0 <= fenetre < 0x10000:
             self.canal_ouvert = fenetre
@@ -2773,8 +2862,11 @@ class Sync:
         changes = reglages_bouges(connus, valeurs)
         if changes:
             connus.update(changes)
+            self.ins_bouge[canal] = time.monotonic()
+            if len(changes) >= PARAMS_PRESET:
+                self.ins_massif.add(canal)
             self.publish({"type": "chparams", "ch": cible, "v": changes})
-            print(f"[canal] {canal} : {len(changes)} reglage(s) envoye(s)")
+            print(f"[channel] {canal}: {len(changes)} setting(s) sent")
 
     def suivre_samplers(self, now):
         """Un Sampler n'a pas de parametres de plugin : ses reglages sont dans son
@@ -2794,6 +2886,81 @@ class Sync:
               and now - self.last_sampler >= INTERVALLE_SAMPLER_OUVERT):
             self.last_sampler = now
             self.comparer_sampler(self.canal_ouvert)
+
+    def suivre_instruments(self, now):
+        """Presets et wavetables : l'instrument ouvert d'abord, les autres chacun
+        leur tour. Un plugin lent a sauvegarder est lu moins souvent."""
+        instruments = [i for i, _nom in self.signature_rack or []
+                       if i in self.ch_params or i in self.smp_autres]
+        if not instruments or time.monotonic() < self.ins_prochain:
+            return
+        # La mesure du bruit passe avant : un geste pendant elle serait perdu
+        a_mesurer = [i for i in instruments if i not in self.ins
+                     or self.ins[i].lectures < LECTURES_BRUIT]
+        if a_mesurer:
+            if now - self.last_ins < INTERVALLE_INSTRUMENT_OUVERT:
+                return
+            self.last_ins = now
+            canal = a_mesurer[0]
+        elif now - self.last_tour_ins >= INTERVALLE_TOUR_INSTRUMENTS:
+            self.last_tour_ins = now
+            self.tour_ins += 1
+            canal = instruments[self.tour_ins % len(instruments)]
+        elif (self.canal_ouvert in instruments
+              and now - self.last_ins >= INTERVALLE_INSTRUMENT_OUVERT):
+            self.last_ins = now
+            canal = self.canal_ouvert
+        else:
+            return
+        debut = time.monotonic()
+        self.comparer_instrument(canal)
+        fin = time.monotonic()
+        self.ins_prochain = fin + 20 * (fin - debut)
+
+    def comparer_instrument(self, canal):
+        cible = self.index_hote(canal)
+        brut = self.lire_canal(canal)
+        if cible is None or brut is None:
+            return
+        etat = etat_plugin(brut)
+        if not etat:
+            return
+        suivi = self.ins.get(canal)
+        if suivi is None:
+            self.ins[canal] = SuiviEtat(etat)
+            return
+        instant = time.monotonic()
+        if suivi.voir(etat) and instant >= suivi.muet:
+            suivi.a_voir = instant
+        if suivi.a_voir is None or instant - suivi.a_voir < CALME_INSTRUMENT:
+            return
+        # Un potard change aussi l'etat, mais il est deja passe par ses parametres
+        potard = self.ins_bouge.get(canal, 0.0) >= suivi.a_voir - CALME_INSTRUMENT
+        suivi.a_voir = None
+        if potard and canal not in self.ins_massif:
+            return
+        self.ins_massif.discard(canal)
+        nom = dict(self.signature_rack or []).get(canal, "")
+        self.publier_canal(canal, nom, remplace=True, instrument=True)
+
+    def poser_instrument(self, canal, brut):
+        """L'etat complet recu, sur le plugin deja en place."""
+        ici = self.lire_canal(canal)
+        requis, present = plugin_requis(brut), plugin_requis(ici) if ici else None
+        if not requis or not present or not meme_nom(requis[0], present[0]):
+            print(f"[channel] {canal}: preset ignored, not the same plugin here")
+            return
+        relu = self.poser_etat(canal, ici, brut)
+        if relu is None:
+            return
+        print(f"[channel] {canal}: preset received")
+        self.ch_params.pop(canal, None)
+        suivi = SuiviEtat(etat_plugin(relu))
+        ancien = self.ins.get(canal)
+        if ancien is not None:
+            suivi.reste, suivi.lectures = ancien.reste, ancien.lectures
+        suivi.muet = time.monotonic() + MUET_APRES_POSE
+        self.ins[canal] = suivi
 
     def lire_canal(self, canal):
         """Le .fst d'un canal, None si FL le refuse."""
@@ -2831,7 +2998,7 @@ class Sync:
             return
         self.publish({"type": "chreglages", "ch": cible,
                       "d": base64.b64encode(zlib.compress(brut, 6)).decode("ascii")})
-        print(f"[canal] {canal} : reglages du Sampler envoyes")
+        print(f"[channel] {canal}: Sampler settings sent")
 
     def poser_reglages(self, canal, paquet):
         """Les reglages recus, sur le son de ce poste : son chemin n'est pas forcement
@@ -2839,7 +3006,16 @@ class Sync:
         ici = self.lire_canal(canal)
         if ici is None:
             return False
-        brut = zlib.decompress(base64.b64decode(paquet))
+        relu = self.poser_etat(canal, ici, zlib.decompress(base64.b64decode(paquet)))
+        if relu is None:
+            return False
+        self.smp_connus[canal] = (reglages_sampler(relu), chemin_sample(relu))
+        self.smp_fenetres[canal] = time.monotonic()
+        return True
+
+    def poser_etat(self, canal, ici, brut):
+        """Remplace le canal en gardant son son et sa fenetre. Rend ce que FL en a
+        fait, None si c'est refuse."""
         sample = chemin_sample(ici)
         brut = (remplacer_sample(brut, sample) if sample
                 else modifier_evenements(brut, {EVT_SAMPLE: None}))
@@ -2859,13 +3035,9 @@ class Sync:
             except OSError:
                 pass
         if " OK " not in reponse:
-            print(f"[canal] {canal} : reglages refuses : {reponse}")
-            return False
-        relu = self.lire_canal(canal)
-        if relu is not None:
-            self.smp_connus[canal] = (reglages_sampler(relu), chemin_sample(relu))
-        self.smp_fenetres[canal] = time.monotonic()
-        return True
+            print(f"[channel] {canal}: settings refused: {reponse}")
+            return None
+        return self.lire_canal(canal)
 
     def suivre_effet(self, t, s):
         if (t, s) in self.fx_absents:
@@ -2885,7 +3057,7 @@ class Sync:
         if changes:
             connus.update(changes)
             self.publish({"type": "fxparams", "track": t, "slot": s, "v": changes})
-            print(f"[fx] tranche {t} slot {s} : {len(changes)} reglage(s) envoye(s)")
+            print(f"[fx] track {t} slot {s}: {len(changes)} setting(s) sent")
 
     def oublier_slot(self, track, slot):
         """L'effet du slot a change : ses reglages connus ne valent plus rien."""
@@ -2913,7 +3085,7 @@ class Sync:
         if isinstance(compte, int):
             if not premiere and compte != self.compte_tranches:
                 self.publish_global({"type": "mixcount", "n": compte})
-                print(f"[sync] mixeur : {compte - 2} tranches, envoye a l'autre")
+                print(f"[sync] mixer: {compte - 2} tracks sent")
                 self.oublier_listes_tranches()
             self.compte_tranches = compte
         vus = {}
@@ -2975,7 +3147,7 @@ class Sync:
                 with open(chemin, "rb") as fichier:
                     brut = fichier.read()
         except (OSError, TimeoutError, IndexError, AttributeError) as exc:
-            print(f"[fx] sauvegarde impossible : {exc}")
+            print(f"[fx] could not save: {exc}")
         try:
             os.remove(chemin)
         except OSError:
@@ -2990,7 +3162,7 @@ class Sync:
             morceau = paquet[i * MORCEAU_CANAL:(i + 1) * MORCEAU_CANAL]
             self.publish_global({"type": "fx_morceau", "track": track, "slot": slot, "i": i,
                                  "d": base64.b64encode(morceau).decode("ascii")})
-        print(f"[fx] '{nom}' envoye avec ses reglages : {len(brut)} octets")
+        print(f"[fx] '{nom}' sent with its settings: {len(brut)} bytes")
         return True
 
     def recevoir_fx(self, recu):
@@ -3002,7 +3174,7 @@ class Sync:
         try:
             brut = zlib.decompress(b"".join(recu["recus"]))
             if hashlib.sha256(brut).hexdigest() != recu.get("sha256"):
-                print(f"[fx] '{nom}' recu abime : ignore")
+                print(f"[fx] '{nom}' arrived damaged: ignored")
                 return
             requis = plugin_requis(brut)
             absent = requis and not (self.plugin_present(*requis)
@@ -3011,14 +3183,14 @@ class Sync:
                 # Comme FL pour un projet : le slot montre ce qui manque.
                 doublure = self.plugin.find_effect(EFFET_DOUBLURE)
                 if not doublure:
-                    print(f"[fx] effet '{requis[0]}' absent de ce poste : "
-                          f"tranche {t} slot {s} vide")
+                    print(f"[fx] effect '{requis[0]}' is not on this PC: "
+                          f"track {t} slot {s} left empty")
                     return
-                print(f"[fx] effet '{requis[0]}' absent de ce poste : doublure "
-                      f"tranche {t} slot {s}")
+                print(f"[fx] effect '{requis[0]}' is not on this PC: placeholder on "
+                      f"track {t} slot {s}")
                 with open(doublure, "rb") as fichier:
                     brut = fichier.read()
-                nom = f"ABSENT - {requis[0]}"
+                nom = f"MISSING - {requis[0]}"
             # FL nomme le slot d'apres le fichier.
             chemin = os.path.join(sous_dossier_local("canaux"),
                                   re.sub(r"[^\w .()-]", "_", nom or "Effet") + ".fst")
@@ -3028,7 +3200,7 @@ class Sync:
             if absent and reponse.startswith("FXLOAD OK"):
                 self.fx_absents.add((t, s))
         except (OSError, ValueError, IndexError, zlib.error) as exc:
-            print(f"[fx] '{nom}' illisible : {exc}")
+            print(f"[fx] '{nom}' unreadable: {exc}")
             return
         finally:
             try:
@@ -3036,14 +3208,14 @@ class Sync:
             except OSError:
                 pass
         if not reponse.startswith("FXLOAD OK"):
-            print(f"[fx] '{nom}' refuse : {reponse}")
+            print(f"[fx] '{nom}' refused: {reponse}")
             return
-        print(f"[fx] tranche {t} slot {s} : '{nom}' pose")
+        print(f"[fx] track {t} slot {s}: '{nom}' added")
         self.oublier_slot(t, s)
         if self.fx is not None:
             self.fx[(t, s)] = reponse[len("FXLOAD OK "):]
 
-    def publier_canal(self, index, nom, remplace=False, revenu=False):
+    def publier_canal(self, index, nom, remplace=False, revenu=False, instrument=False):
         """Envoie le canal entier, sample compris : le pair en a une copie
         exacte. Faux si ca n'a pas pu partir."""
         chemin = os.path.join(sous_dossier_local("canaux"), f"envoi-{os.getpid()}.fst")
@@ -3054,9 +3226,9 @@ class Sync:
                 with open(chemin, "rb") as fichier:
                     brut = fichier.read()
             else:
-                print(f"[canal] sauvegarde refusee : {reponse}")
+                print(f"[channel] save refused: {reponse}")
         except (OSError, TimeoutError, IndexError) as exc:
-            print(f"[canal] sauvegarde impossible : {exc}")
+            print(f"[channel] could not save: {exc}")
         try:
             os.remove(chemin)
         except OSError:
@@ -3064,7 +3236,7 @@ class Sync:
         if brut is None:
             return False
         if len(brut) > TAILLE_CANAL_MAX:
-            print(f"[canal] '{nom}' trop lourd ({len(brut)} octets) : pas envoye")
+            print(f"[channel] '{nom}' too large ({len(brut)} bytes): not sent")
             return False
 
         son = b""
@@ -3077,11 +3249,11 @@ class Sync:
                     with open(source, "rb") as fichier:
                         son = fichier.read()
                 else:
-                    print(f"[canal] sample trop lourd, l'autre ne l'aura pas : {source}")
+                    print(f"[channel] sample too large, not sent: {source}")
             elif original and not original.startswith(VARIABLE_USINE):
-                print(f"[canal] sample introuvable, l'autre ne l'aura pas : {original}")
+                print(f"[channel] sample not found, not sent: {original}")
         except (ValueError, IndexError, OSError) as exc:
-            print(f"[canal] sample illisible : {exc}")
+            print(f"[channel] sample unreadable: {exc}")
 
         contenu = brut + son
         paquet = zlib.compress(contenu, 1 if son else 6)
@@ -3091,7 +3263,7 @@ class Sync:
                              "index": index if cible is None else cible,
                              "nom": nom or "", "taille": len(brut),
                              "chemin": original or "", "remplace": remplace,
-                             "revenu": revenu,
+                             "revenu": revenu, "instrument": instrument,
                              "sha256": hashlib.sha256(contenu).hexdigest(),
                              "morceaux": nombre})
         for i in range(nombre):
@@ -3099,8 +3271,8 @@ class Sync:
             self.publish_global({"type": "canal_morceau",
                                  "index": index if cible is None else cible, "i": i,
                                  "d": base64.b64encode(morceau).decode("ascii")})
-        print(f"[canal] '{nom}' envoye : {len(brut)} octets"
-              + (f" + sample de {len(son)} octets" if son else ""))
+        print(f"[channel] '{nom}' sent: {len(brut)} bytes"
+              + (f" + {len(son)} byte sample" if son else ""))
         return True
 
     def plugin_present(self, nom, chemin):
@@ -3142,26 +3314,32 @@ class Sync:
         try:
             contenu = zlib.decompress(b"".join(recu["recus"]))
             if hashlib.sha256(contenu).hexdigest() != recu.get("sha256"):
-                print(f"[canal] '{nom}' recu abime : ignore")
+                print(f"[channel] '{nom}' arrived damaged: ignored")
                 return
             taille = int(recu.get("taille", 0))
             brut, son = contenu[:taille], contenu[taille:]
+            if recu.get("instrument"):
+                index = int(recu.get("index", 0))
+                cible = index if self.is_host else self.index_local(index)
+                if cible is not None:
+                    self.poser_instrument(cible, brut)
+                return
             if son:
                 brut = self.poser_sample(brut, son, recu)
             sample = chemin_sample(brut)
             if (sample and not sample.startswith(VARIABLE_USINE)
                     and fichier_sample(sample) is None):
-                print(f"[canal] sample absent de ce poste : {sample}")
+                print(f"[channel] sample is not on this PC: {sample}")
                 brut = modifier_evenements(brut, {EVT_SAMPLE: None})
             requis = plugin_requis(brut)
             if requis and not self.plugin_present(*requis):
-                print(f"[canal] plugin '{requis[0]}' absent de ce poste : canal vide a la place")
+                print(f"[channel] plugin '{requis[0]}' is not on this PC: empty channel instead")
                 brut = sans_plugin(brut)
             chemin = os.path.join(sous_dossier_local("canaux"), f"recu-{os.getpid()}.fst")
             with open(chemin, "wb") as fichier:
                 fichier.write(brut)
         except (OSError, ValueError, IndexError, zlib.error) as exc:
-            print(f"[canal] '{nom}' illisible : {exc}")
+            print(f"[channel] '{nom}' unreadable: {exc}")
             return
 
         index = int(recu.get("index", 0))
@@ -3169,7 +3347,7 @@ class Sync:
             if recu.get("remplace"):
                 cible = index if self.is_host else self.index_local(index)
                 if cible is None:
-                    print(f"[canal] '{nom}' n'a pas de correspondant ici")
+                    print(f"[channel] '{nom}' has no match here")
                     return
                 reponse = self.plugin.replace_channel(cible, chemin, nom)
             else:
@@ -3183,9 +3361,9 @@ class Sync:
             except OSError:
                 pass
         if " OK " not in reponse:
-            print(f"[canal] '{nom}' refuse : {reponse}")
+            print(f"[channel] '{nom}' refused: {reponse}")
             return
-        print(f"[canal] '{nom}' recu")
+        print(f"[channel] '{nom}' received")
         self.ch_params = {}
         self.ch_sans_plugin = set()
         self.smp_connus = {}
@@ -3225,12 +3403,12 @@ class Sync:
         if not SUPPRESSION_RECUE:
             for index in indices:
                 nom = self.nom_hote(int(index)) or f"numero {int(index) + 1}"
-                print(f"[rack] l'autre a supprime le canal '{nom}' : "
-                      f"supprime-le a la main si tu veux le suivre")
+                print(f"[rack] the other PC deleted channel '{nom}': "
+                      f"delete it by hand if you want to match")
             return 0
         if not self.is_host and not self.carte_hote_vers_local:
             # sans table, l'index pourrait viser un autre instrument
-            print("[rack] suppression ignoree : racks sans nom commun")
+            print("[rack] delete ignored: no channel names in common")
             return 0
         locaux = {self.index_local(int(i)) for i in indices} - {None}
         retires = 0
@@ -3239,9 +3417,9 @@ class Sync:
             reponse = self.plugin.delete_channel(index)
             if reponse.startswith("DELCHANNEL OK"):
                 retires += 1
-                print(f"[rack] canal {index} supprime comme chez l'autre")
+                print(f"[rack] channel {index} deleted to match the other PC")
             else:
-                print(f"[rack] suppression refusee : {reponse}")
+                print(f"[rack] delete refused: {reponse}")
         fresh = self.plugin.channels()
         if fresh is not None:
             self.channels_state = {i: t for i, t, _ in fresh}
@@ -3266,7 +3444,7 @@ class Sync:
         if premiere:
             return False
         if self.is_host:
-            print("[rack] le rack a change : envoi a l'invite")
+            print("[rack] rack changed: sent to the guest")
             self.publier_rack(channels)
         elif self.rack_hote:
             self.construire_carte(self.rack_hote, channels)
@@ -3328,10 +3506,10 @@ class Sync:
         if not changee:
             return
         if carte:
-            print(f"[rack] correspondance par nom : "
-                  f"{len(carte)} canal(aux) reconnu(s)")
+            print(f"[rack] matched by name: "
+                  f"{len(carte)} channel(s)")
         else:
-            print("[rack] aucun nom commun : les notes suivront les index")
+            print("[rack] no names in common: notes follow channel order")
 
     def proteger(self, action, message):
         """Une erreur de traitement ne coupe pas la session, un plugin perdu
@@ -3341,7 +3519,7 @@ class Sync:
         except TimeoutError:
             # FL est occupe. Sa reponse arrivera en retard et decalerait toutes
             # les suivantes : on repart sur une connexion neuve.
-            print("[sync] FL ne repond pas a temps : reconnexion au plugin")
+            print("[sync] FL is not answering: reconnecting to the plugin")
             self.reprendre_plugin()
         except (ConnectionError, OSError):
             raise
@@ -3401,14 +3579,14 @@ class Sync:
             self.publish_global({"type": "projet_offre",
                                  "poste": socket.gethostname().upper()})
             self.projet_etat = "offert"
-            gui_etat(self.plugin, f"En attente de la réponse de {self.poste_pair}…")
+            gui_etat(self.plugin, f"Waiting for {self.poste_pair} to answer…")
 
         for message in recus:
             kind = message.get("type")
             if kind == "projet_demande" and self.projet_etat == "offert":
                 self.envoyer_projet()
             elif kind == "projet_pret":
-                print(f"[projet] {self.poste_pair} a charge le projet")
+                print(f"[project] {self.poste_pair} loaded the project")
                 self.projet_etat = None
                 self.sent_initial = True
                 self.publier_rack()
@@ -3416,14 +3594,14 @@ class Sync:
                 self.statut_session()
 
     def envoyer_projet(self):
-        gui_etat(self.plugin, f"Envoi du projet à {self.poste_pair}…")
+        gui_etat(self.plugin, f"Sending the project to {self.poste_pair}…")
         chemin = os.path.join(sous_dossier_local("projets"),
                               f"envoi-{os.getpid()}.flp")
         brut = None
         try:
             raison = self.plugin.sauver_projet(chemin)
         except TimeoutError:
-            raison = "FL n'a pas repondu"
+            raison = "FL did not answer"
             self.reprendre_plugin()
         if raison is None:
             try:
@@ -3436,15 +3614,15 @@ class Sync:
         except OSError:
             pass
         if raison is None and len(brut) > TAILLE_PROJET_MAX:
-            raison = f"projet trop lourd ({len(brut)} octets)"
+            raison = f"project too large ({len(brut)} bytes)"
         if raison is not None:
             self.refuser_projet(raison)
             return
 
         paquet = zlib.compress(brut, 6)
         nombre = max(1, (len(paquet) + MORCEAU_PROJET - 1) // MORCEAU_PROJET)
-        print(f"[projet] envoi : {len(brut)} octets, {len(paquet)} compresses, "
-              f"{nombre} morceau(x)")
+        print(f"[project] sending: {len(brut)} bytes, {len(paquet)} compressed, "
+              f"{nombre} part(s)")
         self.publish_global({"type": "projet_debut", "taille": len(brut),
                              "sha256": hashlib.sha256(brut).hexdigest(),
                              "morceaux": nombre})
@@ -3457,7 +3635,7 @@ class Sync:
     def refuser_projet(self, raison):
         """L'invite s'en va : son depart rend la main a l'hote, qui attend le
         suivant."""
-        print(f"[projet] pas d'envoi : {raison}")
+        print(f"[project] not sent: {raison}")
         self.projet_etat = "refuse"
         self.publish_global({"type": "projet_refuse", "raison": raison})
         self.statut_session()
@@ -3475,7 +3653,7 @@ class Sync:
                     gui_etat(self.plugin, f"DEMANDE {self.poste_pair}")
             elif kind == "projet_refuse":
                 # son projet a ete sauvegarde, mais il n'a pas encore ete touche
-                self.quitter_session(f"L'hôte n'a pas pu envoyer son projet : "
+                self.quitter_session(f"The host could not send its project: "
                                      f"{message.get('raison')}")
             elif kind == "projet_debut":
                 self.projet_attendu = message
@@ -3487,7 +3665,7 @@ class Sync:
                 pourcent = 100 * len(self.projet_morceaux) // max(1, nombre)
                 if pourcent >= self.projet_pourcent + 10:
                     self.projet_pourcent = pourcent
-                    gui_etat(self.plugin, f"Réception du projet : {pourcent} %")
+                    gui_etat(self.plugin, f"Receiving the project: {pourcent}%")
                 if len(self.projet_morceaux) >= nombre:
                     self.charger_projet_hote()
                     return
@@ -3503,33 +3681,33 @@ class Sync:
 
         reponse = self.plugin.cmd("CHOIX")[0]
         if not reponse.startswith("CHOIX "):
-            self.quitter_session("Plugin trop ancien : mets FruityMulti à jour")
+            self.quitter_session("Plugin too old: update FruityMulti")
         choix = reponse[6:].strip()
         if choix == "oui":
             self.accepter()
         elif choix == "non":
-            self.quitter_session("Session quittée : projet de l'hôte refusé")
+            self.quitter_session("Left the session: host's project refused")
         elif maintenant > self.projet_limite:
             gui_etat(self.plugin, "DEMANDE -")
-            self.quitter_session("Session quittée : pas de réponse")
+            self.quitter_session("Left the session: no answer")
 
     def accepter(self):
         """La sauvegarde passe avant tout le reste : a partir d'ici, le projet
         de l'invite va etre remplace."""
-        gui_etat(self.plugin, "Sauvegarde de ton projet…")
+        gui_etat(self.plugin, "Saving your project…")
         dossier = sous_dossier_local("sauvegardes")
         chemin = os.path.join(dossier, time.strftime("avant-session-%Y%m%d-%H%M%S.flp"))
         try:
             raison = self.plugin.sauver_projet(chemin)
         except TimeoutError:
-            raison = "FL n'a pas repondu"
+            raison = "FL did not answer"
         if raison is not None:
-            self.quitter_session(f"Sauvegarde de ton projet impossible : {raison}")
+            self.quitter_session(f"Could not save your project: {raison}")
         garder_recentes(dossier, SAUVEGARDES_GARDEES)
-        print(f"[projet] ton projet est sauvegarde : {chemin}")
+        print(f"[project] your project is saved: {chemin}")
 
         self.projet_etat = "reception"
-        gui_etat(self.plugin, f"Réception du projet de {self.poste_pair}…")
+        gui_etat(self.plugin, f"Receiving the project from {self.poste_pair}…")
         self.publish_global({"type": "projet_demande"})
 
     def lire_fichier_recu(self):
@@ -3540,15 +3718,15 @@ class Sync:
                               for i in range(int(attendu["morceaux"])))
             brut = zlib.decompress(paquet)
         except (KeyError, ValueError, zlib.error) as exc:
-            print(f"[projet] fichier recu illisible : {exc}")
+            print(f"[project] received file unreadable: {exc}")
             return None
         if hashlib.sha256(brut).hexdigest() != attendu.get("sha256"):
-            print("[projet] empreinte fausse : fichier abime en route")
+            print("[project] checksum mismatch: file damaged in transit")
             return None
         # Un fichier refuse par FL laisserait le plugin arrete pour de bon :
         # LOADPROJECT coupe tous ses threads avant de lancer le chargement.
         if brut[:4] != b"FLhd":
-            print("[projet] ce n'est pas un projet FL")
+            print("[project] this is not an FL project")
             return None
         return brut
 
@@ -3556,7 +3734,7 @@ class Sync:
         brut = self.lire_fichier_recu()
         self.projet_morceaux = {}
         if brut is None:
-            self.quitter_session("Projet de l'hôte reçu abîmé")
+            self.quitter_session("The host's project arrived damaged")
 
         nom = f"session-{self.code or 'directe'}.flp"
         chemin = os.path.join(sous_dossier_local("projets"), nom)
@@ -3564,17 +3742,17 @@ class Sync:
             with open(chemin, "wb") as fichier:
                 fichier.write(brut)
         except OSError as exc:
-            self.quitter_session(f"Écriture du projet impossible : {exc}")
+            self.quitter_session(f"Could not write the project: {exc}")
 
-        print(f"[projet] chargement de {chemin}")
-        gui_etat(self.plugin, "Chargement du projet…")
+        print(f"[project] loading {chemin}")
+        gui_etat(self.plugin, "Loading the project…")
         reponse = self.plugin.cmd(f"LOADPROJECT {chemin}")[0]
         if not reponse.startswith("LOADPROJECT planifie"):
-            self.quitter_session(f"Chargement refusé : {reponse}")
+            self.quitter_session(f"Load refused: {reponse}")
 
         self.projet_etat = "chargement"
         if not self.plugin.attendre_fermeture(DELAI_COUPURE):
-            self.quitter_session("FL n'a pas lancé le chargement")
+            self.quitter_session("FL did not start loading")
         self.attendre_retour_plugin()
         self.verifier_chargement()
         self.attendre_stabilite()
@@ -3586,7 +3764,7 @@ class Sync:
         self.projet_etat = None
         self.sent_initial = True
         self.publish_global({"type": "projet_pret"})
-        print(f"[projet] projet de {self.poste_pair} charge")
+        print(f"[project] project from {self.poste_pair} loaded")
 
     def verifier_chargement(self):
         """Le plugin revient aussi quand FL a refuse le fichier : son retour ne
@@ -3600,7 +3778,7 @@ class Sync:
                 break
             time.sleep(0.5)
         if code != "0":
-            self.quitter_session(f"FL a refusé le projet (code {code})")
+            self.quitter_session(f"FL refused the project (code {code})")
 
     def attendre_retour_plugin(self):
         """Le Bridge est dans le projet de l'hote, donc il revient tout seul.
@@ -3614,7 +3792,7 @@ class Sync:
                     return
             except OSError:
                 pass
-        raise ConnectionError("le plugin n'est pas revenu apres le chargement")
+        raise ConnectionError("the plugin did not come back after loading")
 
     def attendre_stabilite(self):
         """FL peut repondre alors qu'il n'a pas fini : une lecture a moitie
@@ -3630,24 +3808,24 @@ class Sync:
 
     def quitter_session(self, raison):
         """Sortie de l'agent : la fenetre garde la raison affichee."""
-        print(f"[projet] {raison}")
+        print(f"[project] {raison}")
         self._liberer_autorite()
         gui_etat(self.plugin, f"ERREUR {raison}")
         raise SystemExit(1)
 
     def run(self):
-        print("[sync] pret")
+        print("[sync] ready")
         try:
             while True:
                 # Le pair est parti : on rend la main pour pouvoir en accepter
                 # un autre, au lieu de tourner dans le vide indefiniment.
                 if not getattr(self.link, "alive", True):
-                    print("[sync] pair deconnecte")
+                    print("[sync] other PC disconnected")
                     self._liberer_autorite()
                     return False
 
                 if getattr(self.plugin, "decale", False):
-                    print("[sync] FL ne repond pas a temps : reconnexion au plugin")
+                    print("[sync] FL is not answering: reconnecting to the plugin")
                     self.reprendre_plugin()
 
                 # Autorite : le plugin doit savoir s'il est hote ou invite.
@@ -3657,9 +3835,9 @@ class Sync:
                     try:
                         reponse = self.plugin.cmd(
                             "ROLE " + ("hote" if self.is_host else "invite"))[0]
-                        print(f"[autorite] {reponse}")
+                        print(f"[role] {reponse}")
                     except (OSError, TimeoutError, IndexError) as exc:
-                        print(f"[autorite] role non transmis : {exc}")
+                        print(f"[role] not sent: {exc}")
                     self.role_sent = True
 
                 if self.projet_gele():
@@ -3667,15 +3845,15 @@ class Sync:
                     # remplace ; le comparatif des plugins aide a decider.
                     if self.projet_etat in ("attente", "choix"):
                         self.proteger(lambda: self.apply_incoming(("plugins",)),
-                                      "[sync] message ignore")
+                                      "[sync] message ignored")
                 else:
                     # Un message malforme ne doit jamais couper la session : on
                     # le signale et on continue. Sans cela, la moindre erreur
                     # dans un gestionnaire tuait la connexion et provoquait une
                     # boucle de reconnexions.
-                    self.proteger(self.apply_incoming, "[sync] message ignore")
+                    self.proteger(self.apply_incoming, "[sync] message ignored")
                     self.proteger(self.detect_local,
-                                  "[sync] analyse locale impossible")
+                                  "[sync] local scan failed")
 
                 if self.projet_etat is not None:
                     self.avancer_projet()
@@ -3684,7 +3862,7 @@ class Sync:
                     self.sent_initial = True
                 time.sleep(POLL)
         except (ConnectionError, OSError) as exc:
-            print(f"[sync] connexion au plugin perdue : {exc}")
+            print(f"[sync] lost the plugin: {exc}")
             raise PluginLost(str(exc))
 
 
@@ -3744,7 +3922,7 @@ class TransportTcp:
             if delai is not None:
                 lisible, _, _ = select.select([self.sock], [], [], delai)
                 if not lisible:
-                    raise TimeoutError("rien recu")
+                    raise TimeoutError("nothing received")
             chunk = self.sock.recv(65536)
             if not chunk:
                 raise ConnectionError("pair deconnecte")
@@ -3770,14 +3948,14 @@ class TransportRelais:
         try:
             self.ws.send(texte)
         except ConnectionClosed as exc:
-            raise ConnectionError(f"relais ferme ({exc})")
+            raise ConnectionError(f"relay closed ({exc})")
 
     def recevoir(self, delai=None):
         from websockets.exceptions import ConnectionClosed
         try:
             message = self.ws.recv(timeout=delai)
         except ConnectionClosed as exc:
-            raise ConnectionError(f"relais ferme ({exc})")
+            raise ConnectionError(f"relay closed ({exc})")
         return message if isinstance(message, str) else message.decode("utf-8")
 
     def fermer(self):
@@ -3811,7 +3989,7 @@ def attendre_pair_relais(transport):
             if evenement == "pair_arrive":
                 return
             if evenement == "refuse":
-                raise Refus(m.get("raison", "refuse par le relais"))
+                raise Refus(m.get("raison", "refused by the relay"))
 
 
 def poignee_de_main(transport, est_hote, code, delai=10.0):
@@ -3833,7 +4011,7 @@ def poignee_de_main(transport, est_hote, code, delai=10.0):
     while lui is None:
         reste = limite - time.monotonic()
         if reste <= 0:
-            raise Refus("le pair ne s'est pas presente : version trop ancienne ?")
+            raise Refus("the other PC did not answer: old version?")
         try:
             texte = transport.recevoir(reste)
         except TimeoutError:
@@ -3842,19 +4020,19 @@ def poignee_de_main(transport, est_hote, code, delai=10.0):
             if m.get("_relais") == "pair_parti":
                 raise ConnectionError("pair parti pendant la presentation")
             if m.get("type") == "refus":
-                raise Refus(m.get("raison", "refuse par l'hote"))
+                raise Refus(m.get("raison", "refused by the host"))
             if m.get("type") == "hello":
                 lui = m
                 break
 
     raison = None
     if lui.get("proto") != PROTO:
-        raison = (f"protocole {lui.get('proto')} chez l'autre, {PROTO} ici : "
-                  f"mettez FruityMulti a jour tous les deux")
+        raison = (f"protocol {lui.get('proto')} on the other PC, {PROTO} here: "
+                  f"both PCs need to update FruityMulti")
     elif lui.get("role") == moi["role"]:
-        raison = f"deux {moi['role']}s dans la meme session"
+        raison = f"two {moi['role']}s in one session"
     elif est_hote and str(lui.get("code", "")).upper() != code:
-        raison = "code de session faux"
+        raison = "wrong session code"
 
     if raison is not None:
         if est_hote:
@@ -3867,8 +4045,8 @@ def poignee_de_main(transport, est_hote, code, delai=10.0):
     if est_hote:
         transport.envoyer(json.dumps([moi]))
     if lui.get("version") != AGENT_VERSION:
-        print(f"[reseau] ATTENTION : version {lui.get('version')} chez "
-              f"l'autre, {AGENT_VERSION} ici")
+        print(f"[net] WARNING: version {lui.get('version')} on "
+              f"the other PC, {AGENT_VERSION} here")
     return lui
 
 
@@ -3949,7 +4127,7 @@ class Link:
     def _mort(self, raison):
         if self.alive:
             self.alive = False
-            print(f"[reseau] {raison}")
+            print(f"[net] {raison}")
         with self.cond:
             self.cond.notify()
         self.transport.fermer()
@@ -4011,7 +4189,7 @@ class Link:
             try:
                 messages = _messages(texte)
             except ValueError as exc:
-                print(f"[reseau] message invalide : {exc}")
+                print(f"[net] invalid message: {exc}")
                 continue
             for message in messages:
                 if message.get("_relais") == "pair_parti":
@@ -4027,7 +4205,7 @@ class Link:
                     try:
                         handler(message)
                     except Exception as exc:
-                        print(f"[reseau] traitement impossible : {exc}")
+                        print(f"[net] could not process: {exc}")
 
 
 # --------------------------------------------------------------------------
@@ -4046,25 +4224,25 @@ def try_upnp(port):
     try:
         import miniupnpc
     except ImportError:
-        print("[upnp] module absent (pip install miniupnpc)")
+        print("[upnp] module missing (pip install miniupnpc)")
         return None
 
     try:
         u = miniupnpc.UPnP()
         u.discoverdelay = 400
         if u.discover() == 0:
-            print("[upnp] aucun routeur compatible trouve")
+            print("[upnp] no compatible router found")
             return None
         u.selectigd()
 
         public = u.externalipaddress()
-        print(f"[upnp] IP locale {u.lanaddr}   IP publique {public}")
+        print(f"[upnp] local IP {u.lanaddr}   public IP {public}")
 
         # 1. le port demande, apres une tentative de nettoyage de la vieille regle
         candidates = [port]
         try:
             u.deleteportmapping(port, "TCP")
-            print(f"[upnp] ancienne regle sur {port} supprimee")
+            print(f"[upnp] old rule on {port} removed")
         except Exception:
             pass
 
@@ -4076,22 +4254,22 @@ def try_upnp(port):
                 if u.addportmapping(external, "TCP", u.lanaddr, port,
                                     "FruityMulti", ""):
                     if external == port:
-                        print(f"[upnp] port {port} ouvert automatiquement")
+                        print(f"[upnp] port {port} opened automatically")
                     else:
-                        print(f"[upnp] le port {port} etait bloque : "
-                              f"la box ecoute sur {external} a la place")
+                        print(f"[upnp] port {port} was blocked: "
+                              f"the router listens on {external} instead")
                     global UPNP_EXTERNAL
                     UPNP_EXTERNAL = external
                     return public, external
             except Exception:
                 continue
 
-        print("[upnp] aucun port n'a pu etre ouvert automatiquement.")
-        print(f"       ouvre le port {port}/TCP vers {u.lanaddr} sur ta box,")
-        print("       dans la section NAT / redirection de ports.")
+        print("[upnp] no port could be opened automatically.")
+        print(f"       open port {port}/TCP to {u.lanaddr} on your router,")
+        print("       in its NAT / port forwarding section.")
         return public, port
     except Exception as exc:
-        print(f"[upnp] echec general : {exc}")
+        print(f"[upnp] failed: {exc}")
         return None
 
 
@@ -4110,7 +4288,7 @@ def close_upnp(port):
         for p in ports:
             try:
                 u.deleteportmapping(p, "TCP")
-                print(f"[upnp] port {p} referme")
+                print(f"[upnp] port {p} closed")
             except Exception:
                 pass
     except Exception:
@@ -4245,7 +4423,7 @@ def lancer_setup (dossier):
         chemin = os.path.join (os.environ.get ("LOCALAPPDATA", "."),
                                "FruityMulti", "FruityMultiSetup.exe")
         if not os.path.exists (chemin):
-            print ("[maj] installateur introuvable : reinstalle une fois a la main")
+            print ("[update] installer not found: reinstall by hand once")
             return False
 
     print ("[maj] installation : FL va se fermer puis redemarrer")
@@ -4253,7 +4431,7 @@ def lancer_setup (dossier):
         subprocess.Popen ([chemin, "--apply"], close_fds=True)
         return True
     except Exception as exc:
-        print (f"[maj] lancement impossible : {exc}")
+        print (f"[update] could not start: {exc}")
         return False
 
 
@@ -4264,12 +4442,12 @@ def mettre_a_jour(silencieux=False, lancer_installateur=False):
     try:
         numero, fichiers = derniere_version()
     except Exception as exc:
-        print(f"[maj] verification impossible : {exc}")
+        print(f"[update] could not check: {exc}")
         return 2
 
-    print(f"[maj] derniere version : {numero}   la mienne : {AGENT_VERSION}")
+    print(f"[update] latest: {numero}   installed: {AGENT_VERSION}")
     if numero <= AGENT_VERSION:
-        print("[maj] deja a jour")
+        print("[update] already up to date")
         return 0
 
     dossier = os.path.join(os.environ.get("LOCALAPPDATA", "."), "FruityMulti", "maj")
@@ -4281,21 +4459,21 @@ def mettre_a_jour(silencieux=False, lancer_installateur=False):
         if not adresse:
             manquants.append(nom)
             continue
-        print(f"[maj] telechargement de {nom}...")
+        print(f"[update] downloading {nom}...")
         urllib.request.urlretrieve(adresse, os.path.join(dossier, nom))
 
     chemin_script = os.path.join(dossier, "appliquer-maj.cmd")
     with open(chemin_script, "w", encoding="utf-8") as f:
         f.write(SCRIPT_MAJ)
 
-    print(f"[maj] version {numero} telechargee dans :")
+    print(f"[update] version {numero} downloaded to:")
     print(f"      {dossier}")
     if manquants:
-        print(f"[maj] ATTENTION : absent de la release : {', '.join(manquants)}")
+        print(f"[update] WARNING: missing from the release: {', '.join(manquants)}")
     if lancer_installateur:
         lancer_setup (dossier)
     else:
-        print("[maj] pour l'installer : relance FruityMultiSetup.exe")
+        print("[update] to install it, run FruityMultiSetup.exe")
     return 1
 
 
@@ -4304,9 +4482,9 @@ def verifier_versions(version_plugin):
     numero = numero_de_version(version_plugin)
     if numero == AGENT_VERSION:
         return True
-    print(f"[maj] VERSIONS DESALIGNEES : plugin {numero}, agent {AGENT_VERSION}")
-    print(f"      les deux postes doivent avoir la meme version.")
-    print(f"      mets a jour : fm_agent.exe --maj   ({ADRESSE_RELEASES})")
+    print(f"[update] VERSION MISMATCH: plugin {numero}, agent {AGENT_VERSION}")
+    print("      both PCs need the same version.")
+    print(f"      to update: fm_agent.exe --maj   ({ADRESSE_RELEASES})")
     return False
 
 
@@ -4423,12 +4601,12 @@ def surveiller_parent(pid):
     SYNCHRONIZE = 0x00100000
     poignee = noyau.OpenProcess(SYNCHRONIZE, False, pid)
     if not poignee:
-        print(f"[sync] FL (pid {pid}) deja ferme : arret")
+        print(f"[sync] FL (pid {pid}) already closed: stopping")
         os._exit(0)
 
     def attendre():
         noyau.WaitForSingleObject(poignee, 0xFFFFFFFF)
-        print("[sync] FL s'est ferme : arret de l'agent")
+        print("[sync] FL closed: stopping the agent")
         ecrire_compat([], [], [])
         os._exit(0)
 
@@ -4451,13 +4629,13 @@ def main():
     parser = argparse.ArgumentParser(description="FruityMulti - synchronisation")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--heberger", action="store_true",
-                       help="ouvrir une session par le relais (hote)")
+                       help="host a session through the relay")
     group.add_argument("--rejoindre", metavar="CODE",
                        help="rejoindre une session : CODE, ou ip:port/CODE en direct")
     group.add_argument("--listen", type=int, metavar="PORT",
-                       help="ouvrir une session en direct, sans relais (hote)")
+                       help="host a direct session, no relay")
     group.add_argument("--peer", metavar="HOTE:PORT/CODE",
-                       help="rejoindre une session directe (invite)")
+                       help="join a direct session")
     parser.add_argument("--plugin", default=f"{PLUGIN_HOST}:{PLUGIN_PORT}",
                         help="adresse du plugin local")
     parser.add_argument("--once", action="store_true",
@@ -4467,12 +4645,12 @@ def main():
     parser.add_argument("--check", action="store_true",
                         help="imprimer la derniere version publiee (MAJ n)")
     parser.add_argument("--installer", action="store_true",
-                        help="apres telechargement, lance l'installateur")
+                        help="run the installer after downloading")
     parser.add_argument("--accepter-projet", action="store_true",
-                        help="invite sans fenetre : charger le projet de l'hote "
-                             "sans poser la question")
+                        help="headless guest: load the host's project "
+                             "without asking")
     parser.add_argument("--parent", type=int, metavar="PID",
-                        help="s'arreter quand ce processus (FL) se ferme")
+                        help="stop when this process (FL) closes")
     args = parser.parse_args()
     if args.parent:
         surveiller_parent(args.parent)
@@ -4493,15 +4671,15 @@ def main():
     # un seul agent de SESSION a la fois (les --check et --maj sont libres)
     verrou = verrou_unique()
     if verrou is None:
-        print("[sync] un agent tourne deja : rien a faire")
+        print("[sync] an agent is already running")
         return 0
 
     host, _, port = args.plugin.partition(":")
     try:
         plugin = Plugin(host, int(port))
     except OSError as exc:
-        print(f"Plugin injoignable sur {args.plugin} : {exc}")
-        print("FL est-il lance, avec l'effet FruityMulti Bridge ?")
+        print(f"Cannot reach the plugin at {args.plugin}: {exc}")
+        print("Is FL open, with the FruityMulti Bridge effect?")
         return 1
 
     # Le plugin n'accepte qu'un seul client : si un autre agent tourne deja,
@@ -4513,32 +4691,32 @@ def main():
             if reponse == "OK":
                 last_error = None
                 break
-            if "version de FL" in reponse:
+            if "FL version" in reponse:
                 # FL mis a jour depuis la compilation du plugin : inutile
                 # d'insister, et surtout pas "un autre agent l'utilise"
-                print("[sync] le plugin ne reconnait pas cette version de FL")
-                print("[sync] il faut la version de FL prevue par FruityMulti")
-                gui_etat(plugin, "ERREUR Version de FL non reconnue : mets FruityMulti à jour")
+                print("[sync] the plugin does not recognise this FL version")
+                print("[sync] FruityMulti needs its supported FL version")
+                gui_etat(plugin, "ERREUR This FL version is not supported: update FruityMulti")
                 return 1
             last_error = "reponse inattendue"
         except (OSError, TimeoutError) as exc:
             last_error = exc
-        print(f"[sync] plugin occupe ou lent ({last_error}) — nouvel essai "
+        print(f"[sync] plugin busy or slow ({last_error}): retry "
               f"{attempt + 1}/6")
         time.sleep(1.0)
 
     if last_error is not None:
-        print("Le plugin ne repond pas : un autre agent l'utilise peut-etre deja.")
+        print("The plugin is not answering: another agent may be using it.")
         return 1
 
-    print(f"[sync] plugin connecte ({args.plugin})")
+    print(f"[sync] plugin connected ({args.plugin})")
     ecrire_compat([], [], [])   # rien de la session precedente
 
     try:
         version = plugin.cmd("VERSION")[0]
     except (OSError, IndexError):
         version = "inconnue"
-    print(f"[sync] version du plugin : {version}")
+    print(f"[sync] plugin version: {version}")
     verifier_versions(version)
     est_hote = bool(args.heberger or args.listen)
     gui_etat(plugin, "ROLE " + ("hote" if est_hote else "invite"))
@@ -4557,7 +4735,7 @@ def main():
                 transport = ouvrir_relais(code, "hote")
                 adresse = code
             except Exception as exc:
-                print(f"[reseau] relais injoignable ({exc}) : connexion directe")
+                print(f"[net] relay unreachable ({exc}): direct connection")
                 par_relais = False
         if not par_relais:
             port_ecoute = args.listen or PORT_DIRECT
@@ -4580,12 +4758,12 @@ def main():
 
         print("")
         print("=" * 52)
-        print("  donnez ce code a votre invite :")
+        print("  give this code to your guest:")
         print(f"        {adresse}")
         print("=" * 52)
         print("")
         gui_etat(plugin, f"ADRESSE {adresse}")
-        gui_etat(plugin, f"Code {adresse} : en attente de l'invité")
+        gui_etat(plugin, f"Code {adresse}: waiting for your guest")
     else:
         cible = (args.rejoindre or args.peer).strip()
         if est_un_code(cible):
@@ -4597,7 +4775,7 @@ def main():
             code = code.strip().upper()
             ip, _, port_pair = cible.partition(":")
             pair_direct = (ip, int(port_pair or PORT_DIRECT))
-        gui_etat(plugin, f"Connexion à la session {code or cible}…")
+        gui_etat(plugin, f"Joining session {code or cible}…")
 
     def fermer_tout():
         plugin.close()
@@ -4616,7 +4794,7 @@ def main():
                 attendre_pair_relais(transport)
             elif est_hote:
                 sock, addr = serveur.accept()
-                print(f"[sync] connexion entrante : {addr[0]}:{addr[1]}")
+                print(f"[sync] incoming connection: {addr[0]}:{addr[1]}")
                 transport = TransportTcp(sock)
             elif par_relais:
                 transport = ouvrir_relais(code, "invite")
@@ -4628,8 +4806,8 @@ def main():
         except KeyboardInterrupt:
             raise
         except Refus as exc:
-            print(f"[reseau] refuse : {exc}")
-            gui_etat(plugin, f"Refusé : {exc}")
+            print(f"[net] refused: {exc}")
+            gui_etat(plugin, f"Refused: {exc}")
             if transport is not None:
                 transport.fermer()
                 transport = None
@@ -4641,33 +4819,33 @@ def main():
                 transport.fermer()
                 transport = None
             raison = getattr(exc, "winerror", None)
-            print(f"[reseau] connexion impossible ({exc})")
+            print(f"[net] cannot connect ({exc})")
             if pair_direct is not None:
                 if raison == 10061:
-                    print("[sync]   -> personne n'ecoute a cette adresse.")
-                    print("[sync]      verifie le PORT : la box peut avoir ouvert")
-                    print("[sync]      un autre que celui affiche chez l'hote.")
+                    print("[sync]   -> nobody is listening at this address.")
+                    print("[sync]      check the port: the router may have opened")
+                    print("[sync]      a different one than the host shows.")
                 elif raison == 10060:
-                    print("[sync]   -> pas de reponse : le port est filtre")
-                    print("[sync]      (pare-feu ou box). Demande a l'hote de")
-                    print("[sync]      verifier que l'agent est bien lance chez lui.")
+                    print("[sync]   -> no answer: the port is filtered")
+                    print("[sync]      (firewall or router). Ask the host to")
+                    print("[sync]      check that the session is running.")
                 elif raison == 11001:
-                    print("[sync]   -> adresse introuvable : erreur de frappe ?")
-            print("[sync] nouvelle tentative dans 3 s (Ctrl+C pour arreter)")
+                    print("[sync]   -> address not found: typo?")
+            print("[sync] retrying in 3 s (Ctrl+C to stop)")
             time.sleep(3.0)
             continue
 
         poste = pair.get("poste", "?")
-        print(f"[sync] session ouverte avec {poste} (version {pair.get('version')})")
+        print(f"[sync] session open with {poste} (version {pair.get('version')})")
         gui_etat(plugin, f"PAIR {poste}")
-        gui_etat(plugin, f"Connecté à {poste} ({'hôte' if est_hote else 'invité'})")
+        gui_etat(plugin, f"Connected to {poste} ({'host' if est_hote else 'guest'})")
 
         # --- session -------------------------------------------------------
-        role_affiche = "hôte" if est_hote else "invité"
+        role_affiche = "host" if est_hote else "guest"
         annonces = ["ROLE " + ("hote" if est_hote else "invite"),
                     "ADRESSE " + (adresse if est_hote
                                   else (args.rejoindre or args.peer).strip()),
-                    f"PAIR {poste}", f"Connecté à {poste} ({role_affiche})"]
+                    f"PAIR {poste}", f"Connected to {poste} ({role_affiche})"]
         plugin.fin_veille()
         link = None
         try:
@@ -4683,8 +4861,8 @@ def main():
         except (PluginLost, OSError) as exc:
             # FL a ete ferme, ou l'effet a ete retire : on attend son retour
             # au lieu de demander a l'utilisateur de relancer l'agent.
-            print(f"[sync] FL a disparu ({exc})")
-            print("[sync] on attend le retour de l'effet FruityMulti Bridge...")
+            print(f"[sync] FL is gone ({exc})")
+            print("[sync] waiting for the FruityMulti Bridge effect to come back...")
             plugin.close()
             if link is not None:
                 link.alive = False
@@ -4699,7 +4877,7 @@ def main():
                     continue
                 try:
                     if plugin.ping():
-                        print("[sync] plugin retrouve")
+                        print("[sync] plugin found")
                         break
                 except (OSError, TimeoutError):
                     pass
@@ -4709,7 +4887,7 @@ def main():
             fermer_tout()
             return 1
         except Exception as exc:
-            print(f"[sync] session interrompue : {exc}")
+            print(f"[sync] session interrupted: {exc}")
 
         if link is not None:
             link.alive = False
@@ -4720,9 +4898,9 @@ def main():
 
         if args.once:
             break
-        print("[sync] on attend un nouveau pair")
-        gui_etat(plugin, "Pair parti : en attente" if est_hote
-                 else "Session perdue : reconnexion…")
+        print("[sync] waiting for a new connection")
+        gui_etat(plugin, "Guest left: waiting" if est_hote
+                 else "Session lost: reconnecting…")
         if not est_hote:
             time.sleep(2.0)
 

@@ -879,8 +879,8 @@ static void launchAgent (const char* arguments)
 	if (!agentPath (agent, sizeof (agent)))
 	{
 		MessageBoxA (g_barWnd,
-			"fm_agent.exe introuvable.\n\n"
-			"Lance une fois 1-Installer-plugin.bat : il place l'agent au bon endroit.",
+			"fm_agent.exe not found.\n\n"
+			"Run FruityMultiSetup.exe again.",
 			"FruityMulti", MB_OK | MB_ICONWARNING);
 		return;
 	}
@@ -894,7 +894,7 @@ static void launchAgent (const char* arguments)
 	info.nShow = SW_SHOWNORMAL;
 
 	if (!ShellExecuteExA (&info))
-		MessageBoxA (g_barWnd, "Impossible de lancer l'agent.",
+		MessageBoxA (g_barWnd, "Could not start the agent.",
 		             "FruityMulti", MB_OK | MB_ICONERROR);
 }
 
@@ -904,10 +904,10 @@ static void barMenu ()
 	GetCursorPos (&p);
 
 	HMENU menu = CreatePopupMenu ();
-	AppendMenuA (menu, MF_STRING, 1, "Heberger la session");
-	AppendMenuA (menu, MF_STRING, 2, "Rejoindre (adresse du presse-papier)");
+	AppendMenuA (menu, MF_STRING, 1, "Host a session");
+	AppendMenuA (menu, MF_STRING, 2, "Join (address from clipboard)");
 	AppendMenuA (menu, MF_SEPARATOR, 0, nullptr);
-	AppendMenuA (menu, MF_STRING, 3, "A propos");
+	AppendMenuA (menu, MF_STRING, 3, "About");
 
 	const int choix = (int)TrackPopupMenu (menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
 	                                       p.x, p.y, 0, g_barWnd, nullptr);
@@ -921,8 +921,8 @@ static void barMenu ()
 		if (adresse.empty ())
 		{
 			MessageBoxA (g_barWnd,
-				"Copie d'abord l'adresse de l'hote dans le presse-papier\n"
-				"(par exemple 203.0.113.10:50000, adresse d'exemple), puis reclique.",
+				"Copy the host's address first\n"
+				"(for example 203.0.113.10:50000), then click again.",
 				"FruityMulti", MB_OK | MB_ICONINFORMATION);
 			return;
 		}
@@ -932,9 +932,9 @@ static void barMenu ()
 	else if (choix == 3)
 		MessageBoxA (g_barWnd,
 			"FruityMulti\n\n"
-			"Session FL Studio partagee entre deux postes.\n"
-			"Heberger : ouvre la session et affiche l'adresse.\n"
-			"Rejoindre : lit l'adresse dans le presse-papier.",
+			"Shared FL Studio session between two PCs.\n"
+			"Host: opens the session and shows the address.\n"
+			"Join: reads the address from the clipboard.",
 			"FruityMulti", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -1336,7 +1336,7 @@ static std::string executeCommand (const std::string& line)
 	// dire, donc ce qui ne parle qu'a la fenetre reste permis.
 	if (InterlockedCompareExchange (&g_disabled, 0, 0) != 0
 	    && line.rfind ("STATE", 0) != 0 && line != "VERSION" && line != "CHOIX")
-		return "ERR version de FL non reconnue par le plugin";
+		return "ERR unsupported FL version";
 
 	if (line == "PING")
 		return "OK";
@@ -1381,7 +1381,7 @@ static std::string executeCommand (const std::string& line)
 	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
 	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 47-n";
+		return "VERSION 47-p";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -1400,13 +1400,13 @@ static std::string executeCommand (const std::string& line)
 			InterlockedExchange (&g_role, 0);
 
 		const int role = (int)InterlockedCompareExchange (&g_role, 0, 0);
-		const std::string nom = role == 2 ? "invite" : (role == 1 ? "hote" : "aucun");
+		const std::string nom = role == 2 ? "guest" : (role == 1 ? "host" : "none");
 
 		g_lockApplyAt = 0;      // application immediate, sans attendre la minuterie
 		fmApplyRoleLock ();
 
 		return "ROLE " + nom + " (" + std::to_string ((int)g_locked.size ())
-		     + " action(s) reservee(s) a l'hote)";
+		     + " host-only action(s))";
 	}
 
 	if (line == "REFRESH")
@@ -1426,18 +1426,18 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("PEEK ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		unsigned long long rva = 0;
 		int len = 64;
 		if (sscanf_s (line.c_str () + 5, "%llx %d", &rva, &len) < 1)
-			return "ERR syntaxe PEEK <rva_hex> [longueur]";
+			return "ERR syntax PEEK <rva_hex> [longueur]";
 		if (len < 1 || len > 1024)
 			return "ERR longueur 1..1024";
 
 		const unsigned char* p = (const unsigned char*)g_engine + (size_t)rva;
 		if (!isReadable (p, (size_t)len))
-			return "ERR zone illisible";
+			return "ERR unreadable area";
 
 		std::ostringstream out;
 		out << "PEEK " << (const void*)p << " " << len << " ";
@@ -1454,15 +1454,15 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("PEEKPTR ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		unsigned long long rva = 0;
 		if (sscanf_s (line.c_str () + 8, "%llx", &rva) != 1)
-			return "ERR syntaxe PEEKPTR <rva_hex>";
+			return "ERR syntax PEEKPTR <rva_hex>";
 
 		const unsigned char* slot = (const unsigned char*)g_engine + (size_t)rva;
 		if (!isReadable (slot, 8))
-			return "ERR zone illisible";
+			return "ERR unreadable area";
 
 		const unsigned char* cible = *(const unsigned char* const*)slot;
 		std::ostringstream out;
@@ -1493,7 +1493,7 @@ static std::string executeCommand (const std::string& line)
 	    || line.rfind ("RAWGET ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const bool isSet = (line.rfind ("RAWSET ", 0) == 0);
 		const bool isDispatch = (line.rfind ("RAWDISPATCH ", 0) == 0);
@@ -1508,7 +1508,7 @@ static std::string executeCommand (const std::string& line)
 		if (isSet || isDispatch)
 		{
 			if (lus < 3)
-				return "ERR syntaxe RAWSET|RAWDISPATCH <mode_hex> <handle_hex> <brut>";
+				return "ERR syntax RAWSET|RAWDISPATCH <mode_hex> <handle_hex> <brut>";
 
 			const unsigned long long debut = GetTickCount64 ();
 			unsigned long faute = 0;
@@ -1540,7 +1540,7 @@ static std::string executeCommand (const std::string& line)
 		}
 
 		if (lus < 2)
-			return "ERR syntaxe RAWGET <mode_hex> <handle_hex>";
+			return "ERR syntax RAWGET <mode_hex> <handle_hex>";
 
 		using GetFn = int (*) (long long, int, int);
 		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
@@ -1576,15 +1576,15 @@ static std::string executeCommand (const std::string& line)
 		// le chemin du projet : c'est un parametre transitoire de la commande
 		// d'enregistrement. On repond ERR pour que personne ne s'y fie.
 		// Utiliser SAVEPROJECT, qui ecrit a un chemin choisi par l'appelant.
-		return "ERR PROJECTPATH non fiable : utiliser SAVEPROJECT";
+		return "ERR PROJECTPATH unreliable: use SAVEPROJECT";
 
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const void* const* slot =
 			(const void* const*)((const unsigned char*)g_engine + 0x12BCA50);
 		if (!isReadable (slot, 8))
-			return "ERR chemin illisible";
+			return "ERR unreadable path";
 
 		const wchar_t* p = (const wchar_t*)*slot;
 		if (p == nullptr)
@@ -1628,11 +1628,11 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("SAVEPROJECT ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const std::string chemin = line.substr (12);
 		if (chemin.size () < 5 || chemin.size () > 380)
-			return "ERR syntaxe SAVEPROJECT <chemin absolu>";
+			return "ERR syntax SAVEPROJECT <chemin absolu>";
 
 		using ToDelphi = void* (*) (void*, const char*);
 		ToDelphi toDelphi = (ToDelphi)((unsigned char*)g_engine + 0x1C6E0);
@@ -1644,7 +1644,7 @@ static std::string executeCommand (const std::string& line)
 		void* chaine = nullptr;
 		toDelphi (&chaine, chemin.c_str ());
 		if (chaine == nullptr)
-			return "ERR chaine chemin";
+			return "ERR bad path string";
 
 		// globales de FL, relues a chaque appel
 		const unsigned long long projet =
@@ -1698,13 +1698,13 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("SAVEPROBESAVE ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		unsigned mode = 0;
 		int options = -1;
 		char chemin[400] = { 0 };
 		if (sscanf_s (line.c_str () + 14, "%x %d %399[^\n]", &mode, &options, chemin) < 3)
-			return "ERR syntaxe SAVEPROBESAVE <mode_hex> <options> <chemin>";
+			return "ERR syntax SAVEPROBESAVE <mode_hex> <options> <chemin>";
 
 		using ToDelphi = void* (*) (void*, const char*);
 		ToDelphi toDelphi = (ToDelphi)((unsigned char*)g_engine + 0x1C6E0);
@@ -1718,7 +1718,7 @@ static std::string executeCommand (const std::string& line)
 		void* chaine = nullptr;
 		toDelphi (&chaine, base.c_str ());
 		if (chaine == nullptr)
-			return "ERR chaine chemin";
+			return "ERR bad path string";
 
 		const unsigned long long projet =
 			*(const unsigned long long*)((const unsigned char*)g_engine + 0x12BCA60);
@@ -1750,11 +1750,11 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("LOADPROJECT ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const std::string chemin = line.substr (12);
 		if (chemin.size () < 5 || chemin.size () > 380)
-			return "ERR syntaxe LOADPROJECT <chemin .flp absolu>";
+			return "ERR syntax LOADPROJECT <chemin .flp absolu>";
 
 		// On ne charge PAS ici : le projet remplace decharge ce plugin, donc
 		// revenir dans cette fonction apres coup revient dans du code libere.
@@ -1787,7 +1787,7 @@ static std::string executeCommand (const std::string& line)
 	if (line == "PATTERNS")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		int n = 0;
 		std::ostringstream detail;
@@ -1819,17 +1819,17 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("PATTERNNAME ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		int pattern = 0;
 		if (sscanf_s (line.c_str () + 12, "%d", &pattern) != 1
 		    || pattern < 1 || pattern > 999)
-			return "ERR syntaxe PATTERNNAME <motif>";
+			return "ERR syntax PATTERNNAME <motif>";
 
 		const unsigned char* rec =
 			(const unsigned char*)g_engine + 0x153FCE0 + (size_t)pattern * 0xC0;
 		if (!isReadable (rec, 0xC0))
-			return "ERR motif hors table";
+			return "ERR pattern out of range";
 
 		const wchar_t* nom = *(const wchar_t* const*)rec;
 		if (nom == nullptr)
@@ -1866,14 +1866,14 @@ static std::string executeCommand (const std::string& line)
 			: (int)strtol (line.c_str () + 6, nullptr, 10);
 		unsigned char* list = noteList (pattern);
 		if (list == nullptr)
-			return "ERR pas de liste de notes pour le motif " + std::to_string (pattern);
+			return "ERR no note list for pattern " + std::to_string (pattern);
 
 		const int count = *(const int*)(list + 0x14);
 		const unsigned char* data = *(const unsigned char* const*)(list + 0x08);
 		if (count < 0 || count > 100000)
-			return "ERR nombre de notes inattendu";
+			return "ERR unexpected note count";
 		if (count > 0 && !isReadable (data, (size_t)count * 24))
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 
 		std::ostringstream out;
 		out << "NOTES " << pattern << " " << count << "\n";
@@ -1894,19 +1894,19 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("ADD ", 0) == 0)
 	{
 		if (g_engine == nullptr || g_insertFn == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (4));
 		unsigned channel = 0, time = 0, len = 48, pitch = 60, vel = 100;
 		if (!(ss >> channel >> time >> len >> pitch))
-			return "ERR syntaxe ADD <canal> <temps> <duree> <hauteur> [vel]";
+			return "ERR syntax ADD <canal> <temps> <duree> <hauteur> [vel]";
 		if (!(ss >> vel))
 			vel = 100;
 
 		const int pattern = currentPattern ();
 		unsigned char* list = noteList (pattern);
 		if (list == nullptr)
-			return "ERR pas de liste de notes";
+			return "ERR no note list";
 
 		unsigned char note[24];
 		fillNote (note, channel, time, len, pitch, vel);
@@ -1929,25 +1929,25 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("DEL ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (4));
 		unsigned channel = 0, at = 0, pitch = 0;
 		if (!(ss >> channel >> at >> pitch))
-			return "ERR syntaxe DEL <canal> <temps> <hauteur>";
+			return "ERR syntax DEL <canal> <temps> <hauteur>";
 
 		const int pattern = currentPattern ();
 		unsigned char* list = noteList (pattern);
 		if (list == nullptr)
-			return "ERR pas de liste de notes";
+			return "ERR no note list";
 
 		const int count = *(int*)(list + 0x14);
 		if (count <= 0)
-			return "ERR liste vide";
+			return "ERR empty list";
 
 		unsigned char* data = *(unsigned char**)(list + 0x08);
 		if (!isReadable (data, (size_t)count * 24))
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 
 		int found = -1;
 		for (int k = 0; k < count; k++)
@@ -1962,7 +1962,7 @@ static std::string executeCommand (const std::string& line)
 			}
 		}
 		if (found < 0)
-			return "ERR note introuvable";
+			return "ERR note not found";
 
 		memmove (data + (size_t)found * 24,
 		         data + (size_t)(found + 1) * 24,
@@ -1981,26 +1981,26 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("ADDX ", 0) == 0)
 	{
 		if (g_engine == nullptr || g_insertFn == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (5));
 		unsigned channel = 0, count = 0;
 		if (!(ss >> channel >> count))
-			return "ERR syntaxe ADDX <canal> <nombre> <t:l:p:v>...";
+			return "ERR syntax ADDX <canal> <nombre> <t:l:p:v>...";
 
 		const int total = channelCount ();
 		if (total >= 0 && (int)channel >= total)
 		{
 			std::ostringstream err;
-			err << "ERR canal " << channel << " hors du rack (" << total
-			    << " canal(aux) sur ce poste)";
+			err << "ERR channel " << channel << " outside the rack (" << total
+			    << " channel(s) on this PC)";
 			return err.str ();
 		}
 
 		const int pattern = currentPattern ();
 		unsigned char* list = noteList (pattern);
 		if (list == nullptr)
-			return "ERR pas de liste de notes";
+			return "ERR no note list";
 
 		using InsertFn = int (*) (void*, void*);
 		InsertFn fn = (InsertFn)g_insertFn;
@@ -2048,25 +2048,25 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("ADDXTO ", 0) == 0)
 	{
 		if (g_engine == nullptr || g_insertFn == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (7));
 		unsigned channel = 0, pattern = 0, count = 0;
 		if (!(ss >> channel >> pattern >> count))
-			return "ERR syntaxe ADDXTO <canal> <motif> <nombre> <t:l:p:v>...";
+			return "ERR syntax ADDXTO <canal> <motif> <nombre> <t:l:p:v>...";
 
 		const int total = channelCount ();
 		if (total >= 0 && (int)channel >= total)
 		{
 			std::ostringstream err;
-			err << "ERR canal " << channel << " hors du rack (" << total
-			    << " canal(aux) sur ce poste)";
+			err << "ERR channel " << channel << " outside the rack (" << total
+			    << " channel(s) on this PC)";
 			return err.str ();
 		}
 
 		unsigned char* list = noteList ((int)pattern);
 		if (list == nullptr)
-			return "ERR motif " + std::to_string (pattern) + " absent";
+			return "ERR pattern " + std::to_string (pattern) + " missing";
 
 		using InsertFn = int (*) (void*, void*);
 		InsertFn fn = (InsertFn)g_insertFn;
@@ -2103,24 +2103,24 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("DELX ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (5));
 		unsigned channel = 0, count = 0;
 		if (!(ss >> channel >> count))
-			return "ERR syntaxe DELX <canal> <nombre> <t:p>...";
+			return "ERR syntax DELX <canal> <nombre> <t:p>...";
 
 		const int pattern = currentPattern ();
 		unsigned char* list = noteList (pattern);
 		if (list == nullptr)
-			return "ERR pas de liste de notes";
+			return "ERR no note list";
 
 		int total = *(int*)(list + 0x14);
 		if (total <= 0)
-			return "ERR liste vide";
+			return "ERR empty list";
 		unsigned char* data = *(unsigned char**)(list + 0x08);
 		if (!isReadable (data, (size_t)total * 24))
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 
 		std::vector<std::pair<unsigned, unsigned>> targets;
 		std::string token;
@@ -2169,24 +2169,24 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("CLIPSETLEN ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (11));
 		unsigned pos = 0, len = 0;
 		if (!(ss >> pos >> len))
-			return "ERR syntaxe CLIPSETLEN <position> <longueur> [piste] [motif]";
+			return "ERR syntax CLIPSETLEN <position> <longueur> [piste] [motif]";
 		int wantTrack = -1, wantPat = -1;
 		ss >> wantTrack;
 		ss >> wantPat;
 
 		unsigned char* c = getClipContainer ();
 		if (c == nullptr)
-			return "ERR conteneur de clips introuvable";
+			return "ERR clip list not found";
 
 		const int count = *(int*)(c + 0x14);
 		unsigned char* data = *(unsigned char**)(c + 0x08);
 		if (count <= 0 || !isReadable (data, (size_t)count * 0x58))
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 
 		for (int k = 0; k < count; k++)
 		{
@@ -2205,18 +2205,18 @@ static std::string executeCommand (const std::string& line)
 			requestRefresh ();
 			return "CLIPLEN " + std::to_string (pos) + " " + std::to_string (len);
 		}
-		return "ERR clip introuvable";
+		return "ERR clip not found";
 	}
 
 	// Vide la playlist : CLIPCLEAR
 	if (line == "CLIPCLEAR")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		unsigned char* c = getClipContainer ();
 		if (c == nullptr)
-			return "ERR conteneur de clips introuvable";
+			return "ERR clip list not found";
 
 		const int count = *(int*)(c + 0x14);
 		*(int*)(c + 0x14) = 0;
@@ -2231,17 +2231,17 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("CLEAR ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (6));
 		unsigned channel = 0;
 		if (!(ss >> channel))
-			return "ERR syntaxe CLEAR <canal>";
+			return "ERR syntax CLEAR <canal>";
 
 		const int pattern = currentPattern ();
 		unsigned char* list = noteList (pattern);
 		if (list == nullptr)
-			return "ERR pas de liste de notes";
+			return "ERR no note list";
 
 		int total = *(int*)(list + 0x14);
 		if (total <= 0)
@@ -2249,7 +2249,7 @@ static std::string executeCommand (const std::string& line)
 
 		unsigned char* data = *(unsigned char**)(list + 0x08);
 		if (!isReadable (data, (size_t)total * 24))
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 
 		int kept = 0;
 		for (int k = 0; k < total; k++)
@@ -2277,16 +2277,16 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("CLEARTO ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (8));
 		unsigned channel = 0, pattern = 0;
 		if (!(ss >> channel >> pattern))
-			return "ERR syntaxe CLEARTO <canal> <motif>";
+			return "ERR syntax CLEARTO <canal> <motif>";
 
 		unsigned char* list = noteList ((int)pattern);
 		if (list == nullptr)
-			return "ERR motif " + std::to_string (pattern) + " absent";
+			return "ERR pattern " + std::to_string (pattern) + " missing";
 
 		const int total = *(int*)(list + 0x14);
 		if (total <= 0)
@@ -2295,7 +2295,7 @@ static std::string executeCommand (const std::string& line)
 
 		unsigned char* data = *(unsigned char**)(list + 0x08);
 		if (!isReadable (data, (size_t)total * 24))
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 
 		int kept = 0;
 		for (int k = 0; k < total; k++)
@@ -2319,23 +2319,23 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("DELXTO ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (7));
 		unsigned channel = 0, pattern = 0, count = 0;
 		if (!(ss >> channel >> pattern >> count))
-			return "ERR syntaxe DELXTO <canal> <motif> <nombre> <t:p>...";
+			return "ERR syntax DELXTO <canal> <motif> <nombre> <t:p>...";
 
 		unsigned char* list = noteList ((int)pattern);
 		if (list == nullptr)
-			return "ERR motif " + std::to_string (pattern) + " absent";
+			return "ERR pattern " + std::to_string (pattern) + " missing";
 
 		int total = *(int*)(list + 0x14);
 		if (total <= 0)
-			return "ERR liste vide";
+			return "ERR empty list";
 		unsigned char* data = *(unsigned char**)(list + 0x08);
 		if (!isReadable (data, (size_t)total * 24))
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 
 		std::vector<std::pair<unsigned, unsigned>> targets;
 		std::string token;
@@ -2384,7 +2384,7 @@ static std::string executeCommand (const std::string& line)
 	if (line == "TEMPO")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		const unsigned char* t = (const unsigned char*)g_engine + 0x11D8930;
 		std::ostringstream out;
 		out << "TEMPO " << *(const int*)(t + 0x00)
@@ -2397,15 +2397,15 @@ static std::string executeCommand (const std::string& line)
 	{
 		// Autorite : ces actions touchent le PROJET, qui appartient a l'hote.
 		if (roleBloque ())
-			return "ERR action reservee a l'hote";
+			return "ERR host-only action";
 
 
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		double bpm = atof (line.c_str () + 6);
 		if (bpm < 20.0 || bpm > 999.0)
-			return "ERR tempo hors plage (20..999)";
+			return "ERR tempo out of range (20..999)";
 
 		unsigned char* t = (unsigned char*)g_engine + 0x11D8930;
 		const int milli = (int)(bpm * 1000.0 + 0.5);
@@ -2428,26 +2428,26 @@ static std::string executeCommand (const std::string& line)
 	if (line == "SONGMODE" || line.rfind ("SONGMODE ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		unsigned char* base = (unsigned char*)g_engine;
 		const int* mode = *(const int* const*)(base + 0x11E0EF0);
 		if (!isReadable (mode, 4))
-			return "ERR mode illisible";
+			return "ERR unreadable mode";
 		if (line == "SONGMODE")
 			return "SONGMODE " + std::to_string (*mode);
 
 		if (roleBloque ())
-			return "ERR action reservee a l'hote";
+			return "ERR host-only action";
 
 		int voulu = -1;
 		if (sscanf_s (line.c_str () + 9, "%d", &voulu) != 1 || voulu < 0 || voulu > 1)
-			return "ERR syntaxe SONGMODE <0|1>";
+			return "ERR syntax SONGMODE <0|1>";
 		if (*mode != voulu)
 		{
 			const unsigned long faute = guardedToggleLoopMode (base);
 			if (faute != 0)
-				return "ERR SONGMODE faute " + std::to_string (faute);
+				return "ERR SONGMODE fault " + std::to_string (faute);
 		}
 		return "SONGMODE OK " + std::to_string (voulu);
 	}
@@ -2456,11 +2456,11 @@ static std::string executeCommand (const std::string& line)
 	{
 		// Autorite : ces actions touchent le PROJET, qui appartient a l'hote.
 		if (roleBloque ())
-			return "ERR action reservee a l'hote";
+			return "ERR host-only action";
 
 
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		// FUN_011CA520(int mode, byte flags) â€” vraie fonction de transport.
 		// mode 1 = lecture, mode 0 = arret.
@@ -2480,13 +2480,13 @@ static std::string executeCommand (const std::string& line)
 	if (line == "ISPLAYING")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		// 0x11E09F8 contient un POINTEUR vers l'etat, pas l'etat lui-meme.
 		// (Piege PTR_DAT de Ghidra : rencontrer trois fois ce soir.)
 		const int* slot = *(const int* const*)((const unsigned char*)g_engine + 0x11E09F8);
 		if (slot == nullptr || !isReadable (slot, sizeof (int)))
-			return "ERR etat illisible";
+			return "ERR unreadable state";
 
 		return std::string ("PLAYING ") + (*slot != 0 ? "1" : "0");
 	}
@@ -2494,7 +2494,7 @@ static std::string executeCommand (const std::string& line)
 	if (line == "PATTERN")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		// DAT_015d51a0 : numero du pattern courant (global direct, pas un pointeur)
 		const int current = *(const int*)((const unsigned char*)g_engine + 0x11D51A0);
 		return std::string ("PATTERN ") + std::to_string (current);
@@ -2504,15 +2504,15 @@ static std::string executeCommand (const std::string& line)
 	{
 		// Autorite : ces actions touchent le PROJET, qui appartient a l'hote.
 		if (roleBloque ())
-			return "ERR action reservee a l'hote";
+			return "ERR host-only action";
 
 
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		int wanted = atoi (line.c_str () + 8);
 		if (wanted < 1 || wanted > 999)
-			return "ERR pattern hors plage (1..999)";
+			return "ERR pattern out of range (1..999)";
 
 		// FUN_012D8B30(int) : c'est la fonction que FL appelle quand on
 		// selectionne un pattern. Elle prend un simple entier.
@@ -2553,7 +2553,7 @@ static std::string executeCommand (const std::string& line)
 		std::istringstream ss (line.substr (8));
 		int fx = 0, fy = 0;
 		if (!(ss >> fx >> fy))
-			return "ERR syntaxe CURSORF <x 0..1000> <y 0..1000> [etiquette]";
+			return "ERR syntax CURSORF <x 0..1000> <y 0..1000> [etiquette]";
 
 		std::string label;
 		std::getline (ss, label);
@@ -2563,11 +2563,11 @@ static std::string executeCommand (const std::string& line)
 			label = label.substr (0, 48);
 
 		if (g_cursorWnd == nullptr || g_flWindow == nullptr)
-			return "ERR fenetre curseur indisponible";
+			return "ERR cursor window unavailable";
 
 		RECT rc;
 		if (!GetClientRect (g_flWindow, &rc) || rc.right <= 0 || rc.bottom <= 0)
-			return "ERR fenetre FL indisponible";
+			return "ERR FL window unavailable";
 
 		const int x = (int)((long long)fx * rc.right / 1000);
 		const int y = (int)((long long)fy * rc.bottom / 1000);
@@ -2594,7 +2594,7 @@ static std::string executeCommand (const std::string& line)
 		std::istringstream ss (line.substr (7));
 		int x = 0, y = 0;
 		if (!(ss >> x >> y))
-			return "ERR syntaxe CURSOR <x> <y> [etiquette]";
+			return "ERR syntax CURSOR <x> <y> [etiquette]";
 
 		std::string label;
 		std::getline (ss, label);
@@ -2604,7 +2604,7 @@ static std::string executeCommand (const std::string& line)
 			label = label.substr (0, 48);
 
 		if (g_cursorWnd == nullptr || g_flWindow == nullptr)
-			return "ERR fenetre curseur indisponible";
+			return "ERR cursor window unavailable";
 
 		if (!label.empty ())
 			strncpy_s (g_remoteLabel, label.c_str (), _TRUNCATE);
@@ -2637,12 +2637,12 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("TRACKVOL ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (9));
 		int track = 0;
 		if (!(ss >> track) || track < 0 || track > 125)
-			return "ERR syntaxe TRACKVOL <piste 0..125> [valeur 0..1]";
+			return "ERR syntax TRACKVOL <piste 0..125> [valeur 0..1]";
 
 		const long long handle = ((long long)track * 0x40) * 0x10000LL + 0x70001FC0LL;
 
@@ -2673,12 +2673,12 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("TRACKPAN ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (9));
 		int track = 0;
 		if (!(ss >> track) || track < 0 || track > 125)
-			return "ERR syntaxe TRACKPAN <piste> [pan -1..1]";
+			return "ERR syntax TRACKPAN <piste> [pan -1..1]";
 
 		const long long handle = ((long long)track * 0x40) * 0x10000LL + 0x70001FC1LL;
 
@@ -2710,12 +2710,12 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("TRACKMUTE ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (10));
 		int track = 0;
 		if (!(ss >> track) || track < 0 || track > 125)
-			return "ERR syntaxe TRACKMUTE <piste> [1=muet 0=actif]";
+			return "ERR syntax TRACKMUTE <piste> [1=muet 0=actif]";
 
 		int wanted = -1;
 		if (ss >> wanted)
@@ -2745,12 +2745,12 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("TRACKSTEREO ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (12));
 		int track = 0;
 		if (!(ss >> track) || track < 0 || track > 125)
-			return "ERR syntaxe TRACKSTEREO <piste> [-1..1]";
+			return "ERR syntax TRACKSTEREO <piste> [-1..1]";
 
 		const long long handle = ((long long)track * 0x40) * 0x10000LL + 0x70001FC2LL;
 
@@ -2782,14 +2782,14 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("PARAM ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (6));
 		int track = 0, slot = 0, index = 0;
 		if (!(ss >> track >> slot >> index))
-			return "ERR syntaxe PARAM <piste> <slot> <index> [0..1]";
+			return "ERR syntax PARAM <piste> <slot> <index> [0..1]";
 		if (track < 0 || track > 125 || slot < 0 || slot > 9 || index < 0 || index > 0x7FFF)
-			return "ERR plage invalide";
+			return "ERR invalid range";
 
 		const long long handle =
 			((long long)track * 0x40 + slot) * 0x10000LL + (long long)index + 0x70008000LL;
@@ -2823,15 +2823,15 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("PARAMRAW ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (9));
 		int track = 0, slot = 0, index = 0;
 		long long raw = 0;
 		if (!(ss >> track >> slot >> index >> raw))
-			return "ERR syntaxe PARAMRAW <piste> <slot> <index> <brut>";
+			return "ERR syntax PARAMRAW <piste> <slot> <index> <brut>";
 		if (track < 0 || track > 125 || slot < 0 || slot > 9 || index < 0 || index > 0x7FFF)
-			return "ERR plage invalide";
+			return "ERR invalid range";
 
 		const long long handle =
 			((long long)track * 0x40 + slot) * 0x10000LL + (long long)index + 0x70008000LL;
@@ -2856,11 +2856,11 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("RECGET ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		std::istringstream ss (line.substr (7));
 		int track = -1, slot = -1;
 		if (!(ss >> track >> slot) || track < 0 || track > FM_MIX_MAX || slot < 0 || slot > 9)
-			return "ERR syntaxe RECGET <piste> <slot> <decalage>...";
+			return "ERR syntax RECGET <piste> <slot> <decalage>...";
 		using GetFn = int (*) (long long, int, int);
 		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
 		const long long base = ((long long)track * 0x40 + slot) * 0x10000LL + 0x70000000LL;
@@ -2877,14 +2877,14 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("RECSET ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		std::istringstream ss (line.substr (7));
 		int track = -1, slot = -1;
 		std::string mot;
 		long long brut = 0;
 		if (!(ss >> track >> slot >> mot >> brut) || track < 0 || track > FM_MIX_MAX
 		    || slot < 0 || slot > 9)
-			return "ERR syntaxe RECSET <piste> <slot> <decalage> <brut>";
+			return "ERR syntax RECSET <piste> <slot> <decalage> <brut>";
 		const long long handle = ((long long)track * 0x40 + slot) * 0x10000LL + 0x70000000LL
 		                         + std::stoll (mot, nullptr, 16);
 		// FUN_01051d60, comme mixer.setPluginMuteState : le dernier argument
@@ -2901,7 +2901,7 @@ static std::string executeCommand (const std::string& line)
 	if (line == "MIXFULL")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		unsigned char* moteur = (unsigned char*)g_engine;
 		using GetFn = int (*) (long long, int, int);
 		GetFn getter = (GetFn)(moteur + 0xC51340);
@@ -2949,16 +2949,16 @@ static std::string executeCommand (const std::string& line)
 	if (line == "MIXCOUNT" || line.rfind ("MIXCOUNT ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		unsigned char* moteur = (unsigned char*)g_engine;
 		int voulu = -1;
 		if (line.size () > 9)
 		{
 			if (sscanf_s (line.c_str () + 9, "%d", &voulu) != 1 || voulu < 2 || voulu > FM_MIX_MAX + 1)
-				return "ERR syntaxe MIXCOUNT [compte]";
+				return "ERR syntax MIXCOUNT [compte]";
 			void** routage = *(void***)(moteur + 0x11E22D8);
 			if (!isReadable (routage, 8) || *routage == nullptr)
-				return "ERR routage illisible";
+				return "ERR unreadable routing";
 			((void (*) (int))(moteur + 0xE7CEE0)) (voulu);
 			((void (*) (void*, unsigned char))(moteur + 0xE9E890)) (*routage, 4);
 			requestRefresh ();
@@ -2970,7 +2970,7 @@ static std::string executeCommand (const std::string& line)
 	if (line == "ROUTES")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		std::ostringstream corps;
 		int n = 0;
 		for (int s_ = 0; s_ <= derniereTranche (); s_++)
@@ -2994,35 +2994,35 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("ROUTESET ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		int source = -1, cible = -1, actif = -1, niveau = -1;
 		if (sscanf_s (line.c_str () + 9, "%d %d %d %d", &source, &cible, &actif, &niveau) != 4
 		    || cible < 0 || cible > FM_MIX_MAX || mixerTrack (source) == nullptr)
-			return "ERR syntaxe ROUTESET <source> <cible> <actif> <niveau>";
+			return "ERR syntax ROUTESET <source> <cible> <actif> <niveau>";
 		unsigned char* moteur = (unsigned char*)g_engine;
 		void** global = *(void***)(moteur + 0x11E22D8);
 		if (!isReadable (global, 8) || *global == nullptr)
-			return "ERR routage illisible";
+			return "ERR unreadable routing";
 		const unsigned long faute = guardedRouteSet (moteur, *global, source, cible, actif,
 		                                             niveau, mixerTrack (source));
-		return faute != 0 ? "ERR faute routage" : "ROUTESET OK";
+		return faute != 0 ? "ERR routing fault" : "ROUTESET OK";
 	}
 
 	// Boutons d'une tranche : TRACKFLAG <piste> <polarite|inversion|slots> <0|1>
 	if (line.rfind ("TRACKFLAG ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		std::istringstream ss (line.substr (10));
 		int track = -1, valeur = 0;
 		std::string nom;
 		if (!(ss >> track >> nom >> valeur) || mixerTrack (track) == nullptr)
-			return "ERR syntaxe TRACKFLAG <piste> <nom> <0|1>";
+			return "ERR syntax TRACKFLAG <piste> <nom> <0|1>";
 		size_t rva = 0;
 		if (nom == "polarite") rva = 0xE7C460;
 		else if (nom == "inversion") rva = 0xE7C550;
 		else if (nom == "slots") rva = 0xE7C3E0;
-		else return "ERR drapeau inconnu";
+		else return "ERR unknown flag";
 		((void (*) (int, unsigned char))((unsigned char*)g_engine + rva)) (track, valeur != 0 ? 1 : 0);
 		return "TRACKFLAG OK";
 	}
@@ -3031,7 +3031,7 @@ static std::string executeCommand (const std::string& line)
 	if (line == "TRACKNAMES")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		using CouleurFn = unsigned (*) (void*);
 		CouleurFn couleur = (CouleurFn)((unsigned char*)g_engine + 0xEC1930);
 		std::ostringstream corps;
@@ -3053,10 +3053,10 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("TRACKNAME ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		int track = -1, lu = 0;
 		if (sscanf_s (line.c_str () + 10, "%d %n", &track, &lu) != 1 || mixerTrack (track) == nullptr)
-			return "ERR syntaxe TRACKNAME <piste> <nom>";
+			return "ERR syntax TRACKNAME <piste> <nom>";
 		using ToDelphi = void* (*) (void*, const char*);
 		void* nom = nullptr;
 		((ToDelphi)((unsigned char*)g_engine + 0x1C6E0)) (&nom, line.c_str () + 10 + lu);
@@ -3067,11 +3067,11 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("TRACKCOLOR ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		int track = -1;
 		unsigned valeur = 0;
 		if (sscanf_s (line.c_str () + 11, "%d %u", &track, &valeur) != 2 || mixerTrack (track) == nullptr)
-			return "ERR syntaxe TRACKCOLOR <piste> <couleur>";
+			return "ERR syntax TRACKCOLOR <piste> <couleur>";
 		((void (*) (void*, unsigned))((unsigned char*)g_engine + 0xEC17E0)) (mixerTrack (track), valeur);
 		((void (*) (int, int))((unsigned char*)g_engine + 0x7D68E0)) (0x18, 0);
 		return "TRACKCOLOR OK";
@@ -3081,13 +3081,13 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("FXSAVE ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		int track = -1, slot = -1, lu = 0;
 		if (sscanf_s (line.c_str () + 7, "%d %d %n", &track, &slot, &lu) != 2 || lu == 0)
-			return "ERR syntaxe FXSAVE <piste> <slot> <chemin>";
+			return "ERR syntax FXSAVE <piste> <slot> <chemin>";
 		unsigned char* objet = mixerSlot (track, slot);
 		if (objet == nullptr)
-			return "ERR slot introuvable";
+			return "ERR slot not found";
 		unsigned char* base = (unsigned char*)g_engine;
 		using ToDelphi = void* (*) (void*, const char*);
 		void* chemin = nullptr;
@@ -3095,7 +3095,7 @@ static std::string executeCommand (const std::string& line)
 		unsigned long faute = 0;
 		const int rc = guardedSaveEffect ((ChannelFileFn)(base + 0xB54570), chemin, objet, &faute);
 		if (faute != 0)
-			return "ERR FXSAVE faute";
+			return "ERR FXSAVE fault";
 		return "FXSAVE OK " + std::to_string (rc);
 	}
 
@@ -3103,17 +3103,17 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("FXLOAD ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		int track = -1, slot = -1, lu = 0;
 		if (sscanf_s (line.c_str () + 7, "%d %d %n", &track, &slot, &lu) != 2 || lu == 0)
-			return "ERR syntaxe FXLOAD <piste> <slot> [chemin]";
+			return "ERR syntax FXLOAD <piste> <slot> [chemin]";
 		unsigned char* objet = mixerSlot (track, slot);
 		if (objet == nullptr || slot > 9)
-			return "ERR slot introuvable";
+			return "ERR slot not found";
 		unsigned char* base = (unsigned char*)g_engine;
 		void** global = *(void***)(base + 0x11E1C78);
 		if (!isReadable (global, 8) || *global == nullptr)
-			return "ERR historique illisible";
+			return "ERR unreadable history";
 
 		using ToDelphi = void* (*) (void*, const char*);
 		ToDelphi toDelphi = (ToDelphi)(base + 0x1C6E0);
@@ -3125,7 +3125,7 @@ static std::string executeCommand (const std::string& line)
 			void* dossier = nullptr;
 			unsigned char** globalFl = *(unsigned char***)(base + 0x11E4790);
 			if (!isReadable (globalFl, 8) || !isReadable (*globalFl + 0x30, 8))
-				return "ERR dossier des presets illisible";
+				return "ERR unreadable preset folder";
 			void* usine = *(void**)(*globalFl + 0x30);
 			((void (*) (void*, void**, int, int))(base + 0x35B410)) (usine, &dossier, 0x401, 1);
 			fichier = utf8Texte ((const unsigned short*)dossier) + "(delete) effect.fst";
@@ -3138,7 +3138,7 @@ static std::string executeCommand (const std::string& line)
 			(EtapeSlotFn)(base + (retrait ? 0xC19570 : 0xC187D0)), *global, nomEtape,
 			track, slot, objet, chemin);
 		if (faute != 0)
-			return "ERR FXLOAD faute";
+			return "ERR FXLOAD fault";
 		requestRefresh ();
 		return "FXLOAD OK " + slotName (objet);
 	}
@@ -3147,7 +3147,7 @@ static std::string executeCommand (const std::string& line)
 	if (line == "CLIPS")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const unsigned long long cls =
 			(unsigned long long)((unsigned char*)g_engine + 0xC54168);
@@ -3207,12 +3207,12 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("CLIPADD ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (8));
 		unsigned pos = 0, len = 384;
 		if (!(ss >> pos))
-			return "ERR syntaxe CLIPADD <position> <longueur> [motif]";
+			return "ERR syntax CLIPADD <position> <longueur> [motif]";
 		ss >> len;
 		int motif = -1;
 		ss >> motif;
@@ -3221,18 +3221,18 @@ static std::string executeCommand (const std::string& line)
 
 		unsigned char* best = getClipContainer ();
 		if (best == nullptr)
-			return "ERR conteneur de clips introuvable";
+			return "ERR clip list not found";
 		if (g_insertFn == nullptr)
-			return "ERR fonction d'insertion indisponible";
+			return "ERR insert function unavailable";
 
 		const int count = *(int*)(best + 0x14);
 		const int capacity = *(int*)(best + 0x18);
 		unsigned char* data = *(unsigned char**)(best + 0x08);
 
 		if (count > 0 && !isReadable (data, (size_t)count * 0x58))
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 		if (count > 0 && data == nullptr)
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 
 		unsigned char record[0x58];
 		if (count > 0)
@@ -3298,28 +3298,28 @@ static std::string executeCommand (const std::string& line)
 	if (line.rfind ("CLIPADDTO ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (10));
 		std::string addrText;
 		unsigned pos = 0, len = 384;
 		if (!(ss >> addrText >> pos))
-			return "ERR syntaxe CLIPADDTO <adresse> <position> <longueur>";
+			return "ERR syntax CLIPADDTO <adresse> <position> <longueur>";
 		ss >> len;
 
 		unsigned long long addrValue = strtoull (addrText.c_str (), nullptr, 16);
 		unsigned char* c = (unsigned char*)(uintptr_t)addrValue;
 		if (!isReadable (c, 0x20))
-			return "ERR adresse invalide";
+			return "ERR invalid address";
 
 		const int count = *(int*)(c + 0x14);
 		const int capacity = *(int*)(c + 0x18);
 		unsigned char* data = *(unsigned char**)(c + 0x08);
 
 		if (count <= 0 || count >= capacity)
-			return "ERR conteneur vide ou plein";
+			return "ERR container empty or full";
 		if (!isReadable (data, (size_t)(count + 1) * 0x58))
-			return "ERR donnees illisibles";
+			return "ERR unreadable data";
 
 		unsigned char record[0x58];
 		memcpy (record, data, 0x58);
@@ -3342,12 +3342,12 @@ static std::string executeCommand (const std::string& line)
 	if (line == "CLIPLIST")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 unsigned char* best = getClipContainer ();
 
 		if (best == nullptr)
-			return "ERR conteneur de clips introuvable";
+			return "ERR clip list not found";
 
 		const int count = *(int*)(best + 0x14);
 		const unsigned char* data = *(const unsigned char* const*)(best + 0x08);
@@ -3369,12 +3369,12 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("CLIPDEL ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (8));
 		unsigned pos = 0;
 		if (!(ss >> pos))
-			return "ERR syntaxe CLIPDEL <position> [piste] [motif]";
+			return "ERR syntax CLIPDEL <position> [piste] [motif]";
 		int wantTrack = -1, wantPat = -1;
 		ss >> wantTrack;
 		ss >> wantPat;
@@ -3382,12 +3382,12 @@ unsigned char* best = getClipContainer ();
 unsigned char* best = getClipContainer ();
 
 		if (best == nullptr)
-			return "ERR conteneur de clips introuvable";
+			return "ERR clip list not found";
 
 		const int count = *(int*)(best + 0x14);
 		unsigned char* data = *(unsigned char**)(best + 0x08);
 		if (count <= 0)
-			return "ERR aucun clip";
+			return "ERR no clip";
 
 		int found = -1;
 		for (int k = 0; k < count; k++)
@@ -3405,7 +3405,7 @@ unsigned char* best = getClipContainer ();
 			break;
 		}
 		if (found < 0)
-			return "ERR clip introuvable a cette position";
+			return "ERR no clip at this position";
 
 		// on decale la fin du tableau vers la gauche
 		if (found < count - 1)
@@ -3427,13 +3427,13 @@ unsigned char* best = getClipContainer ();
 	if (line == "FOCUS")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		unsigned char* const* table = *(unsigned char* const* const*)((unsigned char*)g_engine + 0x11E4790);
 		if (!isReadable (table, 8) || !isReadable (*table + 0x54, 8))
-			return "ERR fenetres illisibles";
+			return "ERR unreadable windows";
 		void* fenetres = *(void**)(*table + 0x54);
 		if (!isReadable (fenetres, 8))
-			return "ERR fenetres illisibles";
+			return "ERR unreadable windows";
 		void** vt = *(void***)fenetres;
 		return "FOCUS " + std::to_string (((int (*) (void*))vt[3]) (fenetres));
 	}
@@ -3444,20 +3444,20 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("PARAMDIFF ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		std::istringstream ss (line.substr (10));
 		int track = 0, slot = 0, neuf = 0;
 		if (!(ss >> track >> slot))
-			return "ERR syntaxe PARAMDIFF <piste> <slot> [neuf]";
+			return "ERR syntax PARAMDIFF <piste> <slot> [neuf]";
 		ss >> neuf;
 		if (track < 0 || track > 125 || slot < 0 || slot > 9)
-			return "ERR plage invalide";
+			return "ERR invalid range";
 		unsigned char* objet = mixerSlot (track, slot);
 		if (objet == nullptr || !isReadable (objet + 0x68, 4))
-			return "ERR slot vide";
+			return "ERR empty slot";
 		const int nombre = *(const int*)(objet + 0x68);
 		if (nombre < 0 || nombre > 0x7FFF)
-			return "ERR nombre de parametres illisible";
+			return "ERR unreadable parameter count";
 
 		return paramsBouges ("PARAMDIFF " + std::to_string (track) + " " + std::to_string (slot),
 		                     track * 16 + slot,
@@ -3470,14 +3470,14 @@ unsigned char* best = getClipContainer ();
 		std::istringstream ss (line.substr (12));
 		int canal = -1, neuf = 0;
 		if (!(ss >> canal))
-			return "ERR syntaxe CHPARAMDIFF <canal> [neuf]";
+			return "ERR syntax CHPARAMDIFF <canal> [neuf]";
 		ss >> neuf;
 		unsigned char* objet = canalPlugin (canal);
 		if (objet == nullptr)
-			return "ERR pas de plugin";
+			return "ERR no plugin";
 		const int nombre = *(const int*)(objet + 0x68);
 		if (nombre < 0 || nombre > 0x7FFF)
-			return "ERR nombre de parametres illisible";
+			return "ERR unreadable parameter count";
 		return paramsBouges ("PARAMDIFF " + std::to_string (canal) + " 0", -1 - canal,
 		                     (long long)*(const int*)(objet + 0x9C) + 0x8000LL, nombre, neuf);
 	}
@@ -3488,40 +3488,40 @@ unsigned char* best = getClipContainer ();
 		std::istringstream ss (line.substr (11));
 		int canal = -1;
 		if (!(ss >> canal))
-			return "ERR syntaxe CHPARAMSET <canal> i:brut ...";
+			return "ERR syntax CHPARAMSET <canal> i:brut ...";
 		unsigned char* objet = canalPlugin (canal);
 		if (objet == nullptr)
-			return "ERR pas de plugin";
+			return "ERR no plugin";
 		const int ecrits = ecrireParams (ss, (long long)*(const int*)(objet + 0x9C) + 0x8000LL);
-		return ecrits < 0 ? "ERR jeton invalide" : "PARAMSET " + std::to_string (ecrits);
+		return ecrits < 0 ? "ERR invalid token" : "PARAMSET " + std::to_string (ecrits);
 	}
 
 	// Plusieurs parametres d'un coup : PARAMSET <piste> <slot> i:brut i:brut ...
 	if (line.rfind ("PARAMSET ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 		std::istringstream ss (line.substr (9));
 		int track = 0, slot = 0;
 		if (!(ss >> track >> slot) || track < 0 || track > 125 || slot < 0 || slot > 9)
-			return "ERR syntaxe PARAMSET <piste> <slot> i:brut ...";
+			return "ERR syntax PARAMSET <piste> <slot> i:brut ...";
 		const int ecrits = ecrireParams (ss, ((long long)track * 0x40 + slot) * 0x10000LL + 0x70008000LL);
-		return ecrits < 0 ? "ERR jeton invalide" : "PARAMSET " + std::to_string (ecrits);
+		return ecrits < 0 ? "ERR invalid token" : "PARAMSET " + std::to_string (ecrits);
 	}
 
 	// Tous les parametres d'un emplacement, en une seule reponse.
 	if (line.rfind ("PARAMS ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (7));
 		int track = 0, slot = 0, count = 16;
 		if (!(ss >> track >> slot))
-			return "ERR syntaxe PARAMS <piste> <slot> [nombre]";
+			return "ERR syntax PARAMS <piste> <slot> [nombre]";
 		ss >> count;
 		if (track < 0 || track > 125 || slot < 0 || slot > 9 || count < 1 || count > 128)
-			return "ERR plage invalide";
+			return "ERR invalid range";
 
 		using GetFn = int (*) (long long, int, int);
 		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
@@ -3551,7 +3551,7 @@ unsigned char* best = getClipContainer ();
 	if (line == "FXALL")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::string body;
 		int n = 0;
@@ -3585,16 +3585,16 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("FX ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (3));
 		int track = -1, slot = -1;
 		if (!(ss >> track >> slot))
-			return "ERR syntaxe FX <piste> <slot>";
+			return "ERR syntax FX <piste> <slot>";
 
 		unsigned char* sl = mixerSlot (track, slot);
 		if (sl == nullptr)
-			return "ERR slot introuvable";
+			return "ERR slot not found";
 
 		const std::string nom = slotName (sl);
 		if (nom.empty ())
@@ -3609,12 +3609,12 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("MIX ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (4));
 		int track = 0;
 		if (!(ss >> track) || track < 0 || track > 125)
-			return "ERR syntaxe MIX <piste>";
+			return "ERR syntax MIX <piste>";
 
 		using GetFn = int (*) (long long, int, int);
 		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
@@ -3673,7 +3673,7 @@ unsigned char* best = getClipContainer ();
 	if (line == "STATUS")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const int tempoMilli = *(const int*)((unsigned char*)g_engine + 0x11D8930);
 		const int playing = *(const int*)(*(const char* const*)((unsigned char*)g_engine + 0x11E09F8));
@@ -3758,7 +3758,7 @@ unsigned char* best = getClipContainer ();
 	if (line == "SONGPOS")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const double current = *(const double*)((unsigned char*)g_engine + 0x156EC88);
 		char buf[96];
@@ -3770,16 +3770,16 @@ unsigned char* best = getClipContainer ();
 	{
 		// Autorite : ces actions touchent le PROJET, qui appartient a l'hote.
 		if (roleBloque ())
-			return "ERR action reservee a l'hote";
+			return "ERR host-only action";
 
 
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (8));
 		double value = 0.0;
 		if (!(ss >> value) || value < 0.0)
-			return "ERR syntaxe SONGPOS <position>";
+			return "ERR syntax SONGPOS <position>";
 
 		using SetPosFn = void (*) (double, unsigned char);
 		SetPosFn setPos = (SetPosFn)((unsigned char*)g_engine + 0xDE7A10);
@@ -3837,20 +3837,20 @@ unsigned char* best = getClipContainer ();
 	if (line == "CHANNELS")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const unsigned char* p1 =
 			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E0128);
 		if (!isReadable (p1, 8))
-			return "ERR channel rack introuvable";
+			return "ERR channel rack not found";
 		const unsigned char* container = *(const unsigned char* const*)p1;
 		if (!isReadable (container, 0x18))
-			return "ERR conteneur canaux introuvable";
+			return "ERR channel list not found";
 
 		const int count = *(const int*)(container + 0x10);
 		const unsigned char* array = *(const unsigned char* const*)(container + 8);
 		if (count < 0 || count > 2000 || (count > 0 && !isReadable (array, (size_t)count * 8)))
-			return "ERR liste de canaux illisible";
+			return "ERR unreadable channel list";
 
 		std::ostringstream out;
 		out << "CHANNELS " << count;
@@ -3870,25 +3870,25 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("CHANNELTRACK ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (13));
 		int wanted = 0;
 		if (!(ss >> wanted))
-			return "ERR syntaxe CHANNELTRACK <index> [tranche]";
+			return "ERR syntax CHANNELTRACK <index> [tranche]";
 
 		const unsigned char* p1 =
 			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E0128);
 		if (!isReadable (p1, 8))
-			return "ERR channel rack introuvable";
+			return "ERR channel rack not found";
 		const unsigned char* container = *(const unsigned char* const*)p1;
 		if (!isReadable (container, 0x18))
-			return "ERR conteneur canaux introuvable";
+			return "ERR channel list not found";
 
 		const int count = *(const int*)(container + 0x10);
 		const unsigned char* array = *(const unsigned char* const*)(container + 8);
 		if (count <= 0 || count > 2000 || !isReadable (array, (size_t)count * 8))
-			return "ERR liste de canaux illisible";
+			return "ERR unreadable channel list";
 
 		unsigned char* found = nullptr;
 		for (int i = 0; i < count; i++)
@@ -3903,13 +3903,13 @@ unsigned char* best = getClipContainer ();
 			}
 		}
 		if (found == nullptr)
-			return "ERR canal introuvable";
+			return "ERR channel not found";
 
 		int track = -1;
 		if (ss >> track)
 		{
 			if (track < 0 || track > 125)
-				return "ERR tranche hors plage";
+				return "ERR track out of range";
 			*(int*)(found + 0x258) = track;
 			requestRefresh ();
 		}
@@ -3931,13 +3931,13 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("CHANNELVOL ", 0) == 0 || line.rfind ("CHANNELPAN ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const bool isPan = (line.rfind ("CHANNELPAN ", 0) == 0);
 		std::istringstream ss (line.substr (isPan ? 11 : 11));
 		int index = -1;
 		if (!(ss >> index) || index < 0 || index > 255)
-			return "ERR syntaxe CHANNELVOL|CHANNELPAN <index> [valeur]";
+			return "ERR syntax CHANNELVOL|CHANNELPAN <index> [valeur]";
 
 		const long long handle = ((long long)index << 16) + (isPan ? 1 : 0);
 
@@ -3985,20 +3985,20 @@ unsigned char* best = getClipContainer ();
 	if (line == "CHANNELMIX")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const unsigned char* p1 =
 			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E0128);
 		if (!isReadable (p1, 8))
-			return "ERR channel rack introuvable";
+			return "ERR channel rack not found";
 		const unsigned char* container = *(const unsigned char* const*)p1;
 		if (!isReadable (container, 0x18))
-			return "ERR conteneur canaux introuvable";
+			return "ERR channel list not found";
 
 		const int count = *(const int*)(container + 0x10);
 		const unsigned char* array = *(const unsigned char* const*)(container + 8);
 		if (count < 0 || count > 2000 || (count > 0 && !isReadable (array, (size_t)count * 8)))
-			return "ERR liste de canaux illisible";
+			return "ERR unreadable channel list";
 
 		using GetFn = int (*) (long long, int, int);
 		GetFn read = (GetFn)((unsigned char*)g_engine + 0xC46A70);
@@ -4032,12 +4032,12 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("CHANNELMUTE ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		std::istringstream ss (line.substr (12));
 		int index = -1;
 		if (!(ss >> index) || index < 0 || index > 255)
-			return "ERR syntaxe CHANNELMUTE <index> [brut]";
+			return "ERR syntax CHANNELMUTE <index> [brut]";
 
 		const long long handle = ((long long)index << 16) + 7;
 
@@ -4103,11 +4103,11 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("DELCHANNEL ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		int index = -1;
 		if (sscanf_s (line.c_str () + 11, "%d", &index) != 1)
-			return "ERR syntaxe DELCHANNEL <index>";
+			return "ERR syntax DELCHANNEL <index>";
 
 		const bool manuel = (line.find ("brut") != std::string::npos);
 
@@ -4118,19 +4118,19 @@ unsigned char* best = getClipContainer ();
 		const unsigned char* pm =
 			*(const unsigned char* const*)((unsigned char*)g_engine + 0x11E2218);
 		if (!isReadable (pm, 8))
-			return "ERR liste maitresse illisible";
+			return "ERR unreadable main list";
 		unsigned char* conteneur = *(unsigned char* const*)pm;
 		if (!isReadable (conteneur, 0x18))
-			return "ERR conteneur illisible";
+			return "ERR unreadable container";
 
 		const int n = *(const int*)(conteneur + 0x10);
 		if (index < 0 || index >= n)
 			return "ERR index " + std::to_string (index) + " hors rack ("
-			       + std::to_string (n) + " canal(aux))";
+			       + std::to_string (n) + " channel(s))";
 
 		void** tab = *(void***)(conteneur + 0x08);
 		if (!isReadable (tab, (size_t)n * 8))
-			return "ERR tableau illisible";
+			return "ERR unreadable table";
 
 		// ---- chemin par defaut (46-o) : c'est FL qui supprime -------------
 		if (!manuel)
@@ -4173,12 +4173,12 @@ unsigned char* best = getClipContainer ();
 			{
 				void** global = *(void***)((unsigned char*)g_engine + 0x11E1C78);
 				if (!isReadable (global, 8) || *global == nullptr)
-					return "ERR historique illisible";
+					return "ERR unreadable history";
 				historique = *global;
 				using ToDelphi = void* (*) (void*, const char*);
 				((ToDelphi)((unsigned char*)g_engine + 0x1C6E0)) (&nomEtape, "Delete channel");
 				if (nomEtape == nullptr)
-					return "ERR chaine nom";
+					return "ERR bad name string";
 				ouvrirEtape = (OuvrirEtapeFn)((unsigned char*)g_engine + 0xC19360);
 			}
 
@@ -4188,7 +4188,7 @@ unsigned char* best = getClipContainer ();
 			if (faute != 0)
 			{
 				std::ostringstream err;
-				err << "ERR suppression refusee : FAUTE=0x"
+				err << "ERR delete refused: FAULT=0x"
 				    << std::hex << faute << std::dec;
 				return err.str ();
 			}
@@ -4290,26 +4290,26 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("CHFORM ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		int index = -1;
 		int mode = 0;
 		if (sscanf_s (line.c_str () + 7, "%d %d", &index, &mode) != 2)
-			return "ERR syntaxe CHFORM <index> <mode>";
+			return "ERR syntax CHFORM <index> <mode>";
 
 		unsigned char* base = (unsigned char*)g_engine;
 		const unsigned char* pm = *(const unsigned char* const*)(base + 0x11E2218);
 		if (!isReadable (pm, 8))
-			return "ERR liste maitresse illisible";
+			return "ERR unreadable main list";
 		unsigned char* conteneur = *(unsigned char* const*)pm;
 		if (!isReadable (conteneur, 0x18))
-			return "ERR conteneur illisible";
+			return "ERR unreadable container";
 		const int n = *(const int*)(conteneur + 0x10);
 		if (index < 0 || index >= n)
-			return "ERR index hors rack";
+			return "ERR index outside the rack";
 		void** tab = *(void***)(conteneur + 0x08);
 		if (!isReadable (tab, (size_t)n * 8) || !isReadable (tab[index], 0x800))
-			return "ERR canal illisible";
+			return "ERR unreadable channel";
 
 		unsigned char* fenetre = *(unsigned char**)((unsigned char*)tab[index] + 0x7B4);
 		if (!isReadable (fenetre, 0x500))
@@ -4332,39 +4332,39 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("SAVECHANNEL ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		int index = -1;
 		int lu = 0;
 		if (sscanf_s (line.c_str () + 12, "%d %n", &index, &lu) != 1 || lu == 0)
-			return "ERR syntaxe SAVECHANNEL <index> <chemin>";
+			return "ERR syntax SAVECHANNEL <index> <chemin>";
 		const std::string chemin = line.substr (12 + (size_t)lu);
 		if (chemin.size () < 8 || chemin.size () > 500)
-			return "ERR syntaxe SAVECHANNEL <index> <chemin>";
+			return "ERR syntax SAVECHANNEL <index> <chemin>";
 
 		unsigned char* base = (unsigned char*)g_engine;
 
 		const unsigned char* pm = *(const unsigned char* const*)(base + 0x11E2218);
 		if (!isReadable (pm, 8))
-			return "ERR liste maitresse illisible";
+			return "ERR unreadable main list";
 		unsigned char* conteneur = *(unsigned char* const*)pm;
 		if (!isReadable (conteneur, 0x18))
-			return "ERR conteneur illisible";
+			return "ERR unreadable container";
 
 		const int n = *(const int*)(conteneur + 0x10);
 		if (index < 0 || index >= n)
 			return "ERR index " + std::to_string (index) + " hors rack ("
-			       + std::to_string (n) + " canal(aux))";
+			       + std::to_string (n) + " channel(s))";
 
 		void** tab = *(void***)(conteneur + 0x08);
 		if (!isReadable (tab, (size_t)n * 8) || !isReadable (tab[index], 0x800))
-			return "ERR canal illisible";
+			return "ERR unreadable channel";
 
 		using ToDelphi = void* (*) (void*, const char*);
 		void* nomFichier = nullptr;
 		((ToDelphi)(base + 0x1C6E0)) (&nomFichier, chemin.c_str ());
 		if (nomFichier == nullptr)
-			return "ERR chaine chemin";
+			return "ERR bad path string";
 
 		unsigned long faute = 0;
 		const int rc = guardedSaveChannel ((ChannelFileFn)(base + 0xB54570), nomFichier,
@@ -4373,7 +4373,7 @@ unsigned char* best = getClipContainer ();
 		{
 			char code[16];
 			sprintf_s (code, "0x%08lX", faute);
-			return std::string ("ERR SAVECHANNEL faute ") + code;
+			return std::string ("ERR SAVECHANNEL fault ") + code;
 		}
 		if (rc != 0)
 			return "ERR SAVECHANNEL code " + std::to_string (rc);
@@ -4390,12 +4390,12 @@ unsigned char* best = getClipContainer ();
 	{
 		const size_t debut = remplaceCanal ? 15 : 12;
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		int index = -1;
 		int lu = 0;
 		if (sscanf_s (line.c_str () + debut, "%d %n", &index, &lu) != 1 || lu == 0 || index < 0)
-			return "ERR syntaxe LOADCHANNEL <index> <chemin>[|<nom>]";
+			return "ERR syntax LOADCHANNEL <index> <chemin>[|<nom>]";
 		std::string chemin = line.substr (debut + (size_t)lu);
 		std::string nom;
 		const size_t barre = chemin.find ('|');
@@ -4405,26 +4405,26 @@ unsigned char* best = getClipContainer ();
 			chemin.resize (barre);
 		}
 		if (chemin.size () < 8 || chemin.size () > 500)
-			return "ERR syntaxe LOADCHANNEL <index> <chemin>[|<nom>]";
+			return "ERR syntax LOADCHANNEL <index> <chemin>[|<nom>]";
 
 		unsigned char* base = (unsigned char*)g_engine;
 
 		const unsigned char* pm = *(const unsigned char* const*)(base + 0x11E2218);
 		if (!isReadable (pm, 8))
-			return "ERR liste maitresse illisible";
+			return "ERR unreadable main list";
 		const unsigned char* conteneur = *(const unsigned char* const*)pm;
 		if (!isReadable (conteneur, 0x18))
-			return "ERR conteneur illisible";
+			return "ERR unreadable container";
 		const int n = *(const int*)(conteneur + 0x10);
 		void* existant = nullptr;
 		if (remplaceCanal)
 		{
 			if (index >= n)
 				return "ERR index " + std::to_string (index) + " hors rack ("
-				       + std::to_string (n) + " canal(aux))";
+				       + std::to_string (n) + " channel(s))";
 			void** tab = *(void***)(conteneur + 0x08);
 			if (!isReadable (tab, (size_t)n * 8) || !isReadable (tab[index], 0x800))
-				return "ERR canal illisible";
+				return "ERR unreadable channel";
 			existant = tab[index];
 		}
 		else if (index > n)
@@ -4435,7 +4435,7 @@ unsigned char* best = getClipContainer ();
 		void* nomFichier = nullptr;
 		toDelphi (&nomFichier, chemin.c_str ());
 		if (nomFichier == nullptr)
-			return "ERR chaine chemin";
+			return "ERR bad path string";
 
 		using InsertFn = void* (*) (int, int, int);
 		int rc = 0;
@@ -4447,10 +4447,10 @@ unsigned char* best = getClipContainer ();
 		{
 			char code[16];
 			sprintf_s (code, "0x%08lX", faute);
-			return std::string ("ERR LOADCHANNEL faute ") + code;
+			return std::string ("ERR LOADCHANNEL fault ") + code;
 		}
 		if (channel == nullptr || !isReadable (channel, 0x800))
-			return "ERR creation du canal";
+			return "ERR could not create the channel";
 		if (rc != 0)
 			return "ERR LOADCHANNEL code " + std::to_string (rc);
 
@@ -4475,19 +4475,19 @@ unsigned char* best = getClipContainer ();
 	if (line == "NEWCHANNEL")
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		unsigned char* base = (unsigned char*)g_engine;
 		void** selfSlot = (void**)(base + 0x11E0FF8);
 		if (!isReadable (selfSlot, 8))
-			return "ERR contexte de creation illisible";
+			return "ERR unreadable creation context";
 		void* self = *selfSlot;
 
 		using CreateFn = void* (*) (void*, unsigned char);
 		CreateFn create = (CreateFn)(base + 0xDF53D0);
 		void* channel = create (self, 0);
 		if (channel == nullptr || !isReadable (channel, 8))
-			return "ERR creation du canal";
+			return "ERR could not create the channel";
 
 		const int index = *(int*)((unsigned char*)channel + 0x794);
 		requestRefresh ();
@@ -4497,11 +4497,11 @@ unsigned char* best = getClipContainer ();
 	if (line.rfind ("LOADPLUGIN ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		const std::string chemin = line.substr (11);
 		if (chemin.size () < 8 || chemin.size () > 500)
-			return "ERR syntaxe LOADPLUGIN <chemin .fst absolu>";
+			return "ERR syntax LOADPLUGIN <chemin .fst absolu>";
 
 		unsigned char* base = (unsigned char*)g_engine;
 
@@ -4511,25 +4511,25 @@ unsigned char* best = getClipContainer ();
 		void* preset = nullptr;
 		toDelphi (&preset, chemin.c_str ());
 		if (preset == nullptr)
-			return "ERR chaine chemin";
+			return "ERR bad path string";
 
 		// Le navigateur passe un "self" non nul : le global +0x11E0FF8.
 		void** selfSlot = (void**)(base + 0x11E0FF8);
 		if (!isReadable (selfSlot, 8))
-			return "ERR contexte de creation illisible";
+			return "ERR unreadable creation context";
 		void* self = *selfSlot;
 
 		using CreateFn = void* (*) (void*, unsigned char);
 		CreateFn create = (CreateFn)(base + 0xDF53D0);
 		void* channel = create (self, 0);
 		if (channel == nullptr || !isReadable (channel, 8))
-			return "ERR creation du canal";
+			return "ERR could not create the channel";
 
 		const int index = *(int*)((unsigned char*)channel + 0x794);
 
 		void** vtable = *(void***)channel;
 		if (vtable == nullptr || !isReadable (vtable + 0x150 / 8, 8))
-			return "ERR table de methodes illisible";
+			return "ERR unreadable method table";
 		void* method = vtable[0x150 / 8];
 
 		// Drapeaux : ceux que le navigateur construit (debordements compris).
@@ -4544,7 +4544,7 @@ unsigned char* best = getClipContainer ();
 		load (channel, preset, 0, (int)flags, nullptr, nullptr);
 
 		requestRefresh ();
-		return "LOADPLUGIN OK (canal " + std::to_string (index) + " " + std::to_string (flags) + ")";
+		return "LOADPLUGIN OK (channel " + std::to_string (index) + " " + std::to_string (flags) + ")";
 	}
 
 	// Canal en cours d'edition du piano roll (CURCHANNEL) et selection
@@ -4553,7 +4553,7 @@ unsigned char* best = getClipContainer ();
 	if (line == "CURCHANNEL" || line.rfind ("SELECTCHANNEL ", 0) == 0)
 	{
 		if (g_engine == nullptr)
-			return "ERR pas d'adresse";
+			return "ERR no address";
 
 		unsigned char* base = (unsigned char*)g_engine;
 
@@ -4562,7 +4562,7 @@ unsigned char* best = getClipContainer ();
 			std::istringstream ss (line.substr (14));
 			int index = -1;
 			if (!(ss >> index) || index < 0 || index > 255)
-				return "ERR syntaxe SELECTCHANNEL <index>";
+				return "ERR syntax SELECTCHANNEL <index>";
 
 			using SelFn = void (*) (int);
 			SelFn select = (SelFn)(base + 0xDE84E0);
@@ -4579,7 +4579,7 @@ unsigned char* best = getClipContainer ();
 		return std::string (buf);
 	}
 
-	return "ERR commande inconnue";
+	return "ERR unknown command";
 }
 
 // Appelee sur le thread principal de FL uniquement.

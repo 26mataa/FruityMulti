@@ -2,132 +2,114 @@
 
 # FruityMulti
 
-**Le multijoueur pour FL Studio.**
-Deux PC, un seul projet, chacun devant son FL.
+**Multiplayer for FL Studio.**
+Two PCs, one project, each person in their own FL.
 
-[![Télécharger](https://img.shields.io/github/v/release/26mataa/FruityMulti?label=t%C3%A9l%C3%A9charger&color=2340FF&style=for-the-badge)](https://github.com/26mataa/FruityMulti/releases/latest)
-![Windows 64 bits](https://img.shields.io/badge/Windows-64%20bits-121212?style=for-the-badge)
+[![Download](https://img.shields.io/github/v/release/26mataa/FruityMulti?label=download&color=2340FF&style=for-the-badge)](https://github.com/26mataa/FruityMulti/releases/latest)
+![Windows 64-bit](https://img.shields.io/badge/Windows-64--bit-121212?style=for-the-badge)
 ![FL Studio 26.1.7](https://img.shields.io/badge/FL%20Studio-26.1.7-FF5A1F?style=for-the-badge)
-
-<img src="docs/demo.gif" alt="La fenêtre de FruityMulti : on prend l'antenne, le code s'affiche, l'invité arrive" width="640">
 
 </div>
 
 ---
 
-Tu poses une note, elle apparaît chez l'autre. Il change le tempo, le tien suit.
-Pas de partage d'écran, pas de projet à s'envoyer par mail : FruityMulti relie
-directement vos deux FL Studio pendant que vous composez.
+Add a note and it shows up on the other PC. Change the tempo and theirs follows.
+No screen sharing, no emailing project files: FruityMulti links your two FL
+Studios while you make music.
 
-Aucun son ne passe par le réseau. Chacun entend son propre FL, sans latence,
-avec ses propres plugins.
+No audio goes over the network. Each person hears their own FL, with no delay.
 
-## Ce qui se synchronise
+## What stays in sync
 
 | | |
 |---|---|
-| 🎹 **Notes** | sur le bon canal, même si vos racks ne sont pas dans le même ordre |
-| 🧩 **Playlist** | clips et motifs |
-| ⏱️ **Tempo et lecture** | tempo, motif courant, position de lecture |
-| 🎚️ **Mixeur** | volumes, pans, mutes, master |
-| 🎛️ **Effets** | réglages synchronisés quand le même effet est présent des deux côtés |
+| 🎹 **Notes** | on the right channel, even if your racks are in a different order |
+| 🧩 **Playlist** | clips and patterns |
+| ⏱️ **Tempo and playback** | tempo, current pattern, play position |
+| 🎚️ **Mixer** | volume, pan, mute, routing, master |
+| 🎛️ **Effects** | added effects and all their settings |
+| 🎸 **Instruments** | added instruments, their settings, presets and wavetables, including heavy plugins |
+| 🔊 **Sampler** | the sample itself and the channel's settings |
 
-L'hôte a le dernier mot sur le projet (tempo, motif, transport). Pour le reste,
-vous travaillez à égalité : les notes et le mixeur appartiennent aux deux.
+You both start from the host's project. After that you work as equals, and the
+host has the final say on tempo, pattern and transport.
 
-## Installer
+## Install
 
-1. Ferme FL Studio.
-2. Télécharge **[FruityMultiSetup.exe](https://github.com/26mataa/FruityMulti/releases/latest/download/FruityMultiSetup.exe)** et lance-le.
-3. Windows peut afficher « Windows a protégé votre ordinateur », car
-   l'installateur n'est pas signé : clique sur **Informations complémentaires**,
-   puis **Exécuter quand même**.
-4. Ouvre FL Studio et ajoute l'effet **FruityMulti Bridge** sur une piste du
-   mixeur, puis ouvre sa fenêtre.
+1. Close FL Studio.
+2. Download **[FruityMultiSetup.exe](https://github.com/26mataa/FruityMulti/releases/latest/download/FruityMultiSetup.exe)** and run it.
+3. Windows may say "Windows protected your PC" because the installer is not
+   signed. Click **More info**, then **Run anyway**.
+4. Open FL Studio, add the **FruityMulti Bridge** effect to a mixer track, and
+   open its window.
 
-Les deux PC ont besoin de la même chose : **FL Studio 26.1.7**, et les mêmes
-instruments pour entendre le même morceau.
+Both PCs need **FL Studio 26.1.7**. If a plugin is on only one PC, the other
+person gets an empty channel with its name, and the **PLUGINS** page shows
+what is missing.
 
-## Jouer à deux
+## Play together
 
-<table>
-<tr>
-<td width="50%"><img src="docs/hors-antenne.png" alt="Écran d'accueil"></td>
-<td width="50%"><img src="docs/en-ondes.png" alt="Session ouverte, invité connecté"></td>
-</tr>
-<tr>
-<td><b>Celui qui héberge</b> clique sur <b>HÉBERGER</b> et reçoit une fréquence de 6 signes.</td>
-<td>Il la donne à l'autre. Dès que l'invité arrive, l'onde orange rejoint la bleue.</td>
-</tr>
-<tr>
-<td width="50%"><img src="docs/code.png" alt="Saisie du code"></td>
-<td width="50%"><img src="docs/compatibilite.png" alt="Comparaison des plugins"></td>
-</tr>
-<tr>
-<td><b>Celui qui rejoint</b> clique sur <b>REJOINDRE</b>, tape le code ou le colle avec Ctrl+V, puis valide avec Entrée.</td>
-<td><b>COMPATIBILITÉ</b> montre les plugins que l'un a et pas l'autre, avant que ça sonne faux.</td>
-</tr>
-</table>
+1. The first person clicks **HOST** and gets a 6-character code.
+2. They send the code to the other person.
+3. The other person clicks **JOIN**, types or pastes the code, and presses Enter.
+4. The guest loads the host's project. You are now live.
 
-La fenêtre se pilote aussi au clavier : flèches pour se déplacer, Entrée pour
-valider.
+You can also use the window with the keyboard: arrows to move, Enter to confirm.
 
 > [!NOTE]
-> **Connexion.** Aucun port à ouvrir : le code passe par un relais. Si le relais
-> est injoignable, l'hôte bascule en connexion directe et reçoit une adresse de la
-> forme `82.64.12.7:5000/K7P2QX`, à coller telle quelle chez l'invité. Ce repli
-> demande une box compatible UPnP ou le port 5000 ouvert.
+> **Connection.** You don't need to open any ports: the code goes through a
+> relay. If the relay can't be reached, the host switches to a direct connection
+> and gets an address like `82.64.12.7:5000/K7P2QX`. Paste it as it is on the
+> guest's PC. This needs a router with UPnP, or port 5000 open.
 
-## Mises à jour
+## Updates
 
-**MISE À JOUR** dans la fenêtre interroge GitHub. Si une version plus récente
-existe, Entrée la télécharge et l'installe : FL se ferme, le plugin est remplacé,
-FL redémarre.
+Click **UPDATE** in the window. If there is a newer version, press Enter: FL
+closes, the plugin is replaced, and FL restarts.
 
-## Limites
+## Limits
 
-- Windows 64 bits uniquement.
-- Deux personnes par session.
-- Une seule version de FL est prise en charge. Si FL est mis à jour, le plugin
-  se désactive par sécurité et la fenêtre le signale, en attendant une version
-  de FruityMulti adaptée.
-- Les fichiers audio et les presets ne sont pas transférés.
+- Windows 64-bit only.
+- Two people per session.
+- One FL version is supported. If FL updates, the plugin turns itself off and
+  says so in its window until a new FruityMulti comes out.
+- Very large samples and plugin states are not sent.
+- Your own wavetable files are not sent: a table you imported needs to be on
+  both PCs. Tables that come with the plugin work everywhere.
 
-## Comment ça marche
+## How it works
 
 ```mermaid
 flowchart LR
-    subgraph A["PC de l'hôte"]
-        FLA["FL Studio<br>plugin FruityMulti"] <-->|"127.0.0.1"| AGA["fm_agent"]
+    subgraph A["Host PC"]
+        FLA["FL Studio<br>FruityMulti plugin"] <-->|"127.0.0.1"| AGA["fm_agent"]
     end
-    subgraph B["PC de l'invité"]
-        FLB["FL Studio<br>plugin FruityMulti"] <-->|"127.0.0.1"| AGB["fm_agent"]
+    subgraph B["Guest PC"]
+        FLB["FL Studio<br>FruityMulti plugin"] <-->|"127.0.0.1"| AGB["fm_agent"]
     end
-    AGA <-->|"relais, ou connexion directe"| AGB
+    AGA <-->|"relay or direct connection"| AGB
 ```
 
-Le **plugin VST3** (C++) vit dans FL : il lit et écrit dans le moteur et dessine
-la fenêtre. L'**agent** (Python) compare l'état du projet avec celui de l'autre
-PC et n'envoie que les différences, regroupées toutes les 40 ms.
+The **VST3 plugin** (C++) runs inside FL. It reads and writes the project and
+draws the window. The **agent** (Python) compares your project with the other PC
+and sends only what changed.
 
-Le **relais** est un petit service sur l'offre gratuite de Cloudflare Workers :
-un salon par code, qui recopie les messages d'un PC à l'autre. Si l'autre ne
-donne plus de nouvelles pendant 20 s, la session est considérée comme perdue et
-se rouvre toute seule.
+The **relay** is a small service on Cloudflare Workers' free plan: one room per
+code, passing messages between the two PCs.
 
-| Dossier | Contenu |
+| Folder | Contents |
 |---|---|
-| [`dll/FruityMulti`](dll/FruityMulti) | le plugin et sa fenêtre |
-| [`net`](net) | l'agent de synchronisation |
-| [`relais`](relais) | le relais Cloudflare |
-| [`setup`](setup) | l'installateur |
+| [`dll/FruityMulti`](dll/FruityMulti) | the plugin and its window |
+| [`net`](net) | the sync agent |
+| [`relais`](relais) | the Cloudflare relay |
+| [`setup`](setup) | the installer |
 
 <details>
-<summary><b>Compiler depuis les sources</b></summary>
+<summary><b>Build from source</b></summary>
 
-Il faut Visual Studio 2022, CMake et Python 3.12.
+You need Visual Studio 2022, CMake and Python 3.12.
 
-**Plugin.** Le SDK VST3 n'est pas inclus dans le dépôt :
+**Plugin.** The VST3 SDK is not in this repository:
 
 ```powershell
 git clone --recursive --depth 1 https://github.com/steinbergmedia/vst3sdk dll\vst3sdk
@@ -142,7 +124,7 @@ pip install -r requirements.txt pyinstaller
 python -m PyInstaller --onefile --name fm_agent --distpath net\dist --workpath net\build --specpath net net\agent_sync.py
 ```
 
-**Relais** (compte Cloudflare gratuit, sans carte bancaire) :
+**Relay** (free Cloudflare account, no card needed):
 
 ```powershell
 cd relais
@@ -151,17 +133,17 @@ npx wrangler login
 npx wrangler deploy
 ```
 
-Reporte ensuite l'adresse obtenue dans `RELAIS`, en tête de la partie réseau de
+Then put the address you get in `RELAIS`, at the start of the network section of
 `net/agent_sync.py`.
 
 </details>
 
-## Crédits
+## Credits
 
-Interface dessinée avec [Dear ImGui](https://github.com/ocornut/imgui) (licence MIT),
-polices [Archivo](https://github.com/Omnibus-Type/Archivo) et
-[IBM Plex Mono](https://github.com/IBM/plex) (licence OFL), plugin construit avec le
-[SDK VST3](https://github.com/steinbergmedia/vst3sdk) de Steinberg.
+Interface drawn with [Dear ImGui](https://github.com/ocornut/imgui) (MIT license),
+fonts [Archivo](https://github.com/Omnibus-Type/Archivo) and
+[IBM Plex Mono](https://github.com/IBM/plex) (OFL license), plugin built with
+Steinberg's [VST3 SDK](https://github.com/steinbergmedia/vst3sdk).
 
-FruityMulti est un projet indépendant, sans lien avec Image-Line.
-FL Studio est une marque d'Image-Line.
+FruityMulti is an independent project, not affiliated with Image-Line.
+FL Studio is a trademark of Image-Line.

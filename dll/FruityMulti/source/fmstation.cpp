@@ -272,21 +272,21 @@ struct Ligne
 std::vector<Ligne> lignesDuMenu (bool enOndes, int role)
 {
 	if (!enOndes)
-		return { { Entree::Heberger, "HÉBERGER" },
-		         { Entree::Rejoindre, "REJOINDRE" },
-		         { Entree::Compat, "COMPATIBILITÉ" },
-		         { Entree::Journal, "JOURNAL" },
-		         { Entree::Maj, "MISE À JOUR" } };
-	return { { Entree::CopierCode, "COPIER LE CODE" },
-	         { Entree::Compat, "COMPATIBILITÉ" },
-	         { Entree::Journal, "JOURNAL" },
-	         { Entree::Couper, role == 1 ? "COUPER L'ANTENNE" : "QUITTER LA SESSION" } };
+		return { { Entree::Heberger, "HOST" },
+		         { Entree::Rejoindre, "JOIN" },
+		         { Entree::Compat, "PLUGINS" },
+		         { Entree::Journal, "LOG" },
+		         { Entree::Maj, "UPDATE" } };
+	return { { Entree::CopierCode, "COPY CODE" },
+	         { Entree::Compat, "PLUGINS" },
+	         { Entree::Journal, "LOG" },
+	         { Entree::Couper, role == 1 ? "END SESSION" : "LEAVE SESSION" } };
 }
 
 std::string numero (int v)
 {
 	char b[16];
-	snprintf (b, sizeof (b), "N°%03d", v);
+	snprintf (b, sizeof (b), "V%03d", v);
 	return b;
 }
 
@@ -504,10 +504,10 @@ struct Station::Impl
 	std::string titreVoulu () const
 	{
 		if (!enOndes)
-			return e.maj == Maj::Telechargement ? "MISE À JOUR" : "HORS ANTENNE";
+			return e.maj == Maj::Telechargement ? "UPDATE" : "OFFLINE";
 		if (e.role == 1)
-			return e.code.empty () ? "RÉGLAGE…" : "EN ONDES";
-		return e.pair.empty () ? "RÉCEPTION…" : "EN ONDES";
+			return e.code.empty () ? "STARTING…" : "LIVE";
+		return e.pair.empty () ? "CONNECTING…" : "LIVE";
 	}
 
 	bool alAntenne () const
@@ -521,23 +521,23 @@ struct Station::Impl
 		if (!enOndes)
 		{
 			if (e.maj == Maj::Dispo)
-				return "MISE À JOUR DISPONIBLE — " + numero (e.majVersion) + " — ENTRÉE POUR INSTALLER —";
+				return "UPDATE AVAILABLE — " + numero (e.majVersion) + " — PRESS ENTER TO INSTALL —";
 			if (e.maj == Maj::Telechargement)
-				return "INSTALLATION DE LA " + numero (e.majVersion) + " — FL VA REDÉMARRER —";
-			return "HORS ANTENNE — AUCUNE SESSION — FRUITYMULTI " + numero (e.version) + " —";
+				return "INSTALLING " + numero (e.majVersion) + " — FL WILL RESTART —";
+			return "OFFLINE — NO SESSION — FRUITYMULTI " + numero (e.version) + " —";
 		}
 		const std::string pair = majuscules (e.pair);
 		if (e.role == 1)
 		{
 			if (code.empty ())
-				return "RÉGLAGE DE LA STATION —";
+				return "STARTING SESSION —";
 			if (pair.empty ())
-				return "EN ONDES — FRÉQUENCE " + code + " — EN ATTENTE D'UN AUDITEUR —";
-			return "EN ONDES — " + pair + " À L'ÉCOUTE — SYNCHRO OK —";
+				return "LIVE — CODE " + code + " — WAITING FOR YOUR GUEST —";
+			return "LIVE — " + pair + " CONNECTED — IN SYNC —";
 		}
 		if (pair.empty ())
-			return "RÉCEPTION — RECHERCHE DE LA FRÉQUENCE " + code + " —";
-		return "EN ONDES — CALÉ SUR " + pair + " — SYNCHRO OK —";
+			return "CONNECTING — LOOKING FOR CODE " + code + " —";
+		return "LIVE — CONNECTED TO " + pair + " — IN SYNC —";
 	}
 
 	std::string ligneEtat () const
@@ -545,8 +545,8 @@ struct Station::Impl
 		if (t - tMessage < 2.2f)
 			return majuscules (message);
 		const std::string s = e.statut;
-		if (s.empty () || s == "Aucune session")
-			return "STATION LOCALE · " + majuscules (e.poste);
+		if (s.empty () || s == "No session")
+			return "THIS PC · " + majuscules (e.poste);
 		return majuscules (s);
 	}
 
@@ -806,10 +806,10 @@ struct Station::Impl
 		{
 		case Entree::Heberger:
 		{
-			entete (x, y, a, i, "HÉBERGER");
+			entete (x, y, a, i, "HOST");
 			const float h = paragraphe (x, y + 18, a,
-			    "Prends l'antenne. Tu reçois une fréquence de 6 signes à donner à ton invité.");
-			consigne (x, y + 18 + h + 12, a, "ENTRÉE → PRENDRE L'ANTENNE");
+			    "Start a session. You get a 6-character code to give to your guest.");
+			consigne (x, y + 18 + h + 12, a, "ENTER → START");
 			break;
 		}
 		case Entree::Rejoindre:
@@ -820,9 +820,9 @@ struct Station::Impl
 			break;
 		case Entree::Journal:
 		{
-			entete (x, y, a, i, "JOURNAL");
+			entete (x, y, a, i, "LOG");
 			if (e.journal.empty ())
-				texte (f.mono, 11, x, y + 20, alpha (PAPIER, 0.6f * a), "RIEN POUR L'INSTANT");
+				texte (f.mono, 11, x, y + 20, alpha (PAPIER, 0.6f * a), "NOTHING YET");
 			const size_t debut = e.journal.size () > 6 ? e.journal.size () - 6 : 0;
 			for (size_t k = debut; k < e.journal.size (); ++k)
 			{
@@ -841,11 +841,11 @@ struct Station::Impl
 			break;
 		case Entree::Couper:
 		{
-			entete (x, y, a, i, e.role == 1 ? "COUPER L'ANTENNE" : "QUITTER");
+			entete (x, y, a, i, e.role == 1 ? "END SESSION" : "LEAVE");
 			const float h = paragraphe (x, y + 18, a, e.role == 1
-			    ? "Ferme la station. Ton invité est déconnecté, chacun garde son projet."
-			    : "Tu quittes la session. Ton projet reste tel quel.");
-			consigne (x, y + 18 + h + 12, a, "ENTRÉE → CONFIRMER");
+			    ? "Ends the session. Your guest is disconnected and you both keep your project."
+			    : "You leave the session. Your project stays as it is.");
+			consigne (x, y + 18 + h + 12, a, "ENTER → CONFIRM");
 			break;
 		}
 		}
@@ -853,7 +853,7 @@ struct Station::Impl
 
 	void contenuRejoindre (float x, float y, float a, int i)
 	{
-		entete (x, y, a, i, "FRÉQUENCE DE L'HÔTE");
+		entete (x, y, a, i, "HOST CODE");
 		const bool erreur = t - tErreur < 1.6f;
 		for (int k = 0; k < 6; ++k)
 		{
@@ -886,26 +886,26 @@ struct Station::Impl
 
 		const float yc = y + 80;
 		if (erreur)
-			consigne (x, yc, a, "6 SIGNES ATTENDUS");
+			consigne (x, yc, a, "6 CHARACTERS NEEDED");
 		else if (saisie.size () == 6)
-			consigne (x, yc, a, "ENTRÉE → SE CALER");
+			consigne (x, yc, a, "ENTER → CONNECT");
 		else
-			consigne (x, yc, a, "TAPE LE CODE → ENTRÉE", PAPIER);
+			consigne (x, yc, a, "TYPE THE CODE → ENTER", PAPIER);
 
 		if (!saisieDirecte.empty ())
 			texte (f.mono, 11, x, yc + 18, alpha (BLEU_CL, a),
 			       tronquer (f.mono, F (11), "DIRECT · " + saisieDirecte, F (204)));
 		else
-			texte (f.mono, 11, x, yc + 18, alpha (PAPIER, 0.5f * a), "CTRL+V POUR COLLER");
+			texte (f.mono, 11, x, yc + 18, alpha (PAPIER, 0.5f * a), "CTRL+V TO PASTE");
 	}
 
 	void contenuCompat (float x, float y, float a, int i)
 	{
-		entete (x, y, a, i, "TOI · L'AUTRE");
+		entete (x, y, a, i, "YOU · THEM");
 		if (e.compat.empty ())
 		{
 			paragraphe (x, y + 18, a,
-			    "Connecte-toi à quelqu'un : vos plugins seront comparés ici.");
+			    "Connect to someone: your plugins are compared here.");
 			return;
 		}
 
@@ -937,10 +937,9 @@ struct Station::Impl
 				manquants += rangs[r].first != '=';
 			char b[64];
 			if (manquants > 0)
-				snprintf (b, sizeof (b), "+%d AUTRE%s · %d PAS DES DEUX CÔTÉS", reste,
-				          reste > 1 ? "S" : "", manquants);
+				snprintf (b, sizeof (b), "+%d MORE · %d NOT ON BOTH", reste, manquants);
 			else
-				snprintf (b, sizeof (b), "+%d AUTRE%s EN COMMUN", reste, reste > 1 ? "S" : "");
+				snprintf (b, sizeof (b), "+%d MORE IN COMMON", reste);
 			texte (f.mono, 11, x + visibles * 3.0f, y + 22 + visibles * 24.0f,
 			       alpha (PAPIER, 0.6f * a), tronquer (f.mono, F (11), b, F (204)));
 		}
@@ -948,26 +947,26 @@ struct Station::Impl
 
 	void contenuMaj (float x, float y, float a, int i)
 	{
-		entete (x, y, a, i, "MISE À JOUR · GITHUB");
+		entete (x, y, a, i, "UPDATE · GITHUB");
 		switch (e.maj)
 		{
 		case Maj::Repos:
 			texte (f.titre, 56, x, y + 18, alpha (PAPIER, a), numero (e.version));
 			texte (f.mono, 11, x + largeur (f.titre, 56, numero (e.version)) + 10, y + 52,
-			       alpha (PAPIER, a), "INSTALLÉE");
-			consigne (x, y + 86, a, "ENTRÉE → VÉRIFIER");
+			       alpha (PAPIER, a), "INSTALLED");
+			consigne (x, y + 86, a, "ENTER → CHECK");
 			break;
 		case Maj::Verif:
 		{
 			const int points = 1 + (int)(t * 4) % 3;
-			texte (f.titre, 56, x, y + 18, alpha (PAPIER, 0.4f * a), "N°" + std::string (points, '.'));
-			consigne (x, y + 86, a, "INTERROGATION DE GITHUB…", PAPIER);
+			texte (f.titre, 56, x, y + 18, alpha (PAPIER, 0.4f * a), "V" + std::string (points, '.'));
+			consigne (x, y + 86, a, "ASKING GITHUB…", PAPIER);
 			break;
 		}
 		case Maj::AJour:
-			texte (f.titre, 56, x, y + 18, alpha (PAPIER, a), "À JOUR");
-			consigne (x, y + 72, a, numero (e.version) + " EST LA DERNIÈRE", PAPIER);
-			consigne (x, y + 90, a, "ENTRÉE → REVÉRIFIER");
+			texte (f.titre, 56, x, y + 18, alpha (PAPIER, a), "UP TO DATE");
+			consigne (x, y + 72, a, numero (e.version) + " IS THE LATEST", PAPIER);
+			consigne (x, y + 90, a, "ENTER → CHECK AGAIN");
 			break;
 		case Maj::Dispo:
 		{
@@ -978,14 +977,14 @@ struct Station::Impl
 			const int m = marque ();
 			texte (f.titre, 52, x + wv + 10, y + 16, alpha (BLEU_CL, a), numero (e.majVersion));
 			transformer (dl, m, rotation (-5, V (x + wv + 10, y + 42)));
-			texte (f.mono, 11, x, y + 74, alpha (PAPIER, a), "FL SE FERME PUIS REDÉMARRE.");
-			texte (f.mono, 11, x, y + 89, alpha (PAPIER, a), "ENREGISTRE TON PROJET.");
-			consigne (x, y + 108, a, "ENTRÉE → INSTALLER");
+			texte (f.mono, 11, x, y + 74, alpha (PAPIER, a), "FL CLOSES, THEN RESTARTS.");
+			texte (f.mono, 11, x, y + 89, alpha (PAPIER, a), "SAVE YOUR PROJECT.");
+			consigne (x, y + 108, a, "ENTER → INSTALL");
 			break;
 		}
 		case Maj::Telechargement:
 		{
-			texte (f.titre, 30, x, y + 22, alpha (PAPIER, a), "TÉLÉCHARGEMENT");
+			texte (f.titre, 30, x, y + 22, alpha (PAPIER, a), "DOWNLOADING");
 			// barre indeterminee : un paquet de segments qui court
 			const int tete = (int)(t * 14) % 26;
 			for (int s = 0; s < 18; ++s)
@@ -996,24 +995,24 @@ struct Station::Impl
 				                   alpha (PAPIER, (plein ? 1.0f : 0.2f) * a));
 				transformer (dl, m, inclinaison (-18, V (x + s * 11.0f, y + 72)));
 			}
-			consigne (x, y + 92, a, "FL VA SE FERMER PUIS REDÉMARRER", PAPIER);
+			consigne (x, y + 92, a, "FL WILL CLOSE, THEN RESTART", PAPIER);
 			break;
 		}
 		case Maj::Erreur:
-			texte (f.titre, 44, x, y + 22, alpha (ORANGE, a), "HORS LIGNE");
-			consigne (x, y + 72, a, "GITHUB NE RÉPOND PAS", PAPIER);
-			consigne (x, y + 90, a, "ENTRÉE → RÉESSAYER");
+			texte (f.titre, 44, x, y + 22, alpha (ORANGE, a), "OFFLINE");
+			consigne (x, y + 72, a, "GITHUB IS NOT RESPONDING", PAPIER);
+			consigne (x, y + 90, a, "ENTER → TRY AGAIN");
 			break;
 		case Maj::Redemarrer:
-			texte (f.titre, 40, x, y + 22, alpha (BLEU_CL, a), "REDÉMARRE FL");
-			paragraphe (x, y + 64, a, "La nouvelle version est installée : ferme puis rouvre FL Studio.");
+			texte (f.titre, 40, x, y + 22, alpha (BLEU_CL, a), "RESTART FL");
+			paragraphe (x, y + 64, a, "The new version is installed: close and reopen FL Studio.");
 			break;
 		}
 	}
 
 	void contenuCode (float x, float y, float a, int i)
 	{
-		entete (x, y, a, i, e.role == 1 ? "TA FRÉQUENCE" : "FRÉQUENCE");
+		entete (x, y, a, i, e.role == 1 ? "YOUR CODE" : "CODE");
 		const std::string code = codeSeul (e.code);
 		if (code != codeAffiche)
 		{
@@ -1024,7 +1023,7 @@ struct Station::Impl
 		if (code.empty ())
 		{
 			const int points = 1 + (int)(t * 4) % 3;
-			texte (f.titre, 36, x, y + 22, alpha (PAPIER, 0.5f * a), "RÉGLAGE" + std::string (points, '.'));
+			texte (f.titre, 36, x, y + 22, alpha (PAPIER, 0.5f * a), "STARTING" + std::string (points, '.'));
 		}
 		for (int k = 0; k < (int)code.size () && k < 6; ++k)
 		{
@@ -1077,17 +1076,17 @@ struct Station::Impl
 		};
 		if (e.role == 1)
 		{
-			auditeur (ly, true, PAPIER, moi + " · HÔTE", false);
+			auditeur (ly, true, PAPIER, moi + " · HOST", false);
 			if (lui.empty ())
-				auditeur (ly + 18, false, PAPIER, "EN ATTENTE D'UN AUDITEUR", true);
+				auditeur (ly + 18, false, PAPIER, "WAITING FOR A GUEST", true);
 			else
-				auditeur (ly + 18, true, ORANGE, lui + " · À L'ÉCOUTE", false);
+				auditeur (ly + 18, true, ORANGE, lui + " · CONNECTED", false);
 		}
 		else
 		{
-			auditeur (ly, true, PAPIER, (lui.empty () ? std::string ("RECHERCHE") : lui) + " · HÔTE",
+			auditeur (ly, true, PAPIER, (lui.empty () ? std::string ("SEARCHING") : lui) + " · HOST",
 			          lui.empty ());
-			auditeur (ly + 18, true, ORANGE, "TOI · INVITÉ", false);
+			auditeur (ly + 18, true, ORANGE, "YOU · GUEST", false);
 		}
 	}
 
@@ -1134,22 +1133,22 @@ struct Station::Impl
 		dl->AddRectFilled (V (116, 92), V (548, 296), PAPIER);
 		dl->AddRect (V (116, 92), V (548, 296), ENCRE, 0.0f, 0, F (2.0f));
 
-		texte (f.monoGras, 11, 138, 110, BLEU, "EN ONDES / PROJET DE L'HÔTE");
-		texte (f.titre, 34, 138, 128, ENCRE, "CHARGER SON PROJET ?");
+		texte (f.monoGras, 11, 138, 110, BLEU, "LIVE / HOST'S PROJECT");
+		texte (f.titre, 34, 138, 128, ENCRE, "LOAD THEIR PROJECT?");
 		texte (f.monoGras, 12, 138, 170, ORANGE,
 		       tronquer (f.monoGras, F (12), majuscules (e.demande), F (390)));
 		texte (f.texte, 14, 138, 192, ENCRE,
-		       "Ton projet actuel est sauvegardé, puis remplacé par le sien. "
-		       "Sans ça, tu quittes la session.", 392);
+		       "Your current project is saved, then replaced by theirs. "
+		       "Otherwise you leave the session.", 392);
 
 		const bool surOui = survol == 0, surNon = survol == 1;
 		dl->AddRectFilled (V (138, 250), V (300, 284), surOui ? ENCRE : BLEU);
-		texte (f.titre, 20, 219 - largeur (f.titre, 20, "CHARGER") / 2, 256, PAPIER, "CHARGER");
+		texte (f.titre, 20, 219 - largeur (f.titre, 20, "LOAD") / 2, 256, PAPIER, "LOAD");
 		if (surNon)
 			dl->AddRectFilled (V (312, 250), V (530, 284), ENCRE);
 		dl->AddRect (V (312, 250), V (530, 284), ENCRE, 0.0f, 0, F (2.0f));
-		texte (f.titre, 20, 421 - largeur (f.titre, 20, "QUITTER LA SESSION") / 2, 256,
-		       surNon ? PAPIER : ENCRE, "QUITTER LA SESSION");
+		texte (f.titre, 20, 421 - largeur (f.titre, 20, "LEAVE SESSION") / 2, 256,
+		       surNon ? PAPIER : ENCRE, "LEAVE SESSION");
 
 		transformer (dl, m, matriceDemande ());
 	}

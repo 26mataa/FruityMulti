@@ -202,7 +202,7 @@ void surveillerAgent ()
 		std::lock_guard<std::mutex> g (g_mtx);
 		g_role = 0;
 		g_pair.clear ();
-		g_statut = g_erreur.empty () ? "L'agent s'est arrêté — voir le journal" : g_erreur;
+		g_statut = g_erreur.empty () ? "The agent stopped — see the log" : g_erreur;
 	}
 }
 
@@ -452,11 +452,11 @@ void actionHeberger ()
 	if (lancerSession ("--heberger"))
 	{
 		fmgui::setRole (1);
-		fmgui::setStatus ("Ouverture de la station…");
+		fmgui::setStatus ("Starting session…");
 	}
 	else
 	{
-		fmgui::setStatus ("fm_agent.exe introuvable : réinstalle FruityMulti");
+		fmgui::setStatus ("fm_agent.exe not found: reinstall FruityMulti");
 	}
 }
 
@@ -479,11 +479,11 @@ void actionRejoindre (const std::string& brut)
 	{
 		fmgui::setRole (2);
 		fmgui::setAddress (adresse.c_str ());
-		fmgui::setStatus ("Recherche de la fréquence…");
+		fmgui::setStatus ("Looking for the session…");
 	}
 	else
 	{
-		fmgui::setStatus ("fm_agent.exe introuvable : réinstalle FruityMulti");
+		fmgui::setStatus ("fm_agent.exe not found: reinstall FruityMulti");
 	}
 }
 
@@ -918,11 +918,11 @@ void FmView::executer (fmstation::Action a, const std::string& arg)
 			adresse = g_adresse;
 		}
 		if (adresse.empty ())
-			station.signaler ("Pas encore de fréquence");
+			station.signaler ("No code yet");
 		else
 		{
 			copierTexte (hwnd, adresse);
-			station.signaler ("Fréquence copiée → presse-papiers");
+			station.signaler ("Code copied to clipboard");
 		}
 		break;
 	}

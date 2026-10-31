@@ -30,7 +30,7 @@ export default {
 
 		const morceaux = url.pathname.split ("/").filter (Boolean);
 		if (morceaux.length !== 2 || morceaux[0] !== "salon")
-			return new Response ("introuvable\n", { status: 404 });
+			return new Response ("not found\n", { status: 404 });
 
 		const code = morceaux[1].toUpperCase ();
 		if (!CODE.test (code))
@@ -84,9 +84,9 @@ export class Salon extends DurableObject
 		if (role !== "hote" && role !== "invite")
 			return "role inconnu";
 		if (proto !== PROTO)
-			return `protocole ${proto} ici, ${PROTO} sur le relais : mets FruityMulti a jour`;
+			return `protocol ${proto} here, ${PROTO} on the relay: update FruityMulti`;
 		if (role === "invite" && !this.present ("hote"))
-			return "aucune session ouverte avec ce code";
+			return "no session open with this code";
 		return null;
 	}
 
@@ -133,7 +133,7 @@ export class Salon extends DurableObject
 		{
 			for (const pair of this.autre (ws))
 			{
-				try { pair.close (4002, "hote parti"); } catch (e) { }
+				try { pair.close (4002, "host left"); } catch (e) { }
 			}
 		}
 	}

@@ -28,7 +28,7 @@ const int IDR_VST3 = 1001;
 const int IDR_AGENT = 1002;
 
 std::mutex g_mtx;
-std::wstring g_statut = L"Prêt.";
+std::wstring g_statut = L"Ready.";
 std::atomic<bool> g_travailFini (false);
 std::atomic<bool> g_echec (false);
 bool g_applySeulement = false;
@@ -255,12 +255,12 @@ void travail ()
 
 	if (!g_applySeulement)
 	{
-		statut (L"Préparation des fichiers…");
+		statut (L"Preparing files…");
 		const bool a = extraire (IDR_VST3, vst3Source);
 		const bool b = extraire (IDR_AGENT, agentSource);
 		if (!a || !b)
 		{
-			statut (L"Ce programme est incomplet : télécharge-le à nouveau.");
+			statut (L"This installer is incomplete: download it again.");
 			g_echec = true;
 			g_travailFini = true;
 			PostMessageW (g_fenetre, WM_APP + 1, 0, 0);
@@ -271,7 +271,7 @@ void travail ()
 	if (GetFileAttributesW (vst3Source.c_str ()) == INVALID_FILE_ATTRIBUTES
 	    || GetFileAttributesW (agentSource.c_str ()) == INVALID_FILE_ATTRIBUTES)
 	{
-		statut (L"Aucun fichier à installer.");
+		statut (L"Nothing to install.");
 		g_echec = true;
 		g_travailFini = true;
 		PostMessageW (g_fenetre, WM_APP + 1, 0, 0);
@@ -284,30 +284,30 @@ void travail ()
 
 	if (fenetreFL () != nullptr)
 	{
-		statut (L"FL Studio est ouvert : demande en cours…");
+		statut (L"FL Studio is open: waiting for you…");
 		const int choix = MessageBoxW (
 		    g_fenetre,
-		    L"FL Studio doit être fermé pour remplacer le plugin.\n\n"
-		    L"Enregistre ton projet, puis clique sur OK : FL va se fermer, "
-		    L"l'installation se termine, et FL redémarre tout seul.\n\n"
-		    L"Annuler : tu fermeras FL toi-même et relanceras ce programme.",
+		    L"FL Studio must be closed to replace the plugin.\n\n"
+		    L"Save your project, then click OK: FL closes, the install "
+		    L"finishes, and FL restarts by itself.\n\n"
+		    L"Cancel: close FL yourself and run this installer again.",
 		    kTitre, MB_OKCANCEL | MB_ICONINFORMATION);
 
 		if (choix != IDOK)
 		{
-			statut (L"Installation annulée. Relance ce programme quand FL "
-			        L"sera fermé.");
+			statut (L"Install cancelled. Run this installer again once FL "
+			        L"is closed.");
 			g_travailFini = true;
 			PostMessageW (g_fenetre, WM_APP + 1, 0, 0);
 			return;
 		}
 
 		cheminDeFL = cheminFL ();
-		statut (L"Fermeture de FL Studio…");
+		statut (L"Closing FL Studio…");
 		if (!fermerFL (40000))
 		{
-			statut (L"FL Studio ne s'est pas fermé : ferme-le puis relance "
-			        L"ce programme.");
+			statut (L"FL Studio did not close: close it, then run "
+			        L"this installer again.");
 			g_echec = true;
 			g_travailFini = true;
 			PostMessageW (g_fenetre, WM_APP + 1, 0, 0);
@@ -317,7 +317,7 @@ void travail ()
 		Sleep (900);
 	}
 
-	statut (L"Installation du plugin…");
+	statut (L"Installing the plugin…");
 	std::wstring emplacements;
 	int copies = 0;
 	for (const std::wstring& dossier : dossiersVst3 ())
@@ -331,25 +331,25 @@ void travail ()
 	}
 	if (copies == 0)
 	{
-		statut (L"Impossible d'écrire dans les dossiers VST3.\n"
-		        L"Lance le programme en tant qu'administrateur.");
+		statut (L"Could not write to the VST3 folders.\n"
+		        L"Run the installer as administrator.");
 		g_echec = true;
 		g_travailFini = true;
 		PostMessageW (g_fenetre, WM_APP + 1, 0, 0);
 		return;
 	}
 
-	statut (L"Installation de l'agent…");
+	statut (L"Installing the agent…");
 	arreterAgent ();
 	const std::wstring agentCible = local + L"\\fm_agent.exe";
 	if (!copier (agentSource, agentCible))
 	{
 		wchar_t pourquoi[600];
 		swprintf_s (pourquoi,
-		            L"Impossible d'installer l'agent dans :\n\n  %s\n\n"
-		            L"Erreur Windows : %lu\n\n"
-		            L"Verifie que fm_agent.exe n'est pas lance, et autorise le "
-		            L"fichier dans ton antivirus, puis relance.",
+		            L"Could not install the agent to:\n\n  %s\n\n"
+		            L"Windows error: %lu\n\n"
+		            L"Check that fm_agent.exe is not running, allow the file "
+		            L"in your antivirus, then try again.",
 		            agentCible.c_str (), GetLastError ());
 		statut (pourquoi);
 		g_echec = true;
@@ -365,7 +365,7 @@ void travail ()
 
 	if (relancer)
 	{
-		statut (L"Redémarrage de FL Studio…");
+		statut (L"Restarting FL Studio…");
 		SHELLEXECUTEINFOW info;
 		memset (&info, 0, sizeof (info));
 		info.cbSize = sizeof (info);
@@ -373,15 +373,14 @@ void travail ()
 		info.nShow = SW_SHOWNORMAL;
 		ShellExecuteExW (&info);
 		Sleep (1200);
-		statut (L"Installé :" + emplacements + L"\n  " + agentCible +
-		        L"\n\nFL Studio redémarre avec la nouvelle version.");
+		statut (L"Installed:" + emplacements + L"\n  " + agentCible +
+		        L"\n\nFL Studio is restarting with the new version.");
 	}
 	else
 	{
-		statut (L"Installé :" + emplacements + L"\n  " + agentCible +
-		        L"\n\nRedémarre FL Studio (il garde l'ancienne version en "
-		        L"mémoire), puis ajoute l'effet FruityMulti Bridge sur une "
-		        L"piste du mixeur.");
+		statut (L"Installed:" + emplacements + L"\n  " + agentCible +
+		        L"\n\nRestart FL Studio, then add the FruityMulti Bridge "
+		        L"effect to a mixer track.");
 	}
 
 	g_travailFini = true;
@@ -412,7 +411,7 @@ void dessiner (HDC dc, int largeur, int hauteur)
 	SetTextColor (dc, RGB (0x8A, 0x8D, 0x97));
 	SelectObject (dc, texte);
 	r = { 22, 52, largeur - 22, 72 };
-	DrawTextW (dc, L"Installation dans FL Studio", -1, &r, DT_LEFT | DT_SINGLELINE);
+	DrawTextW (dc, L"Install into FL Studio", -1, &r, DT_LEFT | DT_SINGLELINE);
 
 	std::wstring message;
 	{
@@ -435,7 +434,7 @@ LRESULT CALLBACK proc (HWND h, UINT msg, WPARAM w, LPARAM l)
 		InvalidateRect (h, nullptr, FALSE);
 		if (g_travailFini)
 		{
-			SetWindowTextW (g_bouton, g_echec ? L"Fermer" : L"Terminer");
+			SetWindowTextW (g_bouton, g_echec ? L"Close" : L"Finish");
 			EnableWindow (g_bouton, TRUE);
 		}
 		return 0;
@@ -508,8 +507,8 @@ int WINAPI wWinMain (HINSTANCE instance, HINSTANCE, PWSTR, int)
 		if (relancerEnAdmin ())
 			return 0;
 		MessageBoxW (nullptr,
-		             L"L'installation a besoin des droits d'administrateur.\n"
-		             L"Accepte la demande de Windows, puis relance.",
+		             L"The installer needs administrator rights.\n"
+		             L"Accept the Windows prompt, then try again.",
 		             kTitre, MB_ICONWARNING);
 		return 1;
 	}
@@ -527,14 +526,14 @@ int WINAPI wWinMain (HINSTANCE instance, HINSTANCE, PWSTR, int)
 	const int hauteur = 260;
 
 	g_fenetre = CreateWindowExW (0, L"FruityMultiSetup",
-	                             L"FruityMulti - installation",
+	                             L"FruityMulti Setup",
 	                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
 	                             CW_USEDEFAULT, CW_USEDEFAULT, largeur, hauteur,
 	                             nullptr, nullptr, instance, nullptr);
 	if (g_fenetre == nullptr)
 		return 1;
 
-	g_bouton = CreateWindowExW (0, L"BUTTON", L"Installation en cours…",
+	g_bouton = CreateWindowExW (0, L"BUTTON", L"Installing…",
 	                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
 	                            largeur - 200, hauteur - 62, 178, 34,
 	                            g_fenetre, (HMENU)1, instance, nullptr);
