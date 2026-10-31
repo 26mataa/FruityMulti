@@ -2,115 +2,79 @@
 
 # FruityMulti
 
-**Multiplayer for FL Studio.**
-Two PCs, one project, each person in their own FL.
+**Make music together in FL Studio.**
 
-[![Download](https://img.shields.io/github/v/release/26mataa/FruityMulti?label=download&color=2340FF&style=for-the-badge)](https://github.com/26mataa/FruityMulti/releases/latest)
-![Windows 64-bit](https://img.shields.io/badge/Windows-64--bit-121212?style=for-the-badge)
-![FL Studio 26.1.7](https://img.shields.io/badge/FL%20Studio-26.1.7-FF5A1F?style=for-the-badge)
+Two PCs. One project. Everything you do appears on your friend's screen.
+
+[![Download](https://img.shields.io/badge/Download-FruityMultiSetup.exe-2340FF?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/26mataa/FruityMulti/releases/latest/download/FruityMultiSetup.exe)
+
+Free · Windows · FL Studio 26.1.7
+
+<img src="docs/live.png" alt="The FruityMulti window during a session, with your friend's cursor" width="640">
 
 </div>
 
----
+## Get started
 
-Add a note and it shows up on the other PC. Change the tempo and theirs follows.
-No screen sharing, no emailing project files: FruityMulti links your two FL
-Studios while you make music.
+Both of you do this once:
 
-No audio goes over the network. Each person hears their own FL, with no delay.
+1. **Download** [FruityMultiSetup.exe](https://github.com/26mataa/FruityMulti/releases/latest/download/FruityMultiSetup.exe) and run it.
+2. If Windows says "Windows protected your PC", click **More info**, then **Run anyway**.
+3. Open FL Studio and add **FruityMulti Bridge** to any mixer track.
 
-## What stays in sync
+Then start a session:
+
+<table>
+<tr>
+<td width="50%"><img src="docs/home.png" alt="Click HOST to get a code"></td>
+<td width="50%"><img src="docs/join.png" alt="Click JOIN and enter the code"></td>
+</tr>
+<tr>
+<td><b>Person 1</b> clicks <b>HOST</b> and sends the 6-character code to their friend.</td>
+<td><b>Person 2</b> clicks <b>JOIN</b>, pastes the code and presses Enter.</td>
+</tr>
+</table>
+
+That's it. Person 2 gets Person 1's project, and you are making music together.
+
+## What you share
 
 | | |
 |---|---|
-| 🎹 **Notes** | on the right channel, even if your racks are in a different order |
-| 🧩 **Playlist** | clips and patterns |
-| ⏱️ **Tempo and playback** | tempo, current pattern, play position |
-| 🎚️ **Mixer** | volume, pan, mute, routing, master |
-| 🎛️ **Effects** | added effects and all their settings |
-| 🎸 **Instruments** | added instruments, their settings, presets and wavetables, including heavy plugins |
-| 🔊 **Sampler** | the sample itself and the channel's settings |
-| 🖱️ **Cursor** | your friend's cursor and clicks, on the same window as them |
+| 🎹 **Notes** | Add or move a note and it moves on both PCs. |
+| 🧩 **Playlist** | Clips and patterns. |
+| ⏱️ **Playback** | Tempo, play and stop, position. |
+| 🎚️ **Mixer** | Volume, pan, mute, routing and effects. |
+| 🎸 **Instruments** | Plugins, presets and every knob. |
+| 🔊 **Samples** | The sound and all its Sampler settings. |
+| 🖱️ **Cursor** | See where your friend is pointing and clicking. |
 
-You both start from the host's project. After that you work as equals, and the
-host has the final say on tempo, pattern and transport.
+No sound goes through the internet. You each hear your own FL Studio, with no delay.
 
-## Install
+## Good to know
 
-1. Close FL Studio.
-2. Download **[FruityMultiSetup.exe](https://github.com/26mataa/FruityMulti/releases/latest/download/FruityMultiSetup.exe)** and run it.
-3. Windows may say "Windows protected your PC" because the installer is not
-   signed. Click **More info**, then **Run anyway**.
-4. Open FL Studio, add the **FruityMulti Bridge** effect to a mixer track, and
-   open its window.
+- You both need **FL Studio 26.1.7** on **Windows 64-bit**.
+- A session is **two people**.
+- You both need the same plugins. The **PLUGINS** page shows what is missing.
+- Samples up to 4 MB are sent for you. Bigger samples and your own wavetables need to be on both PCs.
+- You don't need to open any ports.
+- To update, click **UPDATE** in the FruityMulti window.
+- If FL Studio updates, FruityMulti turns itself off until a new version comes out.
 
-Both PCs need **FL Studio 26.1.7**. If a plugin is on only one PC, the other
-person gets an empty channel with its name, and the **PLUGINS** page shows
-what is missing.
-
-## Play together
-
-1. The first person clicks **HOST** and gets a 6-character code.
-2. They send the code to the other person.
-3. The other person clicks **JOIN**, types or pastes the code, and presses Enter.
-4. The guest loads the host's project. You are now live.
-
-You can also use the window with the keyboard: arrows to move, Enter to confirm.
-
-> [!NOTE]
-> **Connection.** You don't need to open any ports: the code goes through a
-> relay. If the relay can't be reached, the host switches to a direct connection
-> and gets an address like `82.64.12.7:5000/K7P2QX`. Paste it as it is on the
-> guest's PC. This needs a router with UPnP, or port 5000 open.
-
-## Updates
-
-Click **UPDATE** in the window. If there is a newer version, press Enter: FL
-closes, the plugin is replaced, and FL restarts.
-
-## Limits
-
-- Windows 64-bit only.
-- Two people per session.
-- One FL version is supported. If FL updates, the plugin turns itself off and
-  says so in its window until a new FruityMulti comes out.
-- Very large samples and plugin states are not sent.
-- Your own wavetable files are not sent: a table you imported needs to be on
-  both PCs. Tables that come with the plugin work everywhere.
-
-## How it works
-
-```mermaid
-flowchart LR
-    subgraph A["Host PC"]
-        FLA["FL Studio<br>FruityMulti plugin"] <-->|"127.0.0.1"| AGA["fm_agent"]
-    end
-    subgraph B["Guest PC"]
-        FLB["FL Studio<br>FruityMulti plugin"] <-->|"127.0.0.1"| AGB["fm_agent"]
-    end
-    AGA <-->|"relay or direct connection"| AGB
-```
-
-The **VST3 plugin** (C++) runs inside FL. It reads and writes the project and
-draws the window. The **agent** (Python) compares your project with the other PC
-and sends only what changed.
-
-The **relay** is a small service on Cloudflare Workers' free plan: one room per
-code, passing messages between the two PCs.
-
-| Folder | Contents |
-|---|---|
-| [`dll/FruityMulti`](dll/FruityMulti) | the plugin and its window |
-| [`net`](net) | the sync agent |
-| [`relais`](relais) | the Cloudflare relay |
-| [`setup`](setup) | the installer |
+FruityMulti is an independent project, not affiliated with Image-Line. FL Studio is a trademark of Image-Line.
 
 <details>
-<summary><b>Build from source</b></summary>
+<summary><b>For developers</b></summary>
 
-You need Visual Studio 2022, CMake and Python 3.12.
+FruityMulti has three parts:
 
-**Plugin.** The VST3 SDK is not in this repository:
+- A **VST3 plugin** in C++ that runs inside FL Studio ([`dll/FruityMulti`](dll/FruityMulti)).
+- An **agent** in Python that sends only what changed ([`net`](net)).
+- A small **relay** on Cloudflare Workers that connects two PCs with a code ([`relais`](relais)).
+
+The installer is in [`setup`](setup).
+
+**Build the plugin.** You need Visual Studio 2022 and CMake. The VST3 SDK is not in this repository:
 
 ```powershell
 git clone --recursive --depth 1 https://github.com/steinbergmedia/vst3sdk dll\vst3sdk
@@ -118,14 +82,14 @@ cmake -S dll\FruityMulti -B dll\build-fm -G "Visual Studio 17 2022" -A x64
 cmake --build dll\build-fm --config Release --target FruityMultiBridge
 ```
 
-**Agent.**
+**Build the agent.** You need Python 3.12:
 
 ```powershell
 pip install -r requirements.txt pyinstaller
 python -m PyInstaller --onefile --name fm_agent --distpath net\dist --workpath net\build --specpath net net\agent_sync.py
 ```
 
-**Relay** (free Cloudflare account, no card needed):
+**Deploy the relay.** You need a free Cloudflare account:
 
 ```powershell
 cd relais
@@ -134,17 +98,8 @@ npx wrangler login
 npx wrangler deploy
 ```
 
-Then put the address you get in `RELAIS`, at the start of the network section of
-`net/agent_sync.py`.
+Then put your relay address in `RELAIS` in `net/agent_sync.py`.
+
+**Credits.** Interface made with [Dear ImGui](https://github.com/ocornut/imgui) (MIT). Fonts: [Archivo](https://github.com/Omnibus-Type/Archivo) and [IBM Plex Mono](https://github.com/IBM/plex) (OFL). Plugin built with Steinberg's [VST3 SDK](https://github.com/steinbergmedia/vst3sdk).
 
 </details>
-
-## Credits
-
-Interface drawn with [Dear ImGui](https://github.com/ocornut/imgui) (MIT license),
-fonts [Archivo](https://github.com/Omnibus-Type/Archivo) and
-[IBM Plex Mono](https://github.com/IBM/plex) (OFL license), plugin built with
-Steinberg's [VST3 SDK](https://github.com/steinbergmedia/vst3sdk).
-
-FruityMulti is an independent project, not affiliated with Image-Line.
-FL Studio is a trademark of Image-Line.

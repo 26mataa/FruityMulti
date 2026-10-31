@@ -255,7 +255,7 @@ void travail ()
 
 	if (!g_applySeulement)
 	{
-		statut (L"Preparing files…");
+		statut (L"Getting ready…");
 		const bool a = extraire (IDR_VST3, vst3Source);
 		const bool b = extraire (IDR_AGENT, agentSource);
 		if (!a || !b)
@@ -284,19 +284,18 @@ void travail ()
 
 	if (fenetreFL () != nullptr)
 	{
-		statut (L"FL Studio is open: waiting for you…");
+		statut (L"FL Studio is open.");
 		const int choix = MessageBoxW (
 		    g_fenetre,
-		    L"FL Studio must be closed to replace the plugin.\n\n"
-		    L"Save your project, then click OK: FL closes, the install "
-		    L"finishes, and FL restarts by itself.\n\n"
-		    L"Cancel: close FL yourself and run this installer again.",
+		    L"FL Studio needs to close to finish installing.\n\n"
+		    L"Save your project, then click OK.\n"
+		    L"FL Studio will close and reopen by itself.",
 		    kTitre, MB_OKCANCEL | MB_ICONINFORMATION);
 
 		if (choix != IDOK)
 		{
-			statut (L"Install cancelled. Run this installer again once FL "
-			        L"is closed.");
+			statut (L"Cancelled. Close FL Studio, then run this installer "
+			        L"again.");
 			g_travailFini = true;
 			PostMessageW (g_fenetre, WM_APP + 1, 0, 0);
 			return;
@@ -306,7 +305,7 @@ void travail ()
 		statut (L"Closing FL Studio…");
 		if (!fermerFL (40000))
 		{
-			statut (L"FL Studio did not close: close it, then run "
+			statut (L"FL Studio did not close. Close it, then run "
 			        L"this installer again.");
 			g_echec = true;
 			g_travailFini = true;
@@ -317,7 +316,7 @@ void travail ()
 		Sleep (900);
 	}
 
-	statut (L"Installing the plugin…");
+	statut (L"Installing…");
 	std::wstring emplacements;
 	int copies = 0;
 	for (const std::wstring& dossier : dossiersVst3 ())
@@ -331,26 +330,24 @@ void travail ()
 	}
 	if (copies == 0)
 	{
-		statut (L"Could not write to the VST3 folders.\n"
-		        L"Run the installer as administrator.");
+		statut (L"Could not install.\n"
+		        L"Right-click this installer and choose Run as administrator.");
 		g_echec = true;
 		g_travailFini = true;
 		PostMessageW (g_fenetre, WM_APP + 1, 0, 0);
 		return;
 	}
 
-	statut (L"Installing the agent…");
 	arreterAgent ();
 	const std::wstring agentCible = local + L"\\fm_agent.exe";
 	if (!copier (agentSource, agentCible))
 	{
 		wchar_t pourquoi[600];
 		swprintf_s (pourquoi,
-		            L"Could not install the agent to:\n\n  %s\n\n"
-		            L"Windows error: %lu\n\n"
-		            L"Check that fm_agent.exe is not running, allow the file "
-		            L"in your antivirus, then try again.",
-		            agentCible.c_str (), GetLastError ());
+		            L"Could not finish installing (Windows error %lu).\n\n"
+		            L"Your antivirus may be blocking FruityMulti.\n"
+		            L"Allow it, then run this installer again.",
+		            GetLastError ());
 		statut (pourquoi);
 		g_echec = true;
 		g_travailFini = true;
@@ -365,7 +362,7 @@ void travail ()
 
 	if (relancer)
 	{
-		statut (L"Restarting FL Studio…");
+		statut (L"Reopening FL Studio…");
 		SHELLEXECUTEINFOW info;
 		memset (&info, 0, sizeof (info));
 		info.cbSize = sizeof (info);
@@ -373,14 +370,12 @@ void travail ()
 		info.nShow = SW_SHOWNORMAL;
 		ShellExecuteExW (&info);
 		Sleep (1200);
-		statut (L"Installed:" + emplacements + L"\n  " + agentCible +
-		        L"\n\nFL Studio is restarting with the new version.");
+		statut (L"All done! FL Studio is reopening.");
 	}
 	else
 	{
-		statut (L"Installed:" + emplacements + L"\n  " + agentCible +
-		        L"\n\nRestart FL Studio, then add the FruityMulti Bridge "
-		        L"effect to a mixer track.");
+		statut (L"All done!\n\nNext: open FL Studio and add FruityMulti "
+		        L"Bridge to a mixer track.");
 	}
 
 	g_travailFini = true;
@@ -411,7 +406,7 @@ void dessiner (HDC dc, int largeur, int hauteur)
 	SetTextColor (dc, RGB (0x8A, 0x8D, 0x97));
 	SelectObject (dc, texte);
 	r = { 22, 52, largeur - 22, 72 };
-	DrawTextW (dc, L"Install into FL Studio", -1, &r, DT_LEFT | DT_SINGLELINE);
+	DrawTextW (dc, L"Multiplayer for FL Studio", -1, &r, DT_LEFT | DT_SINGLELINE);
 
 	std::wstring message;
 	{
