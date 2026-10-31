@@ -33,7 +33,7 @@ from collections import Counter
 # Le depot public qui heberge les versions. L'agent y lit la derniere release
 # et telecharge le plugin + lui-meme. A incrementer a chaque publication.
 DEPOT = "26mataa/FruityMulti"
-AGENT_VERSION = 47
+AGENT_VERSION = 48
 ADRESSE_RELEASES = f"https://github.com/{DEPOT}/releases/latest"
 
 PLUGIN_HOST = "127.0.0.1"
@@ -90,7 +90,15 @@ REPARATIONS_MAX = 3
 EFFET_DOUBLURE = "Fruity Balance"     # ne change pas le son
 # Un canal part en entier : son .fst (reglages du plugin) et son sample.
 TAILLE_CANAL_MAX = 8 * 1024 * 1024
-TAILLE_SAMPLE_MAX = 4 * 1024 * 1024   # 3 Mo prennent 47 s a 66 ko/s en montee
+TAILLE_SAMPLE_MAX = 64 * 1024 * 1024  # le relais suit : c'est la montee du PC qui limite
+GROS_TRANSFERT = 40                   # morceaux : au-dela, la fenetre montre l'avancement
+INTERVALLE_TRANSFERT = 0.5
+# Ce que les deux PC partagent. Le reglage vit dans le plugin et vaut pour les deux.
+SYNC_LECTURE = 1                      # lecture, arret, position, mode SONG/PAT
+SYNC_MOTIF = 2                        # motif affiche
+SYNC_DEFAUT = SYNC_MOTIF
+INTERVALLE_SYNC = 0.25
+VERSION_PAIR_MIN = 48                 # avant : les notes partent sans leur motif
 EVT_SAMPLE = 0xC4
 EVT_TYPE_CANAL = 0x15
 EVT_NOM_PLUGIN = 0xC9
@@ -333,6 +341,8 @@ class PluginLost(Exception):
 class Plugin:
     """Client du plugin, avec une seule connexion reutilisee."""
 
+    motif_lu = None                # motif de la derniere lecture des notes
+
     def __init__(self, host=PLUGIN_HOST, port=PLUGIN_PORT):
         self._presets = None
         self.host = host
@@ -496,6 +506,7 @@ class Plugin:
         for line in self.cmd("NOTES"):
             if line.startswith("NOTES "):
                 tokens = []
+                self.motif_lu = int(line.split()[1])
                 continue
             if line.startswith("END"):
                 break
@@ -531,6 +542,26 @@ class Plugin:
             return None
         tokens = " ".join(f"{n[0]}:{n[2]}" for n in notes)
         return self.cmd(f"DELX {channel} {len(notes)} {tokens}")[0]
+
+    def add_to(self, channel, motif, notes):
+        """Comme add_many, dans un motif donne meme s'il n'est pas affiche."""
+        tokens = " ".join(f"{t}:{l}:{p}:{v}" for t, l, p, v in notes)
+        return self.cmd(f"ADDXTO {channel} {motif} {len(notes)} {tokens}")[0]
+
+    def del_to(self, channel, motif, notes):
+        tokens = " ".join(f"{n[0]}:{n[2]}" for n in notes)
+        return self.cmd(f"DELXTO {channel} {motif} {len(notes)} {tokens}")[0]
+
+    def sync(self):
+        """Ce que les deux PC partagent (SYNC_*), None si le plugin ne le dit pas."""
+        try:
+            parts = self.cmd("SYNC")[0].split()
+            return int(parts[1]) if parts[0] == "SYNC" else None
+        except (OSError, TimeoutError, ValueError, IndexError):
+            return None
+
+    def set_sync(self, bits):
+        return self.cmd(f"SYNC {bits}")[0]
 
     def refresh(self):
         return self.cmd("REFRESH")[0]
@@ -738,6 +769,7 @@ class Plugin:
 
         notes = {}
         if len(lines) > 1 and lines[1].startswith("NOTES "):
+            self.motif_lu = int(lines[1].split()[1])
             for tok in lines[1].split()[3:]:
                 bits = tok.split(":")
                 if len(bits) < 5:
@@ -1451,6 +1483,11 @@ class Sync:
         self.projet_etat = None
         if pair and pair.get("projet"):
             self.projet_etat = "a_offrir" if is_host else "attente"
+        lu = self.plugin.sync()
+        self.sync = SYNC_DEFAUT if lu is None else lu
+        self.last_sync = 0.0
+        self.transfert_max = 0
+        self.last_transfert = 0.0
         self.lire_projet()
 
     def lire_projet(self):
@@ -1582,9 +1619,67 @@ class Sync:
         Les deux participants peuvent lancer la lecture ou regler le tempo.
         En cas de conflit (les deux agissent en meme temps), la derniere
         action recue gagne. L'hote n'est plus en lecture seule : c'etait
-        trop restrictif a l'usage.
+        trop restrictif a l'usage. Faux si les deux PC ne partagent pas ca.
         """
+        if not self.partage(message.get("type")):
+            return False
         self.publish(message)
+        return True
+
+    def partage(self, kind):
+        if kind in ("transport", "songpos", "songmode"):
+            return bool(self.sync & SYNC_LECTURE)
+        if kind == "pattern":
+            return bool(self.sync & SYNC_MOTIF)
+        return True
+
+    def suivre_sync(self):
+        """Le reglage a change dans la fenetre : l'autre PC suit. Celui qui
+        reactive donne le ton, sinon les deux restent decales."""
+        now = time.monotonic()
+        if now - self.last_sync < INTERVALLE_SYNC:
+            return
+        self.last_sync = now
+        bits = self.plugin.sync()
+        if bits is None or bits == self.sync:
+            return
+        reactives = bits & ~self.sync
+        self.sync = bits
+        self.publish({"type": "sync", "bits": bits})
+        print(f"[sync] {self.resume_sync()}")
+        if reactives & SYNC_MOTIF and self.pattern:
+            self.publish_global({"type": "pattern", "n": self.pattern})
+        if reactives & SYNC_LECTURE and self.playing is not None:
+            self.publish_global({"type": "transport", "playing": self.playing})
+            if self.mode is not None:
+                self.publish_global({"type": "songmode", "mode": self.mode})
+
+    def recevoir_sync(self, message):
+        self.sync = int(message.get("bits", self.sync))
+        self.plugin.set_sync(self.sync)
+        print(f"[sync] {self.resume_sync()}")
+
+    def resume_sync(self):
+        return (f"play/stop {'shared' if self.sync & SYNC_LECTURE else 'separate'}, "
+                f"pattern {'shared' if self.sync & SYNC_MOTIF else 'separate'}")
+
+    def suivre_transfert(self):
+        """Un gros sample prend du temps : la fenetre montre ou il en est."""
+        now = time.monotonic()
+        if now - self.last_transfert < INTERVALLE_TRANSFERT:
+            return
+        self.last_transfert = now
+        attente = sum(1 for m in list(getattr(self.link, "lente", ())) if "d" in m)
+        self.transfert_max = max(self.transfert_max, attente)
+        if self.transfert_max < GROS_TRANSFERT:
+            self.transfert_max = attente
+            return
+        if attente == 0:
+            self.transfert_max = 0
+            self.statut_session()
+            return
+        fait = 100 - 100 * attente // self.transfert_max
+        gui_etat(self.plugin, f"Sending to {self.poste_pair}: {fait}%")
 
     def publier_rack(self, channels=None):
         """Rack complet de l'hote, d'un bloc et dans l'ordre : c'est ce qui
@@ -1618,6 +1713,7 @@ class Sync:
 
     def publier_reglages(self):
         """Tempo, motif, transport et position : ce qui ne se rejoue pas."""
+        self.publish({"type": "sync", "bits": self.sync})
         tempo = self.plugin.tempo()
         if tempo:
             self.publish_global({"type": "tempo", "bpm": tempo})
@@ -1660,7 +1756,8 @@ class Sync:
         total = 0
         for channel, notes in self.snapshot.items():
             if notes:
-                self.publish({"type": "add", "ch": channel, "notes": notes})
+                self.publish({"type": "add", "ch": channel, "notes": notes,
+                              "pat": self.pattern})
                 total += len(notes)
 
         tempo = self.publier_reglages()
@@ -1741,6 +1838,11 @@ class Sync:
             kind = message.get("type")
             if seulement is not None and kind not in seulement:
                 continue
+            if kind == "sync":
+                self.recevoir_sync(message)
+                continue
+            if not self.partage(kind):
+                continue
             # "ch" = canal du piano roll. Les anciens messages portaient "list".
             index = message.get("ch", message.get("list", 0))
 
@@ -1776,14 +1878,18 @@ class Sync:
                         print(f"[rack] channel '{nom or index}' is missing here: "
                               f"its notes are not written")
                 elif notes:
-                    self.plugin.add_many(int(cible), notes)
+                    self.ecrire_notes(int(cible), notes, message.get("pat"))
                     applied += len(notes)
 
             elif kind == "del":
                 notes = [tuple(n) for n in message.get("notes", [])]
                 cible = self.index_local(int(index))
                 if notes and cible is not None:
-                    self.plugin.del_many(int(cible), notes)
+                    motif = message.get("pat")
+                    if motif:
+                        self.plugin.del_to(int(cible), int(motif), notes)
+                    else:
+                        self.plugin.del_many(int(cible), notes)
                     applied += len(notes)
 
             elif kind == "tempo":
@@ -1998,9 +2104,15 @@ class Sync:
 
             elif kind == "canal_morceau" and self.canal_recu:
                 self.canal_recu["recus"].append(base64.b64decode(message.get("d", "")))
-                if len(self.canal_recu["recus"]) >= int(self.canal_recu.get("morceaux", 0)):
+                recus = len(self.canal_recu["recus"])
+                nombre = int(self.canal_recu.get("morceaux", 0))
+                if nombre >= GROS_TRANSFERT and recus % 16 == 0:
+                    gui_etat(self.plugin, f"Receiving a sample: {100 * recus // nombre}%")
+                if recus >= nombre:
                     recu, self.canal_recu = self.canal_recu, None
                     self.recevoir_canal(recu)
+                    if nombre >= GROS_TRANSFERT:
+                        self.statut_session()
                     applied += 1
 
             elif kind == "addchannel":
@@ -2274,7 +2386,27 @@ class Sync:
             print(f"[sync] {applied} change(s) received")
         return applied
 
+    def ecrire_notes(self, canal, notes, motif):
+        if not motif:
+            self.plugin.add_many(canal, notes)
+            return
+        reponse = self.plugin.add_to(canal, int(motif), notes)
+        if reponse.endswith("missing"):
+            self.creer_motif(int(motif))
+            self.plugin.add_to(canal, int(motif), notes)
+
+    def creer_motif(self, motif):
+        """FL ne cree la liste de notes d'un motif qu'a sa premiere selection."""
+        ici = self.pattern
+        self.plugin.cmd_force(f"PATTERN {motif}")
+        if ici:
+            self.plugin.cmd_force(f"PATTERN {ici}")
+        self.pattern_limite = time.monotonic() + DELAI_ECHO_TRANSPORT
+        print(f"[sync] pattern {motif} created")
+
     def detect_local(self):
+        self.suivre_sync()
+        self.suivre_transfert()
         st = None
         current = None
 
@@ -2320,9 +2452,9 @@ class Sync:
                 self.playing = current_playing
             elif (current_playing != self.playing
                   and time.monotonic() >= self.transport_limite):
-                self.publish_global({"type": "transport", "playing": current_playing})
-                print(f"[sync] transport sent: {'play' if current_playing else 'stop'}")
-                changed += 1
+                if self.publish_global({"type": "transport", "playing": current_playing}):
+                    print(f"[sync] transport sent: {'play' if current_playing else 'stop'}")
+                    changed += 1
                 self.playing = current_playing
 
         current_mode = st.get("mode", -1) if st else -1
@@ -2330,9 +2462,9 @@ class Sync:
             if self.mode is None:
                 self.mode = current_mode
             elif current_mode != self.mode and time.monotonic() >= self.mode_limite:
-                self.publish_global({"type": "songmode", "mode": current_mode})
-                print(f"[sync] mode sent: {'SONG' if current_mode else 'PAT'}")
-                changed += 1
+                if self.publish_global({"type": "songmode", "mode": current_mode}):
+                    print(f"[sync] mode sent: {'SONG' if current_mode else 'PAT'}")
+                    changed += 1
                 self.mode = current_mode
 
         current_pattern = st["pattern"] if st else None
@@ -2341,9 +2473,9 @@ class Sync:
                 self.pattern = current_pattern
             elif (current_pattern != self.pattern
                   and time.monotonic() >= self.pattern_limite):
-                self.publish_global({"type": "pattern", "n": current_pattern})
-                print(f"[sync] pattern sent: {current_pattern}")
-                changed += 1
+                if self.publish_global({"type": "pattern", "n": current_pattern}):
+                    print(f"[sync] pattern sent: {current_pattern}")
+                    changed += 1
                 self.pattern = current_pattern
                 # Autre motif, autres notes : ce n'est pas une modification. Sans
                 # ca, ses notes partiraient chez le pair avant qu'il ait suivi.
@@ -2551,7 +2683,6 @@ class Sync:
         # reglages du pair avec des valeurs qui ne le concernaient pas.
         if False and now - self.last_params >= 1.0:
             self.last_params = now
-            param_changed = 0
             for track in range(1, 9):
                 for slot in (0, 1):
                     values = self.plugin.params(track, slot, 8)
@@ -2566,10 +2697,7 @@ class Sync:
                         if index < len(known) and raw != known[index]:
                             self.publish({"type": "param", "track": track,
                                           "slot": slot, "i": index, "v": raw})
-                            param_changed += 1
                     self.params[key] = values
-            if param_changed:
-                print(f"[sync] {param_changed} parameter(s) sent")
 
         # position de lecture : diffusee seulement a l'arret. Pendant la
         # lecture elle avance toute seule, la synchroniser ferait des combats.
@@ -2578,15 +2706,14 @@ class Sync:
             if (self.position is not None
                     and abs(position - self.position) > 8
                     and time.monotonic() >= self.transport_limite):
-                self.publish_global({"type": "songpos", "pos": position})
-                print(f"[sync] position sent: {position}")
+                if self.publish_global({"type": "songpos", "pos": position}):
+                    print(f"[sync] position sent: {position}")
             self.position = position
         elif st:
             self.position = st["position"]
 
         # mixeur : deja present dans STATUS, donc plus aucune requete dediee
         if st:
-            sent = 0
             tranches = dict(st["mix"])
             tranches.update(self.mix_tard or {})
             self.mix_tard = None
@@ -2614,10 +2741,6 @@ class Sync:
                     payload = {"type": "mix", "track": track}
                     payload.update(changes)
                     self.publish(payload)
-                    sent += 1
-
-            if sent:
-                print(f"[sync] {sent} mixer track(s) sent")
 
         # Note tenue : l'autre voit le geste, sans une relecture de FL par pixel.
         if notes_pretes:
@@ -2708,6 +2831,11 @@ class Sync:
 
     def envoyer_notes(self, current):
         """Envoie au pair l'ecart entre `current` et ce qu'il connait deja."""
+        # L'utilisateur vient de changer de motif, on ne l'a pas encore vu :
+        # l'ecart ne veut rien dire, et il viderait l'ancien motif chez le pair.
+        lu = self.plugin.motif_lu
+        if lu is not None and lu != self.pattern:
+            return 0
         changed = 0
         for channel in set(list(current.keys()) + list(self.snapshot.keys())):
             # Un canal qui n'existe pas chez l'hote ne doit pas partir :
@@ -2735,12 +2863,14 @@ class Sync:
             # premier canal").
             removed = diff_removals(old, new)
             if removed:
-                self.publish({"type": "del", "ch": cible, "notes": removed})
+                self.publish({"type": "del", "ch": cible, "notes": removed,
+                              "pat": self.pattern})
                 changed += len(removed)
 
             added = diff_additions(old, new)
             if added:
-                self.publish({"type": "add", "ch": cible, "notes": added})
+                self.publish({"type": "add", "ch": cible, "notes": added,
+                              "pat": self.pattern})
                 changed += len(added)
 
         self.snapshot = current
@@ -3914,7 +4044,7 @@ class TransportTcp:
                     raise TimeoutError("nothing received")
             chunk = self.sock.recv(65536)
             if not chunk:
-                raise ConnectionError("pair deconnecte")
+                raise ConnectionError("the other PC left")
             self.buf += chunk
         ligne, _, self.buf = self.buf.partition(b"\n")
         return ligne.decode("utf-8")
@@ -4007,7 +4137,7 @@ def poignee_de_main(transport, est_hote, code, delai=10.0):
             continue
         for m in _messages(texte):
             if m.get("_relais") == "pair_parti":
-                raise ConnectionError("pair parti pendant la presentation")
+                raise ConnectionError("the other PC left during the handshake")
             if m.get("type") == "refus":
                 raise Refus(m.get("raison", "refused by the host"))
             if m.get("type") == "hello":
@@ -4018,6 +4148,8 @@ def poignee_de_main(transport, est_hote, code, delai=10.0):
     if lui.get("proto") != PROTO:
         raison = (f"protocol {lui.get('proto')} on the other PC, {PROTO} here: "
                   f"both PCs need to update FruityMulti")
+    elif int(lui.get("version") or 0) < VERSION_PAIR_MIN:
+        raison = "the other PC has an old FruityMulti: both PCs need the latest version"
     elif lui.get("role") == moi["role"]:
         raison = f"two {moi['role']}s in one session"
     elif est_hote and str(lui.get("code", "")).upper() != code:
@@ -4158,7 +4290,7 @@ class Link:
                 for trame in self._trames(lot):
                     self.transport.envoyer(trame)
             except Exception as exc:
-                self._mort(f"pair deconnecte ({exc})")
+                self._mort(f"the other PC left ({exc})")
                 return
             dernier_envoi = time.monotonic()
 
@@ -4168,11 +4300,11 @@ class Link:
                 texte = self.transport.recevoir(1.0)
             except TimeoutError:
                 if time.monotonic() - self.dernier_recu > self.SILENCE_MAX:
-                    self._mort(f"plus de nouvelles du pair depuis {self.SILENCE_MAX:.0f} s")
+                    self._mort(f"no news from the other PC for {self.SILENCE_MAX:.0f} s")
                     return
                 continue
             except Exception as exc:
-                self._mort(f"pair deconnecte ({exc})")
+                self._mort(f"the other PC left ({exc})")
                 return
             self.dernier_recu = time.monotonic()
             try:
@@ -4182,7 +4314,7 @@ class Link:
                 continue
             for message in messages:
                 if message.get("_relais") == "pair_parti":
-                    self._mort("pair deconnecte")
+                    self._mort("the other PC left")
                     return
                 if "_relais" in message or message.get("type") in ("_battement", "hello"):
                     continue
@@ -4515,6 +4647,8 @@ class _Journal:
                 pass
         if self.fichier is not None:
             try:
+                if texte.strip():
+                    texte = time.strftime("%H:%M:%S ") + texte
                 self.fichier.write(texte)
                 self.fichier.flush()
             except Exception:

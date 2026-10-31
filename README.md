@@ -43,7 +43,8 @@ That's it. Person 2 gets Person 1's project, and you are making music together.
 |---|---|
 | 🎹 **Notes** | Add or move a note and it moves on both PCs. |
 | 🧩 **Playlist** | Clips and patterns. |
-| ⏱️ **Playback** | Tempo, play and stop, position. |
+| ⏱️ **Tempo** | Always the same on both PCs. |
+| ▶️ **Play and stop** | Separate by default, so you can each work. Turn sync on in **SETTINGS**. |
 | 🎚️ **Mixer** | Volume, pan, mute, routing and effects. |
 | 🎸 **Instruments** | Plugins, presets and every knob. |
 | 🔊 **Samples** | The sound and all its Sampler settings. |
@@ -56,7 +57,7 @@ No sound goes through the internet. You each hear your own FL Studio, with no de
 - You both need **FL Studio 26.1.7** on **Windows 64-bit**.
 - A session is **two people**.
 - You both need the same plugins. The **PLUGINS** page shows what is missing.
-- Samples up to 4 MB are sent for you. Bigger samples and your own wavetables need to be on both PCs.
+- Samples up to 64 MB are sent for you. Bigger samples and your own wavetables need to be on both PCs.
 - You don't need to open any ports.
 - To update, click **UPDATE** in the FruityMulti window.
 - If FL Studio updates, FruityMulti turns itself off until a new version comes out.

@@ -34,6 +34,16 @@ void soumettreEtat (const char* texte);
 void setDemande (const char* poste);
 std::string prendreChoix ();
 
+// Ce que les deux PC partagent (bits SYNC_* de l'agent). Garde d'une session
+// a l'autre ; en session, le dernier qui change decide pour les deux.
+int  sync ();
+void setSync (int bits);
+
+// Ce que les deux PC partagent (bits SYNC_* de l'agent). Garde d'une session
+// a l'autre ; en session, le dernier qui change decide pour les deux.
+int  sync ();
+void setSync (int bits);
+
 int  role ();
 bool agentLance ();
 
@@ -41,6 +51,6 @@ bool agentLance ();
 void agentParti ();
 
 // Version du plugin, telle qu'annoncee par la commande VERSION.
-constexpr int kVersionPlugin = 47;
+constexpr int kVersionPlugin = 48;
 
 } // namespace fmgui

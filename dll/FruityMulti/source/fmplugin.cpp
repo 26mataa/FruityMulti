@@ -1818,11 +1818,29 @@ static std::string executeCommand (const std::string& line)
 	if (line == "CHOIX")
 		return "CHOIX " + fmgui::prendreChoix ();
 
+	// Ce que les deux PC partagent : la fenetre le change, l'agent le suit.
+	if (line == "SYNC")
+		return "SYNC " + std::to_string (fmgui::sync ());
+	if (line.rfind ("SYNC ", 0) == 0)
+	{
+		fmgui::setSync (atoi (line.c_str () + 5));
+		return "SYNC " + std::to_string (fmgui::sync ());
+	}
+
+	// Ce que les deux PC partagent : la fenetre le change, l'agent le suit.
+	if (line == "SYNC")
+		return "SYNC " + std::to_string (fmgui::sync ());
+	if (line.rfind ("SYNC ", 0) == 0)
+	{
+		fmgui::setSync (atoi (line.c_str () + 5));
+		return "SYNC " + std::to_string (fmgui::sync ());
+	}
+
 	// Identifiant de build : permet de savoir quelle version tourne
 	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
 	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 47-s";
+		return "VERSION 48-a";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)

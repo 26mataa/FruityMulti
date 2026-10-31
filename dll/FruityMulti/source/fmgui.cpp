@@ -63,6 +63,9 @@ std::atomic<int> g_majEtat ((int)fmstation::Maj::Repos);
 std::atomic<int> g_majVersion (0);
 std::atomic<bool> g_checkEnCours (false);
 
+constexpr int kSyncDefaut = 2;   // SYNC_MOTIF : chacun sa lecture
+std::atomic<int> g_sync (-1);    // -1 = pas encore lu
+
 // --------------------------------------------------------------------------
 // Petits utilitaires
 // --------------------------------------------------------------------------
@@ -910,6 +913,16 @@ void FmView::executer (fmstation::Action a, const std::string& arg)
 	case fmstation::Action::ProjetNon: actionRepondre ("non"); break;
 	case fmstation::Action::VerifierMaj: actionVerifierMaj (); break;
 	case fmstation::Action::InstallerMaj: actionInstallerMaj (); break;
+	case fmstation::Action::Sync: fmgui::setSync (atoi (arg.c_str ())); break;
+	case fmstation::Action::CopierJournal:
+	{
+		std::string tout;
+		for (const std::string& l : journal)
+			tout += l + "\r\n";
+		copierTexte (hwnd, tout);
+		station.signaler ("Log copied");
+		break;
+	}
 	case fmstation::Action::Copier:
 	{
 		std::string adresse;
@@ -944,7 +957,7 @@ void FmView::image ()
 	{
 		dernierJournal = maintenant;
 		const std::string dossier = dossierLocal ();
-		journal = dernieresLignes (dossier + "\\journal.txt", 6);
+		journal = dernieresLignes (dossier + "\\journal.txt", 300);
 		compat = lireCompat (dossier + "\\compat.txt");
 	}
 
@@ -961,8 +974,9 @@ void FmView::image ()
 	e.version = fmgui::kVersionPlugin;
 	e.maj = (fmstation::Maj)g_majEtat.load ();
 	e.majVersion = g_majVersion.load ();
-	e.journal = journal;
-	e.compat = compat;
+	e.sync = fmgui::sync ();
+	e.journal = &journal;
+	e.compat = &compat;
 
 	ImGuiContext* avant = ImGui::GetCurrentContext ();
 	ImGui::SetCurrentContext (imgui);
@@ -1043,6 +1057,10 @@ LRESULT FmView::message (UINT msg, WPARAM w, LPARAM l)
 
 	case WM_LBUTTONUP:
 		station.bouton (false);
+		return 0;
+
+	case WM_MOUSEWHEEL:
+		station.molette ((float)GET_WHEEL_DELTA_WPARAM (w) / WHEEL_DELTA);
 		return 0;
 
 	case WM_SETCURSOR:
@@ -1161,6 +1179,33 @@ std::string prendreChoix ()
 	std::string choix = g_choix.empty () ? "-" : g_choix;
 	g_choix.clear ();
 	return choix;
+}
+
+int sync ()
+{
+	int v = g_sync.load ();
+	if (v >= 0)
+		return v;
+	v = kSyncDefaut;
+	if (FILE* f = fopen ((dossierLocal () + "\\reglages.txt").c_str (), "rb"))
+	{
+		int lu = 0;
+		if (fscanf (f, "sync %d", &lu) == 1 && lu >= 0 && lu <= 3)
+			v = lu;
+		fclose (f);
+	}
+	g_sync = v;
+	return v;
+}
+
+void setSync (int bits)
+{
+	g_sync = bits & 3;
+	if (FILE* f = fopen ((dossierLocal () + "\\reglages.txt").c_str (), "wb"))
+	{
+		fprintf (f, "sync %d\n", bits & 3);
+		fclose (f);
+	}
 }
 
 void agentParti ()

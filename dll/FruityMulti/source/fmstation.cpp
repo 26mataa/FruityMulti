@@ -261,7 +261,60 @@ std::string tronquer (ImFont* f, float taille, const std::string& s, float large
 // --------------------------------------------------------------------------
 // Les entrees du menu
 // --------------------------------------------------------------------------
-enum class Entree { Heberger, Rejoindre, Compat, Journal, Maj, CopierCode, Couper };
+enum class Entree { Heberger, Rejoindre, Compat, Reglages, Journal, Maj, CopierCode, Couper };
+
+// Les pages qui prennent toute la fenetre : l'etiquette n'en montre que le resume.
+enum class Page { Aucune, Plugins, Reglages, Journal };
+
+constexpr float kPageX0 = 104, kPageY0 = 14, kPageX1 = 628, kPageY1 = 344;
+constexpr float kPasPlugin = 24;
+
+// Une ligne du journal, prete a dessiner.
+struct LigneLog
+{
+	std::string heure, tag, texte;
+	bool probleme = false;
+	bool session = false;   // debut d'une session
+	int fois = 1;           // la meme ligne, plusieurs fois de suite
+	float hauteur = 18;
+};
+
+bool estProbleme (const std::string& s)
+{
+	static const char* const mots[] = { "refused", "failed", "could not", "not found", "missing",
+	                                    "too large", "not sent", "error", "ERR", "WARNING",
+	                                    "lost", "unreadable", "damaged", "left" };
+	for (const char* m : mots)
+		if (s.find (m) != std::string::npos)
+			return true;
+	return false;
+}
+
+LigneLog lireLigne (const std::string& brut)
+{
+	LigneLog l;
+	std::string s = brut;
+	if (s.size () > 20 && s[2] == '/' && s[5] == '/')
+	{
+		l.session = true;
+		l.texte = "SESSION · " + s.substr (0, 16);
+		return l;
+	}
+	if (s.size () > 9 && s[2] == ':' && s[5] == ':' && s[8] == ' ')
+	{
+		l.heure = s.substr (0, 8);
+		s = s.substr (9);
+	}
+	const size_t fin = s.find ("] ");
+	if (!s.empty () && s[0] == '[' && fin != std::string::npos)
+	{
+		l.tag = s.substr (1, fin - 1);
+		s = s.substr (fin + 2);
+	}
+	l.texte = s;
+	l.probleme = estProbleme (s);
+	return l;
+}
 
 struct Ligne
 {
@@ -275,10 +328,12 @@ std::vector<Ligne> lignesDuMenu (bool enOndes, int role)
 		return { { Entree::Heberger, "HOST" },
 		         { Entree::Rejoindre, "JOIN" },
 		         { Entree::Compat, "PLUGINS" },
+		         { Entree::Reglages, "SETTINGS" },
 		         { Entree::Journal, "LOG" },
 		         { Entree::Maj, "UPDATE" } };
 	return { { Entree::CopierCode, "COPY CODE" },
 	         { Entree::Compat, "PLUGINS" },
+	         { Entree::Reglages, "SETTINGS" },
 	         { Entree::Journal, "LOG" },
 	         { Entree::Couper, role == 1 ? "END SESSION" : "LEAVE SESSION" } };
 }
@@ -350,6 +405,7 @@ struct Station::Impl
 	int sel = 0;
 	int contenu = 0;               // ligne dont l'etiquette montre le contenu
 	Ressort barre[8], decalage[8], ecart[8], grossi[8];
+	float pasMenu () const { return lignes.size () > 5 ? 31.0f : 35.0f; }
 	float tFrappe = -10.0f;        // derniere validation (tampon)
 	int ligneFrappee = -1;
 
@@ -378,6 +434,19 @@ struct Station::Impl
 	std::string saisie;            // code tape par l'invite
 	std::string saisieDirecte;     // ip:port colle depuis une adresse directe
 	float tFrappeCase[6] = { -10, -10, -10, -10, -10, -10 };
+
+	// --- pages -----------------------------------------------------------------
+	Page page = Page::Aucune;
+	float tPage = -10.0f;
+	bool surBouton = false;
+	bool tenu = false;             // bouton gauche enfonce
+	bool barreTenue = false;
+	float defil = 0.0f, defilVoulu = 0.0f;
+	bool suivreBas = false;        // le journal reste sur la derniere ligne
+	bool queLesEcarts = false;     // plugins manquants, ou problemes du journal
+	std::string recherche;         // plugins : ce qui est tape
+	std::vector<LigneLog> log;
+	std::string logEmpreinte;
 
 	// --- etat precedent, pour reperer les changements ------------------------
 	std::string pairPrec;
@@ -468,10 +537,60 @@ struct Station::Impl
 			tamponner ();
 			demander (Action::Couper);
 			break;
+		case Entree::Compat:
+			tamponner ();
+			ouvrir (Page::Plugins);
+			break;
+		case Entree::Reglages:
+			tamponner ();
+			ouvrir (Page::Reglages);
+			break;
+		case Entree::Journal:
+			tamponner ();
+			ouvrir (Page::Journal);
+			break;
 		default:
 			tamponner ();
 			break;
 		}
+	}
+
+	const std::vector<std::string>& lignesJournal () const
+	{
+		static const std::vector<std::string> vide;
+		return e.journal != nullptr ? *e.journal : vide;
+	}
+
+	const std::vector<std::pair<char, std::string>>& lignesCompat () const
+	{
+		static const std::vector<std::pair<char, std::string>> vide;
+		return e.compat != nullptr ? *e.compat : vide;
+	}
+
+	void compter (int& communs, int& ici, int& labas) const
+	{
+		communs = ici = labas = 0;
+		for (const auto& c : lignesCompat ())
+			++(c.first == '=' ? communs : (c.first == '+' ? ici : labas));
+	}
+
+	void ouvrir (Page p)
+	{
+		page = p;
+		tPage = t;
+		defil = 0.0f;
+		defilVoulu = p == Page::Journal ? 1e7f : 0.0f;
+		suivreBas = p == Page::Journal;
+		recherche.clear ();
+		int communs, ici, labas;
+		compter (communs, ici, labas);
+		queLesEcarts = p == Page::Plugins && ici + labas > 0;
+	}
+
+	void fermerPage ()
+	{
+		page = Page::Aucune;
+		barreTenue = false;
 	}
 
 	void saisir (const std::string& brut)
@@ -678,8 +797,8 @@ struct Station::Impl
 		for (int i = 0; i < (int)lignes.size (); ++i)
 		{
 			const float x0 = 74 + i * 14.0f;
-			const float y0 = 156 + i * 35.0f;
-			if (x >= x0 && x <= x0 + 290 && y >= y0 && y < y0 + 35)
+			const float y0 = 156 + i * pasMenu ();
+			if (x >= x0 && x <= x0 + 290 && y >= y0 && y < y0 + pasMenu ())
 				return i;
 		}
 		return -1;
@@ -697,7 +816,7 @@ struct Station::Impl
 			grossi[i].vers (choisie ? 1.1f : 1.0f, dt);
 
 			const float x = 74 + decalage[i].x;
-			const float y = 156 + i * 35.0f;
+			const float y = 156 + i * pasMenu ();
 			const bool frappee = i == ligneFrappee && t - tFrappe < 0.17f;
 
 			const float k = std::clamp (barre[i].x, 0.0f, 1.08f);
@@ -818,19 +937,36 @@ struct Station::Impl
 		case Entree::Compat:
 			contenuCompat (x, y, a, i);
 			break;
+		case Entree::Reglages:
+		{
+			entete (x, y, a, i, "SETTINGS");
+			auto rang = [&] (float yy, const char* nom, bool partage) {
+				texte (f.titre, 19, x, yy, alpha (PAPIER, a), nom);
+				const char* s = partage ? "SYNC" : "SEPARATE";
+				texte (f.monoGras, 11, x + 204 - largeur (f.monoGras, 11, s), yy + 6,
+				       alpha (partage ? BLEU_CL : ORANGE, a), s);
+				dl->AddRectFilled (V (x, yy + 25), V (x + 204, yy + 26), alpha (PAPIER, 0.2f * a));
+			};
+			rang (y + 20, "PLAY / STOP", (e.sync & 1) != 0);
+			rang (y + 50, "PATTERN", (e.sync & 2) != 0);
+			consigne (x, y + 92, a, "ENTER → CHANGE");
+			break;
+		}
 		case Entree::Journal:
 		{
 			entete (x, y, a, i, "LOG");
-			if (e.journal.empty ())
+			const auto& dern = lignesJournal ();
+			if (dern.empty ())
 				texte (f.mono, 11, x, y + 20, alpha (PAPIER, 0.6f * a), "NOTHING YET");
-			const size_t debut = e.journal.size () > 6 ? e.journal.size () - 6 : 0;
-			for (size_t k = debut; k < e.journal.size (); ++k)
+			const size_t debut = dern.size () > 4 ? dern.size () - 4 : 0;
+			for (size_t k = debut; k < dern.size (); ++k)
 			{
-				const std::string l = tronquer (f.mono, F (11), majuscules (e.journal[k]), F (204));
-				const bool recente = k + 1 == e.journal.size ();
+				const LigneLog l = lireLigne (dern[k]);
+				const std::string s = tronquer (f.mono, F (11), l.texte, F (204));
 				texte (f.mono, 11, x, y + 20 + (k - debut) * 19.0f,
-				       alpha (recente ? BLEU_CL : PAPIER, a), l);
+				       alpha (k + 1 == dern.size () ? BLEU_CL : PAPIER, a), s);
 			}
+			consigne (x, y + 102, a, "ENTER → OPEN");
 			break;
 		}
 		case Entree::Maj:
@@ -901,48 +1037,24 @@ struct Station::Impl
 
 	void contenuCompat (float x, float y, float a, int i)
 	{
-		entete (x, y, a, i, "YOU · THEM");
-		if (e.compat.empty ())
+		entete (x, y, a, i, "PLUGINS");
+		if (lignesCompat ().empty ())
 		{
-			paragraphe (x, y + 18, a,
-			    "Connect to someone: your plugins are compared here.");
+			paragraphe (x, y + 18, a, "Start a session: your plugins are compared here.");
 			return;
 		}
-
-		// ce qui manque d'abord : c'est ce qui casse une session
-		std::vector<std::pair<char, std::string>> rangs = e.compat;
-		auto poids = [] (char c) { return c == '-' ? 0 : (c == '+' ? 1 : 2); };
-		std::stable_sort (rangs.begin (), rangs.end (),
-		                  [&] (const auto& p, const auto& q) { return poids (p.first) < poids (q.first); });
-
-		// 5 rangs tiennent dans l'etiquette ; au-dela, 4 et une ligne de reste
-		const int visibles = (int)rangs.size () <= 5 ? (int)rangs.size () : 4;
-		for (int r = 0; r < visibles; ++r)
-		{
-			const float ry = y + 18 + r * 24.0f;
-			const float rx = x + r * 3.0f;
-			const char sorte = rangs[r].first;
-			const ImU32 c = sorte == '=' ? PAPIER : ORANGE;
-			texte (f.titre, 19, rx, ry, alpha (PAPIER, a),
-			       tronquer (f.titre, F (19), majuscules (rangs[r].second), F (150)));
-			carre (x + 178, ry + 5, 9, alpha (c, a), sorte != '-');
-			carre (x + 192, ry + 5, 9, alpha (c, a), sorte != '+');
-			dl->AddRectFilled (V (rx, ry + 21), V (x + 204, ry + 22), alpha (PAPIER, 0.2f * a));
-		}
-		if ((int)rangs.size () > visibles)
-		{
-			const int reste = (int)rangs.size () - visibles;
-			int manquants = 0;
-			for (int r = visibles; r < (int)rangs.size (); ++r)
-				manquants += rangs[r].first != '=';
-			char b[64];
-			if (manquants > 0)
-				snprintf (b, sizeof (b), "+%d MORE · %d NOT ON BOTH", reste, manquants);
-			else
-				snprintf (b, sizeof (b), "+%d MORE IN COMMON", reste);
-			texte (f.mono, 11, x + visibles * 3.0f, y + 22 + visibles * 24.0f,
-			       alpha (PAPIER, 0.6f * a), tronquer (f.mono, F (11), b, F (204)));
-		}
+		int communs, ici, labas;
+		compter (communs, ici, labas);
+		auto rang = [&] (float yy, int n, const char* s, ImU32 c) {
+			char b[16];
+			snprintf (b, sizeof (b), "%d", n);
+			texte (f.titre, 22, x, yy, alpha (c, a), b);
+			texte (f.monoGras, 11, x + 46, yy + 7, alpha (c, a), s);
+		};
+		rang (y + 18, communs, "IN COMMON", PAPIER);
+		rang (y + 44, ici, "ONLY ON YOUR PC", ici > 0 ? ORANGE : alpha (PAPIER, 0.5f));
+		rang (y + 70, labas, "ONLY ON THEIR PC", labas > 0 ? ORANGE : alpha (PAPIER, 0.5f));
+		consigne (x, y + 104, a, "ENTER → SEE THE LIST");
 	}
 
 	void contenuMaj (float x, float y, float a, int i)
@@ -1088,6 +1200,308 @@ struct Station::Impl
 			          lui.empty ());
 			auditeur (ly + 18, true, ORANGE, "YOU · GUEST", false);
 		}
+	}
+
+	// --- pages ------------------------------------------------------------------
+	bool dedans (ImVec2 p, float x0, float y0, float x1, float y1) const
+	{
+		const float x = p.x / S, y = p.y / S;
+		return p.x >= 0 && x >= x0 && x < x1 && y >= y0 && y < y1;
+	}
+
+	bool zone (float x0, float y0, float x1, float y1)
+	{
+		if (dedans (souris, x0, y0, x1, y1))
+			surBouton = true;
+		if (!clicAttendu || !dedans (clic, x0, y0, x1, y1))
+			return false;
+		clicAttendu = false;
+		return true;
+	}
+
+	bool boutonPage (float x, float y, float w, float h, const std::string& s, bool plein,
+	                 ImU32 c = PAPIER)
+	{
+		const bool sur = dedans (souris, x, y, x + w, y + h);
+		if (plein)
+			dl->AddRectFilled (V (x, y), V (x + w, y + h), c);
+		else if (sur)
+			dl->AddRectFilled (V (x, y), V (x + w, y + h), alpha (c, 0.16f));
+		dl->AddRect (V (x, y), V (x + w, y + h), plein ? c : alpha (c, 0.5f), 0.0f, 0, F (1.0f));
+		texte (f.monoGras, 11, x + (w - largeur (f.monoGras, 11, s)) / 2, y + (h - 14) / 2,
+		       plein ? ENCRE : c, s);
+		return zone (x, y, x + w, y + h);
+	}
+
+	// La barre de defilement, a droite de la liste. Rend le decalage a appliquer.
+	float defiler (float x, float y0, float y1, float total)
+	{
+		const float vue = y1 - y0;
+		const float maxi = std::max (0.0f, total - vue);
+		if (suivreBas)
+			defilVoulu = maxi;
+		const float h = maxi > 0 ? std::max (24.0f, vue * vue / total) : vue;
+		if (maxi > 0)
+		{
+			if (clicAttendu && dedans (clic, x - 4, y0, x + 12, y1))
+			{
+				clicAttendu = false;
+				barreTenue = true;
+			}
+			if (barreTenue && !tenu)
+				barreTenue = false;
+			if (barreTenue)
+				defilVoulu = (souris.y / S - y0 - h / 2) / (vue - h) * maxi;
+		}
+		defilVoulu = std::clamp (defilVoulu, 0.0f, maxi);
+		suivreBas = page == Page::Journal && defilVoulu >= maxi - 0.5f;
+		defil += (defilVoulu - defil) * std::min (1.0f, dt * 20.0f);
+		defil = std::clamp (defil, 0.0f, maxi);
+		if (maxi > 0)
+		{
+			const float yb = y0 + (vue - h) * defil / maxi;
+			dl->AddRectFilled (V (x, y0), V (x + 4, y1), alpha (PAPIER, 0.12f));
+			dl->AddRectFilled (V (x, yb), V (x + 4, yb + h), barreTenue ? BLEU_CL : alpha (PAPIER, 0.7f));
+		}
+		return defil;
+	}
+
+	void coche (float x, float y, bool oui)
+	{
+		if (oui)
+		{
+			const ImVec2 p[3] = { V (x, y + 6), V (x + 4, y + 10), V (x + 11, y + 1) };
+			dl->AddPolyline (p, 3, PAPIER, F (2.0f), 0);
+		}
+		else
+		{
+			dl->AddLine (V (x + 1, y + 1), V (x + 10, y + 10), ORANGE, F (2.0f));
+			dl->AddLine (V (x + 10, y + 1), V (x + 1, y + 10), ORANGE, F (2.0f));
+		}
+	}
+
+	void pagePlugins ()
+	{
+		const float x0 = kPageX0 + 18, x1 = kPageX1 - 26;
+		const auto& compat = lignesCompat ();
+		if (compat.empty ())
+		{
+			texte (f.texte, 14, x0, kPageY0 + 70, alpha (PAPIER, 0.8f),
+			       "Start or join a session: your plugins are compared with your friend's.", 460);
+			return;
+		}
+		int communs, ici, labas;
+		compter (communs, ici, labas);
+		char b[96];
+		snprintf (b, sizeof (b), "%d IN COMMON · %d ONLY YOU · %d ONLY THEM", communs, ici, labas);
+		texte (f.monoGras, 11, x0, kPageY0 + 46, alpha (ici + labas > 0 ? ORANGE : BLEU_CL, 1.0f), b);
+
+		float yb = kPageY0 + 66;
+		snprintf (b, sizeof (b), "ALL %d", communs + ici + labas);
+		if (boutonPage (x0, yb, 72, 22, b, !queLesEcarts))
+		{
+			queLesEcarts = false;
+			defilVoulu = 0;
+		}
+		snprintf (b, sizeof (b), "NOT ON BOTH %d", ici + labas);
+		if (boutonPage (x0 + 78, yb, 112, 22, b, queLesEcarts))
+		{
+			queLesEcarts = true;
+			defilVoulu = 0;
+		}
+		const std::string invite = recherche.empty () ? "TYPE TO SEARCH" : recherche + "_";
+		texte (f.mono, 11, x0 + 204, yb + 4,
+		       alpha (recherche.empty () ? PAPIER : BLEU_CL, recherche.empty () ? 0.5f : 1.0f),
+		       tronquer (f.mono, F (11), invite, F (170)));
+
+		const float yt = yb + 30;
+		texte (f.monoGras, 10, x0, yt, alpha (PAPIER, 0.55f), "PLUGIN");
+		texte (f.monoGras, 10, x1 - 88, yt, alpha (PAPIER, 0.55f), "YOU");
+		texte (f.monoGras, 10, x1 - 38, yt, alpha (PAPIER, 0.55f), "THEM");
+
+		// ce qui manque d'abord : c'est ce qui casse une session
+		const std::string cherche = majuscules (recherche);
+		std::vector<std::pair<char, std::string>> rangs;
+		for (const auto& c : compat)
+			if ((!queLesEcarts || c.first != '=')
+			    && (cherche.empty () || majuscules (c.second).find (cherche) != std::string::npos))
+				rangs.push_back (c);
+		auto poids = [] (char c) { return c == '-' ? 0 : (c == '+' ? 1 : 2); };
+		std::stable_sort (rangs.begin (), rangs.end (),
+		                  [&] (const auto& p, const auto& q) { return poids (p.first) < poids (q.first); });
+
+		const float y0 = yt + 16, y1 = kPageY1 - 12;
+		if (rangs.empty ())
+		{
+			texte (f.texte, 14, x0, y0 + 8, alpha (PAPIER, 0.8f),
+			       recherche.empty () ? "You both have the same plugins." : "No plugin with this name.");
+			return;
+		}
+		const float d = defiler (x1 + 8, y0, y1, rangs.size () * kPasPlugin);
+		dl->PushClipRect (V (x0 - 6, y0), V (x1 + 2, y1), false);
+		for (int r = (int)(d / kPasPlugin); r < (int)rangs.size (); ++r)
+		{
+			const float y = y0 + r * kPasPlugin - d;
+			if (y > y1)
+				break;
+			const char c = rangs[r].first;
+			if (c != '=')
+				dl->AddRectFilled (V (x0 - 6, y), V (x1 + 2, y + kPasPlugin - 2), alpha (ORANGE, 0.14f));
+			texte (f.texte, 14, x0, y + 3, PAPIER, tronquer (f.texte, F (14), rangs[r].second, F (360)));
+			coche (x1 - 82, y + 6, c != '-');
+			coche (x1 - 30, y + 6, c != '+');
+			dl->AddRectFilled (V (x0 - 6, y + kPasPlugin - 1), V (x1 + 2, y + kPasPlugin),
+			                   alpha (PAPIER, 0.1f));
+		}
+		dl->PopClipRect ();
+	}
+
+	void preparerLog (float largeurTexte)
+	{
+		const auto& brut = lignesJournal ();
+		const std::string empreinte = std::to_string (brut.size ()) + "/" + std::to_string (S) + "/"
+		                              + (brut.empty () ? std::string () : brut.back ());
+		if (empreinte == logEmpreinte)
+			return;
+		logEmpreinte = empreinte;
+		log.clear ();
+		for (const std::string& b : brut)
+		{
+			if (b.empty () || b[0] == '=')
+				continue;
+			LigneLog l = lireLigne (b);
+			if (!log.empty () && !l.session && log.back ().texte == l.texte && log.back ().tag == l.tag)
+			{
+				log.back ().fois++;
+				log.back ().heure = l.heure;
+				continue;
+			}
+			l.hauteur = l.session ? 26.0f
+			                      : std::max (18.0f, mesure (f.texte, F (13), l.texte, F (largeurTexte)).y / S + 5);
+			log.push_back (std::move (l));
+		}
+	}
+
+	void pageJournal ()
+	{
+		const float x0 = kPageX0 + 18, x1 = kPageX1 - 26;
+		const float xTexte = x0 + 118;
+		preparerLog (x1 - xTexte - 36);
+
+		const float yb = kPageY0 + 46;
+		if (boutonPage (x0, yb, 72, 22, "ALL", !queLesEcarts))
+		{
+			queLesEcarts = false;
+			suivreBas = true;
+		}
+		if (boutonPage (x0 + 78, yb, 92, 22, "PROBLEMS", queLesEcarts))
+		{
+			queLesEcarts = true;
+			suivreBas = true;
+		}
+		if (boutonPage (x1 - 60, yb, 62, 22, "COPY", false))
+			demander (Action::CopierJournal);
+
+		const float y0 = yb + 32, y1 = kPageY1 - 12;
+		float total = 0;
+		for (const LigneLog& l : log)
+			if (!queLesEcarts || l.probleme)
+				total += l.hauteur;
+		if (total <= 0)
+		{
+			texte (f.texte, 14, x0, y0 + 8, alpha (PAPIER, 0.8f),
+			       queLesEcarts ? "No problems so far." : "Nothing yet.");
+			return;
+		}
+		const float d = defiler (x1 + 8, y0, y1, total);
+		dl->PushClipRect (V (x0 - 6, y0), V (x1 + 2, y1), false);
+		float y = y0 - d;
+		for (const LigneLog& l : log)
+		{
+			if (queLesEcarts && !l.probleme)
+				continue;
+			if (y + l.hauteur >= y0 && y <= y1)
+			{
+				if (l.session)
+				{
+					dl->AddRectFilled (V (x0, y + 16), V (x1, y + 17), alpha (BLEU_CL, 0.5f));
+					texte (f.monoGras, 10, x0, y + 2, BLEU_CL, l.texte);
+				}
+				else
+				{
+					texte (f.mono, 10, x0, y + 3, alpha (PAPIER, 0.45f), l.heure);
+					texte (f.monoGras, 10, x0 + 56, y + 3, l.probleme ? ORANGE : BLEU_CL,
+					       tronquer (f.monoGras, F (10), majuscules (l.tag), F (58)));
+					texte (f.texte, 13, xTexte, y + 1, l.probleme ? ORANGE : PAPIER, l.texte, x1 - xTexte - 36);
+					if (l.fois > 1)
+						texte (f.monoGras, 10, x1 - 30, y + 3, alpha (PAPIER, 0.55f),
+						       "×" + std::to_string (l.fois));
+				}
+			}
+			y += l.hauteur;
+		}
+		dl->PopClipRect ();
+	}
+
+	void pageReglages ()
+	{
+		const float x0 = kPageX0 + 18, x1 = kPageX1 - 26;
+		texte (f.monoGras, 11, x0, kPageY0 + 46, BLEU_CL, "WHAT YOU SHARE · FOR BOTH OF YOU");
+
+		auto rang = [&] (float y, const char* nom, int bit, const char* partage, const char* separe) {
+			const bool oui = (e.sync & bit) != 0;
+			texte (f.titre, 26, x0, y, PAPIER, nom);
+			if (boutonPage (x1 - 180, y + 2, 92, 26, "SEPARATE", !oui, oui ? PAPIER : ORANGE) && oui)
+				demander (Action::Sync, std::to_string (e.sync & ~bit));
+			if (boutonPage (x1 - 86, y + 2, 86, 26, "SYNC", oui, oui ? BLEU_CL : PAPIER) && !oui)
+				demander (Action::Sync, std::to_string (e.sync | bit));
+			texte (f.texte, 14, x0, y + 34, alpha (PAPIER, 0.8f), oui ? partage : separe, x1 - x0);
+			dl->AddRectFilled (V (x0, y + 74), V (x1, y + 75), alpha (PAPIER, 0.2f));
+		};
+		rang (kPageY0 + 68, "PLAY / STOP", 1,
+		      "Play, stop and position are the same on both PCs.",
+		      "Each of you plays and stops on your own PC. Perfect when you work on different parts.");
+		rang (kPageY0 + 150, "PATTERN", 2,
+		      "When one of you changes pattern, the other follows.",
+		      "Each of you stays on your own pattern. Notes still reach the right pattern.");
+		texte (f.mono, 11, x0, kPageY0 + 238, alpha (PAPIER, 0.6f),
+		       "ALWAYS SHARED: NOTES, CLIPS, TEMPO, MIXER, INSTRUMENTS.");
+		texte (f.mono, 11, x0, kPageY0 + 256, alpha (PAPIER, 0.6f),
+		       "WHEN A SESSION STARTS, THE HOST'S CHOICE APPLIES.");
+	}
+
+	void dessinerPage ()
+	{
+		surBouton = false;
+		const int m = marque ();
+		dl->AddRectFilled (V (kPageX0 + 6, kPageY0 + 6), V (kPageX1 + 6, kPageY1 + 6), BLEU);
+		dl->AddRectFilled (V (kPageX0, kPageY0), V (kPageX1, kPageY1), ENCRE);
+
+		const char* nom = page == Page::Plugins ? "PLUGINS"
+		                  : (page == Page::Reglages ? "SETTINGS" : "LOG");
+		texte (f.titre, 32, kPageX0 + 18, kPageY0 + 8, PAPIER, nom);
+		if (t - tMessage < 2.2f)
+			texte (f.monoGras, 11, kPageX0 + 170, kPageY0 + 20, ORANGE, majuscules (message));
+		if (boutonPage (kPageX1 - 86, kPageY0 + 12, 68, 24, "BACK", false))
+			fermerPage ();
+
+		switch (page)
+		{
+		case Page::Plugins: pagePlugins (); break;
+		case Page::Journal: pageJournal (); break;
+		case Page::Reglages: pageReglages (); break;
+		case Page::Aucune: break;
+		}
+
+		// un clic a cote de la feuille : on revient au menu
+		if (clicAttendu)
+		{
+			clicAttendu = false;
+			if (!dedans (clic, kPageX0, kPageY0, kPageX1, kPageY1))
+				fermerPage ();
+		}
+		const float p = std::clamp ((t - tPage) / 0.18f, 0.0f, 1.0f);
+		transformer (dl, m, translation (0, F (14 * (1 - sortieRapide (p)))));
 	}
 
 	// --- bandeau defilant ------------------------------------------------------
@@ -1241,9 +1655,10 @@ void Station::image (ImDrawList* dl, const Polices& p, float echelle, float dt, 
 
 	// --- souris ---------------------------------------------------------------------
 	const bool question = !e.demande.empty ();
-	s.survol = question ? s.boutonSous (s.souris) : s.ligneSous (s.souris);
+	const bool enPage = s.page != Page::Aucune && !question;
+	s.survol = question ? s.boutonSous (s.souris) : (enPage ? -1 : s.ligneSous (s.souris));
 	const bool bouge = s.souris.x != s.sourisPrec.x || s.souris.y != s.sourisPrec.y;
-	if (!question && bouge && s.survol >= 0)
+	if (!question && !enPage && bouge && s.survol >= 0)
 		s.choisir (s.survol);
 	s.sourisPrec = s.souris;
 	if (question)
@@ -1260,7 +1675,7 @@ void Station::image (ImDrawList* dl, const Polices& p, float echelle, float dt, 
 				s.demander (Action::ProjetNon);
 		}
 	}
-	else if (s.clicAttendu)
+	else if (s.clicAttendu && !enPage)
 	{
 		// la ligne sous l'APPUI : un « souris sortie » arrive parfois entre
 		// l'appui et l'image, et le clic se perdait
@@ -1286,10 +1701,17 @@ void Station::image (ImDrawList* dl, const Polices& p, float echelle, float dt, 
 	s.dessinerNumero ();
 	s.dessinerOscillo ();
 	s.dessinerBande ();
-	s.dessinerTitre ();
-	s.dessinerMenu ();
-	s.dessinerEtiquette ();
+	if (!enPage)   // ils depasseraient de la feuille
+	{
+		s.dessinerTitre ();
+		s.dessinerMenu ();
+		s.dessinerEtiquette ();
+	}
 	s.dessinerBandeau ();
+	if (enPage)
+		s.dessinerPage ();
+	else
+		s.surBouton = false;
 	s.dessinerVolet ();
 	if (question)
 		s.dessinerDemande ();
@@ -1302,11 +1724,24 @@ void Station::souris (float x, float y) { d->souris = ImVec2 (x, y); }
 
 void Station::bouton (bool appuye)
 {
+	d->tenu = appuye;
 	if (appuye)
 	{
 		d->clic = d->souris;
 		d->clicAttendu = true;
 	}
+}
+
+void Station::molette (float crans)
+{
+	Impl& s = *d;
+	if (s.page == Page::Aucune)
+	{
+		s.choisir (s.sel + (crans > 0 ? -1 : 1));
+		return;
+	}
+	s.suivreBas = false;
+	s.defilVoulu -= crans * 3 * kPasPlugin;
 }
 
 bool Station::touche (int vk, bool ctrl)
@@ -1317,6 +1752,28 @@ bool Station::touche (int vk, bool ctrl)
 		if (vk == VK_ESCAPE)
 			s.demander (Action::ProjetNon);
 		return true;
+	}
+	if (s.page != Page::Aucune)
+	{
+		switch (vk)
+		{
+		case VK_ESCAPE: s.fermerPage (); return true;
+		case VK_UP: molette (0.34f); return true;
+		case VK_DOWN: molette (-0.34f); return true;
+		case VK_PRIOR: molette (3.0f); return true;
+		case VK_NEXT: molette (-3.0f); return true;
+		case VK_HOME: s.suivreBas = false; s.defilVoulu = 0; return true;
+		case VK_END: s.defilVoulu = 1e7f; return true;
+		case VK_BACK:
+			if (s.page == Page::Plugins && !s.recherche.empty ())
+			{
+				s.recherche.pop_back ();
+				s.defilVoulu = 0;
+			}
+			return true;
+		default:
+			return false;
+		}
 	}
 	switch (vk)
 	{
@@ -1361,6 +1818,14 @@ bool Station::caractere (unsigned c)
 		return true;
 	if (c < 32 || c > 126)
 		return false;
+	if (s.page != Page::Aucune)
+	{
+		if (s.page != Page::Plugins)
+			return false;
+		s.recherche += (char)c;
+		s.defilVoulu = 0;
+		return true;
+	}
 	const char ch = (char)toupper ((int)c);
 
 	if (s.courante () == Entree::Rejoindre)
@@ -1387,7 +1852,7 @@ bool Station::caractere (unsigned c)
 void Station::coller (const std::string& texte)
 {
 	Impl& s = *d;
-	if (s.enOndes || !s.e.demande.empty ())
+	if (s.enOndes || !s.e.demande.empty () || s.page != Page::Aucune)
 		return;
 	// coller un code doit marcher depuis n'importe quelle ligne
 	for (int i = 0; i < (int)s.lignes.size (); ++i)
@@ -1396,7 +1861,7 @@ void Station::coller (const std::string& texte)
 	s.saisir (texte);
 }
 
-bool Station::survolCliquable () const { return d->survol >= 0; }
+bool Station::survolCliquable () const { return d->survol >= 0 || d->surBouton; }
 
 bool Station::prendreAction (Action& action, std::string& argument)
 {

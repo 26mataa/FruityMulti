@@ -33,8 +33,11 @@ struct Etat
 	int version = 0;
 	Maj maj = Maj::Repos;
 	int majVersion = 0;
-	std::vector<std::string> journal;                  // dernieres lignes
-	std::vector<std::pair<char, std::string>> compat;  // '=' les deux, '+' ici, '-' chez l'autre
+	int sync = 0;              // 1 lecture partagee, 2 motif partage
+	// Tenus par la vue, valables pendant l'image : ne pas les recopier 60 fois
+	// par seconde.
+	const std::vector<std::string>* journal = nullptr;                  // dernieres lignes
+	const std::vector<std::pair<char, std::string>>* compat = nullptr;  // '=' les deux, '+' ici, '-' chez l'autre
 };
 
 struct Polices
@@ -46,7 +49,7 @@ struct Polices
 };
 
 enum class Action { Heberger, Rejoindre, Copier, Couper, VerifierMaj, InstallerMaj,
-                    ProjetOui, ProjetNon };
+                    ProjetOui, ProjetNon, Sync, CopierJournal };
 
 class Station
 {
@@ -62,6 +65,7 @@ public:
 	// Entrees, en pixels de la fenetre. x < 0 : la souris est sortie.
 	void souris (float x, float y);
 	void bouton (bool appuye);
+	void molette (float crans);        // > 0 : vers le haut
 	bool touche (int vk, bool ctrl);   // vrai si la touche a servi
 	bool caractere (unsigned c);
 	void coller (const std::string& texte);
