@@ -22,6 +22,7 @@
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -770,13 +771,56 @@ static void forceRefresh ()
 
 static HWND g_cursorWnd = nullptr;
 static HWND g_flWindow = nullptr;
-static volatile LONG g_remoteX = 0;
-static volatile LONG g_remoteY = 0;
-static char g_remoteLabel[64] = "peer";
 static volatile LONG g_cursorThreadId = 0;
 static HANDLE g_cursorThread = nullptr;
 
-#define FM_KEY_COLOR RGB(255, 0, 255)
+struct EtatCurseur
+{
+	std::string cle;        // fenetre de FL survolee par le pair
+	int ax = 0, ay = 0;     // ecart a son coin
+	int dpi = 96;
+	int nx = -1, ny = -1;   // repli : proportion de la fenetre de FL (0..1000)
+	int role = 2;           // 1 = hote, 2 = invite
+	bool clic = false;
+	bool visible = false;
+};
+
+static std::mutex g_curseurMtx;
+static EtatCurseur g_curseur;
+
+static std::string lireSouris ();
+
+// Traitees par le thread du serveur : un curseur ne doit pas attendre que FL
+// ait fini de redessiner.
+static bool commandeCurseur (const std::string& line)
+{
+	return line.rfind ("CURSORA ", 0) == 0 || line == "CURSOR-HIDE" || line == "MOUSEA";
+}
+
+static std::string executerCurseur (const std::string& line)
+{
+	if (line == "MOUSEA")
+		return lireSouris ();
+
+	std::lock_guard<std::mutex> lock (g_curseurMtx);
+	if (line == "CURSOR-HIDE")
+	{
+		g_curseur.visible = false;
+		g_curseur.clic = false;
+		return "CURSOR-HIDDEN";
+	}
+	EtatCurseur e;
+	int clic = 0;
+	std::istringstream ss (line.substr (8));
+	if (!(ss >> e.nx >> e.ny >> clic >> e.ax >> e.ay >> e.dpi >> e.role))
+		return "ERR syntax CURSORA <nx> <ny> <clic> <ax> <ay> <dpi> <role> [fenetre]";
+	ss >> e.cle;
+	e.clic = clic != 0;
+	e.visible = true;
+	g_curseur = e;
+	return "CURSOR-OK";
+}
+
 
 // Nombre de tranches de mixage suivies. FL en propose bien plus, mais chaque
 // tranche coute deux nombres dans STATUS a chaque cycle.
@@ -800,36 +844,228 @@ static LRESULT CALLBACK cursorWndProc (HWND h, UINT msg, WPARAM w, LPARAM l)
 		PostQuitMessage (0);
 		return 0;
 	}
-	if (msg == WM_PAINT)
-	{
-		PAINTSTRUCT ps;
-		HDC dc = BeginPaint (h, &ps);
-
-		RECT rc;
-		GetClientRect (h, &rc);
-		HBRUSH bg = CreateSolidBrush (FM_KEY_COLOR);
-		FillRect (dc, &rc, bg);
-		DeleteObject (bg);
-
-		// petite fleche orange
-		POINT pts[3] = { { 4, 4 }, { 4, 34 }, { 14, 24 } };
-		HBRUSH fill = CreateSolidBrush (RGB (255, 90, 0));
-		HPEN edge = CreatePen (PS_SOLID, 2, RGB (0, 0, 0));
-		HGDIOBJ oldBrush = SelectObject (dc, fill);
-		HGDIOBJ oldPen = SelectObject (dc, edge);
-		Polygon (dc, pts, 3);
-		SelectObject (dc, oldBrush);
-		SelectObject (dc, oldPen);
-		DeleteObject (fill);
-		DeleteObject (edge);
-
-		// L'etiquette du pair a ete retiree le 29/10 (demande) : on ne garde
-		// que la fleche orange, qui suffit a montrer ou l'autre a son curseur.
-
-		EndPaint (h, &ps);
-		return 0;
-	}
 	return DefWindowProc (h, msg, w, l);
+}
+
+// g_flWindow est la premiere fenetre dont le titre contient "FL Studio" : pas
+// forcement la principale, qui fait toute la taille de FL.
+static BOOL CALLBACK chercherPrincipale (HWND h, LPARAM l)
+{
+	DWORD process = 0;
+	char classe[32] = { 0 };
+	GetWindowThreadProcessId (h, &process);
+	GetClassNameA (h, classe, sizeof (classe));
+	if (process != GetCurrentProcessId () || strcmp (classe, "TFruityLoopsMainForm") != 0)
+		return TRUE;
+	*(HWND*)l = h;
+	return FALSE;
+}
+
+static HWND fenetrePrincipale ()
+{
+	static HWND principale = nullptr;
+	if (principale == nullptr || !IsWindow (principale))
+	{
+		HWND h = nullptr;
+		EnumWindows (chercherPrincipale, (LPARAM)&h);
+		principale = h;
+	}
+	return principale != nullptr ? principale : g_flWindow;
+}
+
+// La fenetre de FL qui contient h : Playlist, Piano roll, Mixer, un plugin...
+// Ni GetWindowText ni rien qui envoie un message : le thread du curseur ne doit
+// pas attendre FL quand FL est occupe.
+static HWND fenetreFL (HWND h)
+{
+	while (h != nullptr)
+	{
+		if ((GetWindowLongPtrA (h, GWL_STYLE) & WS_CHILD) == 0)
+			return h;
+		HWND parent = GetParent (h);
+		char classe[32] = { 0 };
+		if (parent != nullptr)
+			GetClassNameA (parent, classe, sizeof (classe));
+		if (parent == nullptr || parent == fenetrePrincipale () || strcmp (classe, "TWPControl") == 0)
+			return h;
+		h = parent;
+	}
+	return nullptr;
+}
+
+// Son nom, le meme sur les deux PC : "TEventEditForm:Piano_roll", "TPluginForm:Serum_2".
+static std::string cleFenetre (HWND h)
+{
+	char classe[64] = { 0 };
+	GetClassNameA (h, classe, sizeof (classe));
+	std::string cle = classe;
+
+	wchar_t titre[96] = { 0 };
+	const int n = InternalGetWindowText (h, titre, 96);
+	std::string nom;
+	for (int i = 0; i < n; ++i)
+	{
+		const wchar_t c = titre[i];
+		if (c > 0x7E || c == '(' || (c == '-' && i > 0 && titre[i - 1] == ' '))
+			break;
+		nom += (c == ' ') ? '_' : (char)c;
+	}
+	while (!nom.empty () && nom.back () == '_')
+		nom.pop_back ();
+	return nom.empty () ? cle : cle + ":" + nom;
+}
+
+// Ce que le pair doit savoir de ma souris : la fenetre survolee et l'ecart a son
+// coin. Un ecart en pixels tombe sur la meme chose meme si les fenetres n'ont pas
+// la meme taille : la grille de FL part du coin, et un plugin a la meme taille partout.
+static bool ancrageSouris (std::string& cle, int& ax, int& ay, int& dpi)
+{
+	POINT p;
+	if (!GetCursorPos (&p))
+		return false;
+	HWND sous = WindowFromPoint (p);
+	DWORD process = 0;
+	if (sous == nullptr || GetWindowThreadProcessId (sous, &process) == 0
+	    || process != GetCurrentProcessId ())
+		return false;
+	HWND f = fenetreFL (sous);
+	RECT rc;
+	if (f == nullptr || !GetWindowRect (f, &rc))
+		return false;
+	cle = cleFenetre (f);
+	ax = p.x - rc.left;
+	ay = p.y - rc.top;
+	dpi = (int)GetDpiForWindow (f);
+	return true;
+}
+
+// MOUSEA <fenetre|-> <ax> <ay> <dpi> <nx> <ny> <clic>
+static std::string lireSouris ()
+{
+	std::string fenetre;
+	int ax = 0, ay = 0, dpi = 96;
+	if (!ancrageSouris (fenetre, ax, ay, dpi))
+		return "MOUSEA - 0 0 96 -1 -1 0";
+
+	int nx = -1, ny = -1;
+	POINT p;
+	RECT rc;
+	HWND principale = fenetrePrincipale ();
+	if (GetCursorPos (&p) && ScreenToClient (principale, &p) && GetClientRect (principale, &rc)
+	    && p.x >= 0 && p.y >= 0 && p.x < rc.right && p.y < rc.bottom)
+	{
+		nx = (int)((long long)p.x * 1000 / rc.right);
+		ny = (int)((long long)p.y * 1000 / rc.bottom);
+	}
+	const bool tenu = (GetAsyncKeyState (VK_LBUTTON) & 0x8000) != 0
+	               || (GetAsyncKeyState (VK_RBUTTON) & 0x8000) != 0;
+
+	std::ostringstream out;
+	out << "MOUSEA " << fenetre << " " << ax << " " << ay << " " << dpi << " "
+	    << nx << " " << ny << " " << (tenu ? 1 : 0);
+	return out.str ();
+}
+
+struct RechercheFenetre
+{
+	std::string cle;
+	HWND trouvee;
+};
+
+static BOOL CALLBACK chercherFenetre (HWND h, LPARAM l)
+{
+	RechercheFenetre* r = (RechercheFenetre*)l;
+	DWORD process = 0;
+	GetWindowThreadProcessId (h, &process);
+	if (process != GetCurrentProcessId () || !IsWindowVisible (h) || h == g_cursorWnd)
+		return TRUE;
+	if (fenetreFL (h) == h && cleFenetre (h) == r->cle)
+	{
+		r->trouvee = h;
+		return FALSE;
+	}
+	return TRUE;
+}
+
+// Un curseur en vectoriel : tout part de la distance au bord de la forme, ce qui
+// donne le lissage, le contour, l'ombre et les coins ronds sans bibliotheque.
+static float distancePolygone (const float (*v)[2], int n, float x, float y)
+{
+	float d = (x - v[0][0]) * (x - v[0][0]) + (y - v[0][1]) * (y - v[0][1]);
+	float signe = 1.0f;
+	for (int i = 0, j = n - 1; i < n; j = i, ++i)
+	{
+		const float ex = v[j][0] - v[i][0], ey = v[j][1] - v[i][1];
+		const float wx = x - v[i][0], wy = y - v[i][1];
+		float t = (wx * ex + wy * ey) / (ex * ex + ey * ey);
+		t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+		const float bx = wx - ex * t, by = wy - ey * t;
+		const float b = bx * bx + by * by;
+		if (b < d)
+			d = b;
+		const bool a1 = y >= v[i][1], a2 = y < v[j][1], a3 = ex * wy > ey * wx;
+		if ((a1 && a2 && a3) || (!a1 && !a2 && !a3))
+			signe = -signe;
+	}
+	return signe * sqrtf (d);
+}
+
+static float couverture (float d)      // 1 dedans, 0 dehors, lisse sur un pixel
+{
+	const float c = 0.5f - d;
+	return c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+}
+
+// Ajoute une couche sous ce qui est deja la (BGRA premultiplie, en flottants).
+static void poser (float* px, float r, float g, float b, float a)
+{
+	const float k = a * (1.0f - px[3]);
+	px[0] += b * k;
+	px[1] += g * k;
+	px[2] += r * k;
+	px[3] += k;
+}
+
+static const int kCurseurTaille = 112;
+
+static void dessinerCurseur (unsigned int* pixels, int cote, float echelle,
+                             float r, float g, float b, float onde)
+{
+	static const float fleche[4][2] = {
+		{ 1.9f, 2.2f }, { 2.0f, 20.0f }, { 7.4f, 15.3f }, { 15.0f, 14.9f } };
+	const float arrondi = 1.5f, contour = 1.7f;
+	const float centre = (float)(cote / 2);
+
+	for (int y = 0; y < cote; ++y)
+	{
+		for (int x = 0; x < cote; ++x)
+		{
+			const float fx = ((float)x + 0.5f - centre) / echelle;
+			const float fy = ((float)y + 0.5f - centre) / echelle;
+			const float d = distancePolygone (fleche, 4, fx, fy) - arrondi;
+			float px[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+			poser (px, r, g, b, couverture (d * echelle));
+			poser (px, 1.0f, 1.0f, 1.0f, couverture ((d - contour) * echelle));
+
+			if (onde >= 0.0f)
+			{
+				const float rayon = 5.0f + 25.0f * onde;
+				const float ecart = fabsf (sqrtf (fx * fx + fy * fy) - rayon) - 1.4f;
+				poser (px, r, g, b, couverture (ecart * echelle) * (1.0f - onde) * 0.85f);
+			}
+
+			const float o = distancePolygone (fleche, 4, fx - 0.8f, fy - 1.8f) - arrondi - contour;
+			const float flou = o > 4.0f ? 0.0f : (o < -1.0f ? 1.0f : (4.0f - o) / 5.0f);
+			poser (px, 0.0f, 0.0f, 0.0f, flou * flou * 0.34f);
+
+			pixels[y * cote + x] =
+				  ((unsigned int)(px[3] * 255.0f + 0.5f) << 24)
+				| ((unsigned int)(px[2] * 255.0f + 0.5f) << 16)
+				| ((unsigned int)(px[1] * 255.0f + 0.5f) << 8)
+				|  (unsigned int)(px[0] * 255.0f + 0.5f);
+		}
+	}
 }
 
 // Bouton flottant "FruityMulti" : retire le 29/10 (demande).
@@ -975,14 +1211,14 @@ static LRESULT CALLBACK barWndProc (HWND h, UINT msg, WPARAM w, LPARAM l)
 
 static void positionBar ()
 {
-	if (g_barWnd == nullptr || g_flWindow == nullptr)
+	if (g_barWnd == nullptr || fenetrePrincipale () == nullptr)
 		return;
 
 	// Fenetre INDEPENDANTE (pas enfant) : coordonnees ecran, recalculees
 	// periodiquement pour suivre FL. Cela evite le melange client/ecran qui
 	// envoyait le bouton dans la barre des taches.
 	RECT fl;
-	if (!GetWindowRect (g_flWindow, &fl))
+	if (!GetWindowRect (fenetrePrincipale (), &fl))
 		return;
 	if (fl.right - fl.left < 600)
 		return;
@@ -1027,6 +1263,219 @@ static DWORD WINAPI barThread (LPVOID)
 	return 0;
 }
 
+// Ce que le reseau apporte, 25 fois par seconde au mieux. Le thread du curseur
+// glisse vers cette position a 60 images par seconde.
+static void animerCurseur ()
+{
+	HDC ecran = GetDC (nullptr);
+	HDC memoire = CreateCompatibleDC (ecran);
+	HBITMAP image = nullptr;
+	HGDIOBJ ancienne = nullptr;
+	unsigned int* pixels = nullptr;
+	int cote = 0;
+	int roleDessine = 0;
+	float ondeDessinee = -2.0f;
+
+	LARGE_INTEGER frequence, avant;
+	QueryPerformanceFrequency (&frequence);
+	QueryPerformanceCounter (&avant);
+
+	HWND ancre = nullptr;
+	std::string cleAncre;
+	double prochaineRecherche = 0.0;
+	double temps = 0.0;
+	double dernierMouvement = 0.0;
+	double debutOnde = -1.0;
+	int dernierAx = -1, dernierAy = -1;
+	bool clicAvant = false;
+	bool place = false;
+	float x = 0.0f, y = 0.0f, alpha = 0.0f;
+	bool affichee = false;
+
+	for (;;)
+	{
+		MsgWaitForMultipleObjects (0, nullptr, FALSE, alpha > 0.0f || place ? 8 : 40, QS_ALLINPUT);
+		MSG msg;
+		while (PeekMessageA (&msg, nullptr, 0, 0, PM_REMOVE))
+		{
+			if (msg.message == WM_QUIT)
+			{
+				if (image != nullptr)
+				{
+					SelectObject (memoire, ancienne);
+					DeleteObject (image);
+				}
+				DeleteDC (memoire);
+				ReleaseDC (nullptr, ecran);
+				return;
+			}
+			TranslateMessage (&msg);
+			DispatchMessageA (&msg);
+		}
+
+		LARGE_INTEGER maintenant;
+		QueryPerformanceCounter (&maintenant);
+		const float dt = (float)((double)(maintenant.QuadPart - avant.QuadPart) / (double)frequence.QuadPart);
+		avant = maintenant;
+		temps += dt;
+
+		EtatCurseur e;
+		{
+			std::lock_guard<std::mutex> lock (g_curseurMtx);
+			e = g_curseur;
+		}
+
+		// La fenetre visee : elle peut bouger ou s'ouvrir a tout moment
+		if (e.cle != cleAncre || temps >= prochaineRecherche)
+		{
+			prochaineRecherche = temps + 0.25;
+			cleAncre = e.cle;
+			RechercheFenetre r = { e.cle, nullptr };
+			if (!e.cle.empty () && fenetrePrincipale () != nullptr)
+			{
+				EnumChildWindows (fenetrePrincipale (), chercherFenetre, (LPARAM)&r);
+				if (r.trouvee == nullptr)
+					EnumWindows (chercherFenetre, (LPARAM)&r);
+			}
+			ancre = r.trouvee;
+		}
+
+		float voulueX = x, voulueY = y;
+		bool trouve = false;
+		RECT rc;
+		if (ancre != nullptr && IsWindowVisible (ancre) && GetWindowRect (ancre, &rc))
+		{
+			const int dpi = (int)GetDpiForWindow (ancre);
+			const int ax = e.dpi > 0 ? e.ax * dpi / e.dpi : e.ax;
+			const int ay = e.dpi > 0 ? e.ay * dpi / e.dpi : e.ay;
+			const int largeur = rc.right - rc.left, hauteur = rc.bottom - rc.top;
+			voulueX = (float)(rc.left + (ax < largeur ? ax : largeur - 1));
+			voulueY = (float)(rc.top + (ay < hauteur ? ay : hauteur - 1));
+			trouve = true;
+		}
+		else if (fenetrePrincipale () != nullptr && e.nx >= 0 && GetClientRect (fenetrePrincipale (), &rc))
+		{
+			POINT p = { (LONG)((long long)e.nx * rc.right / 1000),
+			            (LONG)((long long)e.ny * rc.bottom / 1000) };
+			ClientToScreen (fenetrePrincipale (), &p);
+			voulueX = (float)p.x;
+			voulueY = (float)p.y;
+		}
+
+		if (e.ax != dernierAx || e.ay != dernierAy)
+		{
+			dernierAx = e.ax;
+			dernierAy = e.ay;
+			dernierMouvement = temps;
+		}
+		if (e.clic && !clicAvant)
+			debutOnde = temps;
+		clicAvant = e.clic;
+
+		// Sur une autre appli, ou FL en bas : l'autre n'a rien a faire a l'ecran
+		DWORD process = 0;
+		HWND devant = GetForegroundWindow ();
+		if (devant != nullptr)
+			GetWindowThreadProcessId (devant, &process);
+		const bool flDevant = process == GetCurrentProcessId ()
+		                   && fenetrePrincipale () != nullptr && !IsIconic (fenetrePrincipale ());
+
+		float voulu = (e.visible && flDevant) ? 1.0f : 0.0f;
+		if (!trouve)
+			voulu *= 0.5f;         // dans une fenetre fermee ici : position approchee
+		else if (temps - dernierMouvement > 12.0)
+			voulu *= 0.6f;         // il ne bouge plus
+
+		alpha += (voulu - alpha) * (1.0f - expf (-dt / 0.09f));
+		if (alpha < 0.01f && voulu == 0.0f)
+			alpha = 0.0f;
+
+		if (!place || alpha == 0.0f)
+		{
+			x = voulueX;
+			y = voulueY;
+			place = e.visible;
+		}
+		const float k = 1.0f - expf (-dt / 0.035f);
+		x += (voulueX - x) * k;
+		y += (voulueY - y) * k;
+		if (fabsf (voulueX - x) < 0.4f)
+			x = voulueX;
+		if (fabsf (voulueY - y) < 0.4f)
+			y = voulueY;
+
+		if (alpha == 0.0f)
+		{
+			if (affichee)
+			{
+				ShowWindow (g_cursorWnd, SW_HIDE);
+				affichee = false;
+			}
+			continue;
+		}
+
+		const float echelle = (float)GetDpiForWindow (fenetrePrincipale ()) / 96.0f;
+		const int coteVoulu = (int)((float)kCurseurTaille * echelle + 0.5f) & ~1;
+		if (coteVoulu != cote)
+		{
+			if (image != nullptr)
+			{
+				SelectObject (memoire, ancienne);
+				DeleteObject (image);
+			}
+			BITMAPINFO bi;
+			memset (&bi, 0, sizeof (bi));
+			bi.bmiHeader.biSize = sizeof (bi.bmiHeader);
+			bi.bmiHeader.biWidth = coteVoulu;
+			bi.bmiHeader.biHeight = -coteVoulu;
+			bi.bmiHeader.biPlanes = 1;
+			bi.bmiHeader.biBitCount = 32;
+			bi.bmiHeader.biCompression = BI_RGB;
+			void* bits = nullptr;
+			image = CreateDIBSection (memoire, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+			if (image == nullptr)
+				continue;
+			ancienne = SelectObject (memoire, image);
+			pixels = (unsigned int*)bits;
+			cote = coteVoulu;
+			roleDessine = 0;
+		}
+
+		float onde = -1.0f;
+		if (debutOnde >= 0.0)
+		{
+			onde = (float)((temps - debutOnde) / 0.38);
+			if (onde >= 1.0f)
+			{
+				onde = -1.0f;
+				debutOnde = -1.0;
+			}
+		}
+		if (roleDessine != e.role || onde != ondeDessinee)
+		{
+			// bleu pour l'hote, orange pour l'invite, comme les ondes de la fenetre
+			const bool hote = e.role == 1;
+			dessinerCurseur (pixels, cote, echelle, hote ? 0.137f : 1.0f,
+			                 hote ? 0.251f : 0.353f, hote ? 1.0f : 0.122f, onde);
+			roleDessine = e.role;
+			ondeDessinee = onde;
+		}
+
+		POINT destination = { (LONG)floorf (x + 0.5f) - cote / 2, (LONG)floorf (y + 0.5f) - cote / 2 };
+		POINT source = { 0, 0 };
+		SIZE taille = { cote, cote };
+		BLENDFUNCTION melange = { AC_SRC_OVER, 0, (BYTE)(alpha * 255.0f + 0.5f), AC_SRC_ALPHA };
+		UpdateLayeredWindow (g_cursorWnd, ecran, &destination, &taille, memoire, &source,
+		                     0, &melange, ULW_ALPHA);
+		if (!affichee)
+		{
+			SetWindowPos (g_cursorWnd, HWND_TOPMOST, 0, 0, 0, 0,
+			              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+			affichee = true;
+		}
+	}
+}
+
 static DWORD WINAPI cursorThread (LPVOID)
 {
 	InterlockedExchange (&g_cursorThreadId, (LONG)GetCurrentThreadId ());
@@ -1043,20 +1492,12 @@ static DWORD WINAPI cursorThread (LPVOID)
 	g_cursorWnd = CreateWindowExA (
 		WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
 		"FruityMultiCursor", "", WS_POPUP,
-		0, 0, 160, 64, nullptr, nullptr, wc.hInstance, nullptr);
+		0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
 
 	if (g_cursorWnd == nullptr)
 		return 0;
 
-	SetLayeredWindowAttributes (g_cursorWnd, FM_KEY_COLOR, 0, LWA_COLORKEY);
-	ShowWindow (g_cursorWnd, SW_SHOWNOACTIVATE);
-
-	MSG msg;
-	while (GetMessageA (&msg, nullptr, 0, 0) > 0)
-	{
-		TranslateMessage (&msg);
-		DispatchMessageA (&msg);
-	}
+	animerCurseur ();
 	return 0;
 }
 
@@ -1381,7 +1822,7 @@ static std::string executeCommand (const std::string& line)
 	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
 	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 47-p";
+		return "VERSION 47-s";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -2527,7 +2968,7 @@ static std::string executeCommand (const std::string& line)
 
 	if (line == "MOUSE")
 	{
-		if (g_flWindow == nullptr)
+		if (fenetrePrincipale () == nullptr)
 			return "MOUSE -1 -1";
 
 		POINT p;
@@ -2535,100 +2976,17 @@ static std::string executeCommand (const std::string& line)
 			return "MOUSE -1 -1";
 
 		POINT c = p;
-		if (!ScreenToClient (g_flWindow, &c))
+		if (!ScreenToClient (fenetrePrincipale (), &c))
 			return "MOUSE -1 -1";
 
 		RECT rc;
-		if (!GetClientRect (g_flWindow, &rc))
+		if (!GetClientRect (fenetrePrincipale (), &rc))
 			return "MOUSE -1 -1";
 
 		if (c.x < 0 || c.y < 0 || c.x >= rc.right || c.y >= rc.bottom)
 			return "MOUSE -1 -1";
 
 		return "MOUSE " + std::to_string (c.x) + " " + std::to_string (c.y);
-	}
-
-	if (line.rfind ("CURSORF ", 0) == 0)
-	{
-		std::istringstream ss (line.substr (8));
-		int fx = 0, fy = 0;
-		if (!(ss >> fx >> fy))
-			return "ERR syntax CURSORF <x 0..1000> <y 0..1000> [etiquette]";
-
-		std::string label;
-		std::getline (ss, label);
-		while (!label.empty () && (label.front () == ' ' || label.front () == '\t'))
-			label.erase (label.begin ());
-		if (label.size () > 48)
-			label = label.substr (0, 48);
-
-		if (g_cursorWnd == nullptr || g_flWindow == nullptr)
-			return "ERR cursor window unavailable";
-
-		RECT rc;
-		if (!GetClientRect (g_flWindow, &rc) || rc.right <= 0 || rc.bottom <= 0)
-			return "ERR FL window unavailable";
-
-		const int x = (int)((long long)fx * rc.right / 1000);
-		const int y = (int)((long long)fy * rc.bottom / 1000);
-
-		if (!label.empty ())
-			strncpy_s (g_remoteLabel, label.c_str (), _TRUNCATE);
-
-		g_remoteX = x;
-		g_remoteY = y;
-
-		POINT p;
-		p.x = x;
-		p.y = y;
-		ClientToScreen (g_flWindow, &p);
-		SetWindowPos (g_cursorWnd, HWND_TOPMOST, p.x - 4, p.y - 4, 160, 64,
-		              SWP_NOACTIVATE | SWP_SHOWWINDOW);
-		InvalidateRect (g_cursorWnd, nullptr, TRUE);
-
-		return "CURSOR-OK " + std::to_string (x) + " " + std::to_string (y);
-	}
-
-	if (line.rfind ("CURSOR ", 0) == 0)
-	{
-		std::istringstream ss (line.substr (7));
-		int x = 0, y = 0;
-		if (!(ss >> x >> y))
-			return "ERR syntax CURSOR <x> <y> [etiquette]";
-
-		std::string label;
-		std::getline (ss, label);
-		while (!label.empty () && (label.front () == ' ' || label.front () == '\t'))
-			label.erase (label.begin ());
-		if (label.size () > 48)
-			label = label.substr (0, 48);
-
-		if (g_cursorWnd == nullptr || g_flWindow == nullptr)
-			return "ERR cursor window unavailable";
-
-		if (!label.empty ())
-			strncpy_s (g_remoteLabel, label.c_str (), _TRUNCATE);
-
-		g_remoteX = x;
-		g_remoteY = y;
-
-		POINT p;
-		p.x = x;
-		p.y = y;
-		ClientToScreen (g_flWindow, &p);
-
-		SetWindowPos (g_cursorWnd, HWND_TOPMOST, p.x - 4, p.y - 4, 160, 64,
-		              SWP_NOACTIVATE | SWP_SHOWWINDOW);
-		InvalidateRect (g_cursorWnd, nullptr, TRUE);
-
-		return "CURSOR-OK " + std::to_string (x) + " " + std::to_string (y);
-	}
-
-	if (line == "CURSOR-HIDE")
-	{
-		if (g_cursorWnd != nullptr)
-			ShowWindow (g_cursorWnd, SW_HIDE);
-		return "CURSOR-HIDDEN";
 	}
 
 	// Volume d'une piste du mixeur.
@@ -3716,10 +4074,10 @@ unsigned char* best = getClipContainer ();
 		// convertit en proportion, donc une resolution differente ne decale plus
 		// le curseur. Inclus ici pour eviter 25 requetes par seconde.
 		int mx = -1, my = -1, mw = 0, mh = 0;
-		if (g_flWindow != nullptr)
+		if (fenetrePrincipale () != nullptr)
 		{
 			RECT rc;
-			if (GetClientRect (g_flWindow, &rc))
+			if (GetClientRect (fenetrePrincipale (), &rc))
 			{
 				mw = rc.right;
 				mh = rc.bottom;
@@ -3727,7 +4085,7 @@ unsigned char* best = getClipContainer ();
 				if (GetCursorPos (&p))
 				{
 					POINT c = p;
-					if (ScreenToClient (g_flWindow, &c) &&
+					if (ScreenToClient (fenetrePrincipale (), &c) &&
 					    c.x >= 0 && c.y >= 0 && c.x < rc.right && c.y < rc.bottom)
 					{
 						mx = c.x;
@@ -5038,6 +5396,15 @@ static DWORD WINAPI serverThread (LPVOID)
 				if (line.empty ())
 					continue;
 
+				std::string out;
+				if (commandeCurseur (line))
+				{
+					out = executerCurseur (line) + "\n";
+					send (c, out.c_str (), (int)out.size (), 0);
+					dernierOctet = GetTickCount ();
+					continue;
+				}
+
 				auto r = std::make_shared<Request> ();
 				r->cmd = line;
 				{
@@ -5060,7 +5427,7 @@ static DWORD WINAPI serverThread (LPVOID)
 					 && InterlockedCompareExchange (&g_stopServer, 0, 0) == 0; ++i)
 					Sleep (1);
 
-				std::string out = r->done.load () ? r->reply : std::string ("TIMEOUT");
+				out = r->done.load () ? r->reply : std::string ("TIMEOUT");
 				out += "\n";
 				// send peut n'envoyer qu'une partie (reponses INVENTORY de
 				// plusieurs centaines de Ko)
@@ -5087,6 +5454,7 @@ static DWORD WINAPI serverThread (LPVOID)
 
 		// l'agent est parti : la fenetre le dit
 		fmgui::agentParti ();
+		executerCurseur ("CURSOR-HIDE");
 	}
 
 	closesocket (srv);

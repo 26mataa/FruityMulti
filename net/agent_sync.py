@@ -39,6 +39,7 @@ ADRESSE_RELEASES = f"https://github.com/{DEPOT}/releases/latest"
 PLUGIN_HOST = "127.0.0.1"
 PLUGIN_PORT = 47831
 POLL = 0.005
+INTERVALLE_CURSEUR = 0.03             # le plugin lisse entre deux positions
 
 # Echange du projet : l'invite charge le .flp de l'hote a la connexion.
 MORCEAU_PROJET = 128 * 1024        # deux morceaux tiennent dans une trame
@@ -582,24 +583,22 @@ class Plugin:
             pass
         return None
 
-    def cursor(self, x, y, label=""):
-        if x < 0 or y < 0:
-            return self.cmd("CURSOR-HIDE")[0]
-        if label:
-            return self.cmd(f"CURSOR {x} {y} {label}")[0]
-        return self.cmd(f"CURSOR {x} {y}")[0]
+    def souris(self):
+        """Ma souris, sans passer par FL : (fenetre, ax, ay, dpi, nx, ny, clic)."""
+        parts = self.cmd("MOUSEA")[0].split()
+        if len(parts) != 8 or parts[0] != "MOUSEA":
+            return None
+        return (parts[1], *(int(v) for v in parts[2:]))
 
-    def cursor_f(self, nx, ny, label=""):
-        """Curseur en coordonnees proportionnelles (0..1000).
-
-        Les pixels dependent de la resolution et du zoom : deux FL differents
-        affichaient le curseur au mauvais endroit.
-        """
-        if nx < 0 or ny < 0:
+    def curseur(self, m, role):
+        """Le curseur du pair, role 1 pour l'hote, 2 pour l'invite."""
+        fenetre = str(m.get("k", "-"))
+        if fenetre == "-" and int(m.get("nx", -1)) < 0:
             return self.cmd("CURSOR-HIDE")[0]
-        if label:
-            return self.cmd(f"CURSORF {nx} {ny} {label}")[0]
-        return self.cmd(f"CURSORF {nx} {ny}")[0]
+        cle = "" if fenetre == "-" else fenetre
+        return self.cmd(f"CURSORA {int(m.get('nx', -1))} {int(m.get('ny', -1))} "
+                        f"{int(m.get('c', 0))} {int(m.get('ax', 0))} {int(m.get('ay', 0))} "
+                        f"{int(m.get('d', 96))} {role} {cle}")[0]
 
     def track_volume(self, index):
         """Volume d'une piste du mixeur, de 0 a 1."""
@@ -1471,6 +1470,8 @@ class Sync:
         self.last_geste = 0.0
         self.tour_effet = 0
         self.last_mouse = None
+        self.souris_recue = None
+        self.last_curseur = 0.0
         self.clip_lengths = None
         self.clips_key = None
         self.last_clipsync = 0.0
@@ -1539,29 +1540,35 @@ class Sync:
         self.tour_sampler = 0
         self.last_sampler = 0.0
         self.last_tour_samplers = 0.0
-        # Le curseur a besoin d'une cadence bien plus rapide que les notes.
-        # le curseur passe par STATUS : plus de thread ni de requete dediee
 
-    def _mouse_loop(self):
-        last = None
-        while True:
+    def _fil_curseur(self):
+        """Le curseur a son propre fil : la boucle principale tombe a 11 positions
+        par seconde quand tout le reste se synchronise. Ni MOUSEA ni CURSORA ne
+        passent par FL."""
+        while getattr(self.link, "alive", True):
+            time.sleep(INTERVALLE_CURSEUR / 3)
+            if getattr(self.plugin, "decale", False):
+                continue
             try:
-                pos = self.plugin.mouse()
-            except (ConnectionError, OSError):
-                # le plugin a disparu : on s'arrete, l'agent principal gerera
-                return
-            except Exception as exc:
-                # toute autre erreur ne doit pas tuer le thread en silence
-                print(f"[cursor] cannot read: {exc}")
-                return
-            if pos != last:
-                last = pos
-                if pos is None:
-                    self.publish({"type": "mouse", "x": -1, "y": -1, "label": self.label})
-                else:
-                    self.publish({"type": "mouse", "x": pos[0], "y": pos[1],
-                                  "label": self.label})
-            time.sleep(0.04)
+                recu, self.souris_recue = self.souris_recue, None
+                if recu is not None:
+                    self.plugin.curseur(recu, 1 if not self.is_host else 2)
+                now = time.monotonic()
+                if now - self.last_curseur < INTERVALLE_CURSEUR:
+                    continue
+                pos = self.plugin.souris()
+                if pos is not None and pos != self.last_mouse:
+                    self.last_mouse = pos
+                    self.last_curseur = now
+                    fenetre, ax, ay, dpi, nx, ny, clic = pos
+                    self.publish({"type": "mouse", "nx": nx, "ny": ny, "k": fenetre,
+                                  "ax": ax, "ay": ay, "d": dpi, "c": clic})
+            except (OSError, ValueError, IndexError, AttributeError):
+                time.sleep(0.2)
+        try:
+            self.plugin.cmd("CURSOR-HIDE")
+        except (OSError, ValueError, IndexError, AttributeError):
+            pass
 
     def publish(self, message):
         try:
@@ -1692,6 +1699,9 @@ class Sync:
         print(f"[sync] initial state sent ({total} notes, tempo {tempo})")
 
     def on_message(self, message):
+        if message.get("type") == "mouse":
+            self.souris_recue = message
+            return
         with self.incoming_lock:
             kind = str(message.get("type", ""))
             if kind.startswith("projet_"):
@@ -2110,13 +2120,6 @@ class Sync:
                     # compte comme un changement : la relecture de la fin evite
                     # de prendre les notes de l'autre motif pour des retraits
                     applied += 1
-
-            elif kind == "mouse":
-                # coordonnees proportionnelles (0..1000) : independantes de la
-                # resolution et du zoom de chacun.
-                self.plugin.cursor_f(int(message.get("nx", -1)),
-                                     int(message.get("ny", -1)),
-                                     str(message.get("label", "")))
 
             elif kind == "mix":
                 track = int(message.get("track", 0))
@@ -2580,19 +2583,6 @@ class Sync:
             self.position = position
         elif st:
             self.position = st["position"]
-
-        # curseur : deja present dans STATUS, on le diffuse s'il a bouge
-        if st:
-            mx, my, mw, mh = st["mouse"]
-            if mw > 0 and mh > 0 and mx >= 0 and my >= 0:
-                nx = int(mx * 1000 / mw)
-                ny = int(my * 1000 / mh)
-            else:
-                nx, ny = -1, -1
-            if (nx, ny) != self.last_mouse:
-                self.last_mouse = (nx, ny)
-                self.publish({"type": "mouse", "nx": nx, "ny": ny,
-                              "label": self.label})
 
         # mixeur : deja present dans STATUS, donc plus aucune requete dediee
         if st:
@@ -3757,8 +3747,6 @@ class Sync:
         self.verifier_chargement()
         self.attendre_stabilite()
 
-        with self.incoming_lock:
-            self.incoming = [m for m in self.incoming if m.get("type") != "mouse"]
         self.lire_projet()
         self.annoncer()
         self.projet_etat = None
@@ -3815,6 +3803,7 @@ class Sync:
 
     def run(self):
         print("[sync] ready")
+        threading.Thread(target=self._fil_curseur, daemon=True).start()
         try:
             while True:
                 # Le pair est parti : on rend la main pour pouvoir en accepter

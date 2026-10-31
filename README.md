@@ -30,6 +30,7 @@ No audio goes over the network. Each person hears their own FL, with no delay.
 | 🎛️ **Effects** | added effects and all their settings |
 | 🎸 **Instruments** | added instruments, their settings, presets and wavetables, including heavy plugins |
 | 🔊 **Sampler** | the sample itself and the channel's settings |
+| 🖱️ **Cursor** | your friend's cursor and clicks, on the same window as them |
 
 You both start from the host's project. After that you work as equals, and the
 host has the final say on tempo, pattern and transport.
