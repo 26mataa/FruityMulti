@@ -46,6 +46,8 @@ MORCEAU_CANAL = 32 * 1024          # une note peut se glisser entre deux morceau
 TAILLE_PROJET_MAX = 64 * 1024 * 1024
 TAILLE_PROJET_MIN = 4096           # en dessous : pas un vrai projet (voir plus bas)
 DELAI_SAUVEGARDE = 60.0            # gros projet : FL peut mettre du temps
+DELAI_REPONSE = 20.0               # le plugin repond TIMEOUT au bout de 16 s
+DELAI_CHARGEMENT = 330.0           # un plugin lourd : il attend 5 min, nous un peu plus
 DELAI_CHOIX = 120.0                # l'invite a deux minutes pour repondre
 DELAI_COUPURE = 15.0               # apres LOADPROJECT, le plugin tombe vite
 DELAI_RETOUR_PLUGIN = 300.0        # Zenology et consorts : des dizaines de s
@@ -63,6 +65,9 @@ INTERVALLE_REGLAGES_CANAUX = 0.1
 INTERVALLE_EFFETS = 0.5
 INTERVALLE_REGLAGE_EFFET = 0.1        # l'effet ouvert : 15 ms pour 4240 parametres
 INTERVALLE_TOUR_EFFETS = 0.25         # les autres, un par un
+INTERVALLE_SAMPLER_OUVERT = 0.2       # un Sampler se relit par son .fst : ~15 ms
+INTERVALLE_TOUR_SAMPLERS = 1.0        # les autres, un par un
+DELAI_FENETRE_SAMPLER = 0.4           # sa fenetre se rafraichit quand ca se calme
 PARAMS_PAR_ECRITURE = 512
 TOUCHENT_NOTES = ("add", "del", "pattern", "reset", "delchannels", "racklist",
                   "canal_debut", "canal_morceau", "etat_notes")
@@ -82,6 +87,12 @@ EVT_TYPE_CANAL = 0x15
 EVT_NOM_PLUGIN = 0xC9
 EVT_NOUVEAU_PLUGIN = 0xD4
 EVT_ETAT_PLUGIN = 0xD5
+EVT_ACTIF = 0x00
+EVT_VERSION = 0xC7
+EVT_NOM_CANAL = 0xCB
+EVT_NIVEAUX = 0xDB                 # panoramique et volume, puis le reste
+# Suivis a part, ou propres a ce poste (0xD4 porte l'onglet affiche de la fenetre).
+EVT_HORS_REGLAGES = {EVT_ACTIF, EVT_VERSION, EVT_NOM_CANAL, EVT_SAMPLE, EVT_NOUVEAU_PLUGIN}
 PLUGIN_ENVELOPPE = "Fruity Wrapper"   # VST et VST3 : le vrai nom est dans l'etat
 VARIABLE_USINE = "%FLStudioFactoryData%"
 VARIABLE_UTILISATEUR = "%FLStudioUserData%"
@@ -318,10 +329,11 @@ class Plugin:
         self.host = host
         self.port = port
         self.sock = socket.create_connection((host, port), timeout=5.0)
-        self.sock.settimeout(5.0)
+        self.sock.settimeout(DELAI_REPONSE)
         self.buf = b""
         self.lock = threading.Lock()
         self.veille = None
+        self.decale = False
 
     def veiller(self):
         """Le plugin coupe un client muet au bout de 20 s, et personne ne lui
@@ -361,7 +373,8 @@ class Plugin:
             self.buf = b""
             self.sock = socket.create_connection((self.host, self.port),
                                                  timeout=5.0)
-            self.sock.settimeout(5.0)
+            self.sock.settimeout(DELAI_REPONSE)
+            self.decale = False
 
     def close(self):
         try:
@@ -386,7 +399,7 @@ class Plugin:
             except OSError:
                 return True
             finally:
-                self.sock.settimeout(5.0)
+                self.sock.settimeout(DELAI_REPONSE)
         return False
 
     def _readline(self):
@@ -409,6 +422,9 @@ class Plugin:
                 self.sock.sendall((text + "\n").encode("utf-8"))
                 first = self._readline()
                 lines = [first]
+                # FL est occupe : la commande passera plus tard, sans autre reponse.
+                if first == "TIMEOUT":
+                    return lines
                 # Reponses multilignes : NOTES <motif> <n> ... END <n>
                 if text.strip() == "POLL":
                     while True:
@@ -423,9 +439,13 @@ class Plugin:
                         if nxt.startswith("END"):
                             break
                 return lines
+            except TimeoutError:
+                # sa reponse en retard decalerait toutes les suivantes
+                self.decale = True
+                raise
             finally:
                 if delai is not None:
-                    self.sock.settimeout(5.0)
+                    self.sock.settimeout(DELAI_REPONSE)
 
     # -- raccourcis --------------------------------------------------------
     def ping(self):
@@ -797,19 +817,24 @@ class Plugin:
         return self.cmd("NEWCHANNEL")[0]
 
     def load_plugin(self, chemin):
-        return self.cmd(f"LOADPLUGIN {chemin}")[0]
+        return self.cmd(f"LOADPLUGIN {chemin}", delai=DELAI_CHARGEMENT)[0]
 
     def save_channel(self, index, chemin):
-        return self.cmd(f"SAVECHANNEL {index} {chemin}")[0]
+        return self.cmd(f"SAVECHANNEL {index} {chemin}", delai=DELAI_CHARGEMENT)[0]
 
     def load_channel(self, index, chemin, nom=""):
-        return self.cmd(f"LOADCHANNEL {index} {chemin}|{nom}")[0]
+        return self.cmd(f"LOADCHANNEL {index} {chemin}|{nom}", delai=DELAI_CHARGEMENT)[0]
 
     def replace_channel(self, index, chemin, nom=""):
-        return self.cmd(f"REPLACECHANNEL {index} {chemin}|{nom}")[0]
+        return self.cmd(f"REPLACECHANNEL {index} {chemin}|{nom}", delai=DELAI_CHARGEMENT)[0]
 
     def delete_channel(self, index):
         return self.cmd(f"DELCHANNEL {index}")[0]
+
+    def rafraichir_fenetre(self, canal):
+        """Une fenetre de canal ouverte garde ses anciennes valeurs apres un
+        rechargement : on la ferme et on la rouvre, si elle est ouverte."""
+        return self.cmd(f"CHFORM {canal} 2")[0]
 
     def effects(self):
         """Effets du mixeur : {(tranche, slot): nom}.
@@ -1047,11 +1072,11 @@ class Plugin:
         return self.cmd(f"TRACKCOLOR {track} {couleur}")[0]
 
     def fx_save(self, track, slot, chemin):
-        return self.cmd(f"FXSAVE {track} {slot} {chemin}")[0]
+        return self.cmd(f"FXSAVE {track} {slot} {chemin}", delai=DELAI_CHARGEMENT)[0]
 
     def fx_load(self, track, slot, chemin=""):
         """Pose un .fst dans le slot, ou le vide sans chemin."""
-        return self.cmd(f"FXLOAD {track} {slot} {chemin}")[0]
+        return self.cmd(f"FXLOAD {track} {slot} {chemin}", delai=DELAI_CHARGEMENT)[0]
 
     def cmd_force(self, texte):
         """Ordre de l'hote : s'execute meme chez l'invite.
@@ -1064,19 +1089,32 @@ class Plugin:
         """Ecrit un parametre en valeur brute, sans conversion d'echelle."""
         return self.cmd(f"PARAMRAW {track} {slot} {index} {int(raw)}")[0]
 
-    def set_params(self, track, slot, valeurs):
-        """Ecrit des valeurs brutes {index: valeur}, par lots : un changement de
-        preset en touche des milliers."""
+    def _ecrire_params(self, commande, valeurs):
+        """Valeurs brutes {index: valeur}, par lots : un changement de preset en
+        touche des milliers."""
         items = list(valeurs.items())
         for debut in range(0, len(items), PARAMS_PAR_ECRITURE):
             lot = items[debut:debut + PARAMS_PAR_ECRITURE]
             jetons = " ".join(f"{i}:{int(v)}" for i, v in lot)
-            self.cmd(f"PARAMSET {track} {slot} {jetons}")
+            self.cmd(f"{commande} {jetons}")
+
+    def set_params(self, track, slot, valeurs):
+        self._ecrire_params(f"PARAMSET {track} {slot}", valeurs)
+
+    def set_channel_params(self, canal, valeurs):
+        self._ecrire_params(f"CHPARAMSET {canal}", valeurs)
 
     def param_diff(self, track, slot, neuf=False):
+        return self._params_bouges(f"PARAMDIFF {track} {slot}", neuf)
+
+    def channel_param_diff(self, canal, neuf=False):
+        """None pour un canal sans plugin."""
+        return self._params_bouges(f"CHPARAMDIFF {canal}", neuf)
+
+    def _params_bouges(self, commande, neuf):
         """(tout_relu, {index: valeur}) depuis le dernier appel, ou None."""
         try:
-            parts = self.cmd(f"PARAMDIFF {track} {slot}" + (" 1" if neuf else ""))[0].split()
+            parts = self.cmd(commande + (" 1" if neuf else ""))[0].split()
             if len(parts) < 5 or parts[0] != "PARAMDIFF":
                 return None
             valeurs = {}
@@ -1088,7 +1126,7 @@ class Plugin:
             return None
 
     def focus(self):
-        """Fenetre active de FL : effet = (tranche*64 + slot) << 16."""
+        """Fenetre active de FL : effet = (tranche*64 + slot) << 16, canal = son index."""
         try:
             parts = self.cmd("FOCUS")[0].split()
             return int(parts[1]) if parts[0] == "FOCUS" else None
@@ -1212,6 +1250,22 @@ def remplacer_sample(brut, chemin):
     return modifier_evenements(brut, {EVT_SAMPLE: (chemin + "\0").encode("utf-16-le")})
 
 
+def reglages_sampler(brut):
+    """Les reglages d'un .fst de Sampler, a comparer d'une lecture a l'autre."""
+    morceaux = []
+    for ev, debut, valeur, fin in evenements_fl(brut):
+        if ev == EVT_NIVEAUX:
+            morceaux.append(brut[valeur + 8:fin])
+        elif ev not in EVT_HORS_REGLAGES:
+            morceaux.append(brut[debut:fin])
+    return b"".join(morceaux)
+
+
+def est_sampler(brut):
+    return any(ev == EVT_TYPE_CANAL and brut[valeur] == 0
+               for ev, _debut, valeur, _fin in evenements_fl(brut))
+
+
 def plugin_requis(brut):
     """(nom, chemin) du plugin d'un canal, None pour un canal sans plugin.
 
@@ -1267,6 +1321,13 @@ def fichier_sample(chemin):
                     return complet
             return None
     return chemin if os.path.isfile(chemin) else None
+
+
+def reglages_bouges(connus, valeurs):
+    """Ce qui a vraiment bouge. FL quantifie les valeurs (ecart mesure : ~90 000
+    sur les 2^30) : en dessous de 2^17 on ne voit rien."""
+    return {i: v for i, v in valeurs.items()
+            if v != -2147483648 and abs(v - connus.get(i, 0)) > (1 << 17)}
 
 
 def diff_additions(old, new):
@@ -1381,7 +1442,17 @@ class Sync:
         self.last_fx = 0.0
         self.last_fxparams = 0.0
         self.last_tour_effets = 0.0
-        self.effet_actif = None
+        self.source_active = None
+        self.ch_params = {}
+        self.ch_signature = None
+        self.ch_sans_plugin = set()
+        self.canal_ouvert = None
+        self.smp_connus = {}
+        self.smp_autres = set()
+        self.smp_fenetres = {}
+        self.tour_sampler = 0
+        self.last_sampler = 0.0
+        self.last_tour_samplers = 0.0
         # Le curseur a besoin d'une cadence bien plus rapide que les notes.
         # le curseur passe par STATUS : plus de thread ni de requete dediee
 
@@ -1916,6 +1987,20 @@ class Sync:
                         self.fx_params[(t, s)].update(valeurs)
                     applied += 1
 
+            elif kind == "chreglages":
+                cible = self.index_local(int(index))
+                if cible is not None and self.poser_reglages(cible, message.get("d", "")):
+                    applied += 1
+
+            elif kind == "chparams":
+                cible = self.index_local(int(index))
+                valeurs = {int(i): int(v) for i, v in message.get("v", {}).items()}
+                if cible is not None and valeurs:
+                    self.plugin.set_channel_params(cible, valeurs)
+                    if cible in self.ch_params:
+                        self.ch_params[cible].update(valeurs)
+                    applied += 1
+
             elif kind == "channeltrack":
                 index = self.index_local(int(message.get("index", -1)))
                 track = int(message.get("track", -1))
@@ -2363,10 +2448,12 @@ class Sync:
         # donc aucune echelle a supposer.
         if now - self.last_fxparams >= INTERVALLE_REGLAGE_EFFET:
             self.last_fxparams = now
-            if self.fx:
-                cible = self.effet_a_lire(now)
-                if cible is not None:
-                    self.suivre_effet(*cible)
+            source = self.source_a_lire(now)
+            if source is not None and source[0] == "fx":
+                self.suivre_effet(source[1], source[2])
+            elif source is not None:
+                self.suivre_canal(source[1])
+            self.suivre_samplers(now)
 
         # parametres de plugin : DESACTIVES. Sans verification que les deux
         # cotes ont le meme plugin dans le meme emplacement, on ecrasait les
@@ -2638,21 +2725,147 @@ class Sync:
         self.channel_mix_state = None
         return True
 
-    def effet_a_lire(self, now):
-        """L'effet ouvert en priorite, et de temps en temps un autre. Il le reste
+    def source_a_lire(self, now):
+        """Le plugin ouvert en priorite, et de temps en temps un autre. Il le reste
         quand on clique ailleurs : c'est souvent lui qu'on ecoute."""
+        if self.signature_rack != self.ch_signature:
+            # les index ont pu glisser
+            self.ch_signature = self.signature_rack
+            self.ch_params = {}
+            self.ch_sans_plugin = set()
+            self.smp_connus = {}
+            self.smp_autres = set()
+            self.smp_fenetres = {}
         fenetre = self.plugin.focus()
-        if isinstance(fenetre, int) and fenetre >= 0x10000:
-            cle = divmod(fenetre >> 16, 64)
-            if cle in self.fx:
-                self.effet_actif = cle
+        if isinstance(fenetre, int) and 0 <= fenetre < 0x10000:
+            self.canal_ouvert = fenetre
+        sources = [("fx", t, s) for t, s in sorted(self.fx or {})]
+        sources += [("canal", i) for i, _nom in self.signature_rack or []
+                    if i not in self.ch_sans_plugin]
+        if not sources:
+            return None
+        if isinstance(fenetre, int) and fenetre >= 0:
+            cle = (("fx",) + divmod(fenetre >> 16, 64) if fenetre >= 0x10000
+                   else ("canal", fenetre))
+            if cle in sources:
+                self.source_active = cle
         if now - self.last_tour_effets >= INTERVALLE_TOUR_EFFETS:
             self.last_tour_effets = now
-            autres = [cle for cle in sorted(self.fx) if cle != self.effet_actif]
+            autres = [cle for cle in sources if cle != self.source_active]
             if autres:
                 self.tour_effet += 1
                 return autres[self.tour_effet % len(autres)]
-        return self.effet_actif if self.effet_actif in self.fx else None
+        return self.source_active if self.source_active in sources else None
+
+    def suivre_canal(self, canal):
+        cible = self.index_hote(canal)
+        if cible is None:
+            return
+        connus = self.ch_params.get(canal)
+        lecture = self.plugin.channel_param_diff(canal, connus is None)
+        if not isinstance(lecture, tuple):
+            self.ch_sans_plugin.add(canal)
+            return
+        tout, valeurs = lecture
+        if connus is None or tout:
+            self.ch_params[canal] = dict(valeurs)
+            return
+        changes = reglages_bouges(connus, valeurs)
+        if changes:
+            connus.update(changes)
+            self.publish({"type": "chparams", "ch": cible, "v": changes})
+            print(f"[canal] {canal} : {len(changes)} reglage(s) envoye(s)")
+
+    def suivre_samplers(self, now):
+        """Un Sampler n'a pas de parametres de plugin : ses reglages sont dans son
+        .fst. Le canal ouvert d'abord, les autres chacun leur tour."""
+        for canal, instant in list(self.smp_fenetres.items()):
+            if time.monotonic() - instant >= DELAI_FENETRE_SAMPLER:
+                del self.smp_fenetres[canal]
+                self.plugin.rafraichir_fenetre(canal)
+        samplers = sorted(self.ch_sans_plugin - self.smp_autres)
+        if not samplers:
+            return
+        if now - self.last_tour_samplers >= INTERVALLE_TOUR_SAMPLERS:
+            self.last_tour_samplers = now
+            self.tour_sampler += 1
+            self.comparer_sampler(samplers[self.tour_sampler % len(samplers)])
+        elif (self.canal_ouvert in samplers
+              and now - self.last_sampler >= INTERVALLE_SAMPLER_OUVERT):
+            self.last_sampler = now
+            self.comparer_sampler(self.canal_ouvert)
+
+    def lire_canal(self, canal):
+        """Le .fst d'un canal, None si FL le refuse."""
+        chemin = os.path.join(sous_dossier_local("canaux"), f"lecture-{os.getpid()}.fst")
+        if not self.plugin.save_channel(canal, chemin).startswith("SAVECHANNEL OK"):
+            return None
+        try:
+            with open(chemin, "rb") as fichier:
+                return fichier.read()
+        except OSError:
+            return None
+        finally:
+            try:
+                os.remove(chemin)
+            except OSError:
+                pass
+
+    def comparer_sampler(self, canal):
+        cible = self.index_hote(canal)
+        brut = self.lire_canal(canal)
+        if cible is None or brut is None:
+            return
+        if not est_sampler(brut):
+            self.smp_autres.add(canal)
+            return
+        connu = self.smp_connus.get(canal)
+        neuf = (reglages_sampler(brut), chemin_sample(brut))
+        self.smp_connus[canal] = neuf
+        if connu is None or connu == neuf:
+            return
+        if connu[1] != neuf[1]:
+            # FL ne renomme pas un canal que l'utilisateur a nomme lui-meme
+            nom = dict(self.signature_rack or []).get(canal, "")
+            self.publier_canal(canal, nom, remplace=True)
+            return
+        self.publish({"type": "chreglages", "ch": cible,
+                      "d": base64.b64encode(zlib.compress(brut, 6)).decode("ascii")})
+        print(f"[canal] {canal} : reglages du Sampler envoyes")
+
+    def poser_reglages(self, canal, paquet):
+        """Les reglages recus, sur le son de ce poste : son chemin n'est pas forcement
+        celui du pair, et sans lui FL viderait le Sampler."""
+        ici = self.lire_canal(canal)
+        if ici is None:
+            return False
+        brut = zlib.decompress(base64.b64decode(paquet))
+        sample = chemin_sample(ici)
+        brut = (remplacer_sample(brut, sample) if sample
+                else modifier_evenements(brut, {EVT_SAMPLE: None}))
+        for ev, _debut, valeur, fin in evenements_fl(ici):
+            if ev == EVT_NOUVEAU_PLUGIN:
+                brut = modifier_evenements(brut, {ev: ici[valeur:fin]})
+                break
+        chemin = os.path.join(sous_dossier_local("canaux"), f"reglages-{os.getpid()}.fst")
+        with open(chemin, "wb") as fichier:
+            fichier.write(brut)
+        try:
+            nom = dict(self.signature_rack or []).get(canal, "")
+            reponse = self.plugin.replace_channel(canal, chemin, nom)
+        finally:
+            try:
+                os.remove(chemin)
+            except OSError:
+                pass
+        if " OK " not in reponse:
+            print(f"[canal] {canal} : reglages refuses : {reponse}")
+            return False
+        relu = self.lire_canal(canal)
+        if relu is not None:
+            self.smp_connus[canal] = (reglages_sampler(relu), chemin_sample(relu))
+        self.smp_fenetres[canal] = time.monotonic()
+        return True
 
     def suivre_effet(self, t, s):
         if (t, s) in self.fx_absents:
@@ -2668,12 +2881,7 @@ class Sync:
         if connus is None or tout:
             self.fx_params[(t, s)] = dict(valeurs)
             return
-        changes = {}
-        for i, v in valeurs.items():
-            # FL quantifie les valeurs (ecart mesure : ~90 000 sur les 2^30). En
-            # dessous de 2^17 on ne voit rien ; au-dessus, c'est un vrai mouvement.
-            if v != -2147483648 and abs(v - connus.get(i, 0)) > (1 << 17):
-                changes[i] = v
+        changes = reglages_bouges(connus, valeurs)
         if changes:
             connus.update(changes)
             self.publish({"type": "fxparams", "track": t, "slot": s, "v": changes})
@@ -2978,6 +3186,10 @@ class Sync:
             print(f"[canal] '{nom}' refuse : {reponse}")
             return
         print(f"[canal] '{nom}' recu")
+        self.ch_params = {}
+        self.ch_sans_plugin = set()
+        self.smp_connus = {}
+        self.smp_autres = set()
 
         fresh = self.plugin.channels()
         if fresh is None:
@@ -3434,6 +3646,10 @@ class Sync:
                     self._liberer_autorite()
                     return False
 
+                if getattr(self.plugin, "decale", False):
+                    print("[sync] FL ne repond pas a temps : reconnexion au plugin")
+                    self.reprendre_plugin()
+
                 # Autorite : le plugin doit savoir s'il est hote ou invite.
                 # Chez l'invite, il grise alors les actions du projet (export,
                 # sauvegarde, ouverture, scan de plugins).
@@ -3712,7 +3928,7 @@ class Link:
                 effets.add((attente.get("track"), attente.get("slot")))
         if kind in ("racklist", "channelcount", "addchannel", "controle"):
             return True
-        if kind in ("add", "del"):
+        if kind in ("add", "del", "chparams", "chreglages"):
             return message.get("ch") in canaux
         if kind in ("channeltrack", "channelmix"):
             return message.get("index") in canaux

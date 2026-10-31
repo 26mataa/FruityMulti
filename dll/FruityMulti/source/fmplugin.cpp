@@ -318,6 +318,19 @@ static unsigned long guardedToggleLoopMode (unsigned char* base)
 	return 0;
 }
 
+static unsigned long guardedAppel3 (void* fn, void* a, long long b, long long c)
+{
+	__try
+	{
+		((void (*) (void*, long long, long long))fn) (a, b, c);
+		return 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return GetExceptionCode ();
+	}
+}
+
 static void* guardedLoadChannel (void* (*inserer) (int, int, int), ChannelFileFn lire,
                                  void* existant, int index, void* chemin, int* rc,
                                  unsigned long* faute)
@@ -669,6 +682,16 @@ static HMODULE g_engine = nullptr;
 static void*   g_insertFn = nullptr;
 static SOCKET  g_srv = INVALID_SOCKET;
 static volatile LONG g_stopServer = 0;
+
+// Ces commandes tiennent FL aussi longtemps que le plugin le veut.
+static bool commandeLourde (const std::string& line)
+{
+	for (const char* debut : { "LOADPLUGIN ", "LOADCHANNEL ", "REPLACECHANNEL ",
+							   "SAVECHANNEL ", "FXLOAD ", "FXSAVE " })
+		if (line.rfind (debut, 0) == 0)
+			return true;
+	return false;
+}
 
 // Partagee entre le thread serveur et le thread principal : une requete
 // expiree (TIMEOUT) peut encore etre executee plus tard sans ecrire dans une
@@ -1182,6 +1205,71 @@ static std::string widePtr (const unsigned char* obj, size_t off, int maxChars)
 	return out;
 }
 
+// Plugin d'un canal, celui de plugins.getParamValue sans slot : nullptr pour un
+// sampler ou un index hors du rack.
+static unsigned char* canalPlugin (int canal)
+{
+	if (g_engine == nullptr || canal < 0)
+		return nullptr;
+	unsigned char* base = (unsigned char*)g_engine;
+	const unsigned char* pm = *(const unsigned char* const*)(base + 0x11E2218);
+	if (!isReadable (pm, 8))
+		return nullptr;
+	unsigned char* conteneur = *(unsigned char* const*)pm;
+	if (!isReadable (conteneur, 0x18) || canal >= *(const int*)(conteneur + 0x10))
+		return nullptr;
+	void* objet = nullptr;
+	if (!((char (*) (int, char, void**))(base + 0xC05770)) (canal, 1, &objet) || objet == nullptr)
+		return nullptr;
+	if (!((char (*) (void*))(base + 0xF2F7C0)) (objet) || !isReadable (objet, 0x100))
+		return nullptr;
+	return (unsigned char*)objet;
+}
+
+// Reponse de PARAMDIFF : "<tete> nombre neuf i:brut ...", seulement ce qui a bouge.
+static std::string paramsBouges (const std::string& tete, int cle, long long base, int nombre, int neuf)
+{
+	using GetFn = int (*) (long long, int, int);
+	GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
+	std::vector<int>& connus = g_paramsConnus[cle];
+	if (neuf != 0 || (int)connus.size () != nombre)
+	{
+		neuf = 1;
+		connus.assign ((size_t)nombre, 0);
+	}
+	std::ostringstream out;
+	out << tete << " " << nombre << " " << neuf;
+	for (int k = 0; k < nombre; k++)
+	{
+		const int raw = getter (base + k, 0x7FFFFFFF, 1);
+		if (neuf != 0 || raw != connus[(size_t)k])
+		{
+			connus[(size_t)k] = raw;
+			out << " " << k << ":" << raw;
+		}
+	}
+	return out.str ();
+}
+
+// Ecrit des jetons i:brut lus dans ss. Rend le nombre ecrit, ou -1.
+static int ecrireParams (std::istringstream& ss, long long base)
+{
+	using SetFn = int (*) (int, int, int);
+	SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
+	int ecrits = 0;
+	std::string jeton;
+	while (ss >> jeton)
+	{
+		int index = 0;
+		long long raw = 0;
+		if (sscanf_s (jeton.c_str (), "%d:%lld", &index, &raw) != 2 || index < 0 || index > 0x7FFF)
+			return -1;
+		setter ((int)(base + index), (int)raw, 0x3FD);
+		ecrits++;
+	}
+	return ecrits;
+}
+
 // Derniere tranche existante : le + du mixeur fait varier ce compte, les
 // fiches au-dela existent mais FL ne les montre pas.
 static int derniereTranche ()
@@ -1293,7 +1381,7 @@ static std::string executeCommand (const std::string& line)
 	// chez chacun, sans ambiguite. Meme numero que AGENT_VERSION et
 	// fmgui::kVersionPlugin.
 	if (line == "VERSION")
-		return "VERSION 47-i";
+		return "VERSION 47-n";
 
 	// Role dans la session, annonce par l'agent :
 	//   ROLE hote | ROLE invite | ROLE aucun     (sans argument : on repond)
@@ -3371,29 +3459,41 @@ unsigned char* best = getClipContainer ();
 		if (nombre < 0 || nombre > 0x7FFF)
 			return "ERR nombre de parametres illisible";
 
-		using GetFn = int (*) (long long, int, int);
-		GetFn getter = (GetFn)((unsigned char*)g_engine + 0xC51340);
-		const long long base =
-			((long long)track * 0x40 + slot) * 0x10000LL + 0x70008000LL;
+		return paramsBouges ("PARAMDIFF " + std::to_string (track) + " " + std::to_string (slot),
+		                     track * 16 + slot,
+		                     ((long long)track * 0x40 + slot) * 0x10000LL + 0x70008000LL, nombre, neuf);
+	}
 
-		std::vector<int>& connus = g_paramsConnus[track * 16 + slot];
-		if (neuf != 0 || (int)connus.size () != nombre)
-		{
-			neuf = 1;
-			connus.assign ((size_t)nombre, 0);
-		}
-		std::ostringstream out;
-		out << "PARAMDIFF " << track << " " << slot << " " << nombre << " " << neuf;
-		for (int k = 0; k < nombre; k++)
-		{
-			const int raw = getter (base + k, 0x7FFFFFFF, 1);
-			if (neuf != 0 || raw != connus[(size_t)k])
-			{
-				connus[(size_t)k] = raw;
-				out << " " << k << ":" << raw;
-			}
-		}
-		return out.str ();
+	// La meme chose pour le plugin d'un canal : CHPARAMDIFF <canal> [neuf]
+	if (line.rfind ("CHPARAMDIFF ", 0) == 0)
+	{
+		std::istringstream ss (line.substr (12));
+		int canal = -1, neuf = 0;
+		if (!(ss >> canal))
+			return "ERR syntaxe CHPARAMDIFF <canal> [neuf]";
+		ss >> neuf;
+		unsigned char* objet = canalPlugin (canal);
+		if (objet == nullptr)
+			return "ERR pas de plugin";
+		const int nombre = *(const int*)(objet + 0x68);
+		if (nombre < 0 || nombre > 0x7FFF)
+			return "ERR nombre de parametres illisible";
+		return paramsBouges ("PARAMDIFF " + std::to_string (canal) + " 0", -1 - canal,
+		                     (long long)*(const int*)(objet + 0x9C) + 0x8000LL, nombre, neuf);
+	}
+
+	// CHPARAMSET <canal> i:brut i:brut ...
+	if (line.rfind ("CHPARAMSET ", 0) == 0)
+	{
+		std::istringstream ss (line.substr (11));
+		int canal = -1;
+		if (!(ss >> canal))
+			return "ERR syntaxe CHPARAMSET <canal> i:brut ...";
+		unsigned char* objet = canalPlugin (canal);
+		if (objet == nullptr)
+			return "ERR pas de plugin";
+		const int ecrits = ecrireParams (ss, (long long)*(const int*)(objet + 0x9C) + 0x8000LL);
+		return ecrits < 0 ? "ERR jeton invalide" : "PARAMSET " + std::to_string (ecrits);
 	}
 
 	// Plusieurs parametres d'un coup : PARAMSET <piste> <slot> i:brut i:brut ...
@@ -3405,22 +3505,8 @@ unsigned char* best = getClipContainer ();
 		int track = 0, slot = 0;
 		if (!(ss >> track >> slot) || track < 0 || track > 125 || slot < 0 || slot > 9)
 			return "ERR syntaxe PARAMSET <piste> <slot> i:brut ...";
-		using SetFn = int (*) (int, int, int);
-		SetFn setter = (SetFn)((unsigned char*)g_engine + 0xC46A70);
-		const long long base =
-			((long long)track * 0x40 + slot) * 0x10000LL + 0x70008000LL;
-		int ecrits = 0;
-		std::string jeton;
-		while (ss >> jeton)
-		{
-			int index = 0;
-			long long raw = 0;
-			if (sscanf_s (jeton.c_str (), "%d:%lld", &index, &raw) != 2 || index < 0 || index > 0x7FFF)
-				return "ERR jeton invalide " + jeton;
-			setter ((int)(base + index), (int)raw, 0x3FD);
-			ecrits++;
-		}
-		return "PARAMSET " + std::to_string (ecrits);
+		const int ecrits = ecrireParams (ss, ((long long)track * 0x40 + slot) * 0x10000LL + 0x70008000LL);
+		return ecrits < 0 ? "ERR jeton invalide" : "PARAMSET " + std::to_string (ecrits);
 	}
 
 	// Tous les parametres d'un emplacement, en une seule reponse.
@@ -4198,6 +4284,49 @@ unsigned char* best = getClipContainer ();
 		       + " decalee(s))";
 	}
 
+	// Fenetre d'un canal : canal+0x7B4, visible a +0x49E (d'apres showCSForm).
+	//   CHFORM <index> <mode>  0 = etat, 2 = fermer puis rouvrir si elle est ouverte
+	// Une fenetre ouverte ne relit pas un canal recharge ; en s'ouvrant, si.
+	if (line.rfind ("CHFORM ", 0) == 0)
+	{
+		if (g_engine == nullptr)
+			return "ERR pas d'adresse";
+
+		int index = -1;
+		int mode = 0;
+		if (sscanf_s (line.c_str () + 7, "%d %d", &index, &mode) != 2)
+			return "ERR syntaxe CHFORM <index> <mode>";
+
+		unsigned char* base = (unsigned char*)g_engine;
+		const unsigned char* pm = *(const unsigned char* const*)(base + 0x11E2218);
+		if (!isReadable (pm, 8))
+			return "ERR liste maitresse illisible";
+		unsigned char* conteneur = *(unsigned char* const*)pm;
+		if (!isReadable (conteneur, 0x18))
+			return "ERR conteneur illisible";
+		const int n = *(const int*)(conteneur + 0x10);
+		if (index < 0 || index >= n)
+			return "ERR index hors rack";
+		void** tab = *(void***)(conteneur + 0x08);
+		if (!isReadable (tab, (size_t)n * 8) || !isReadable (tab[index], 0x800))
+			return "ERR canal illisible";
+
+		unsigned char* fenetre = *(unsigned char**)((unsigned char*)tab[index] + 0x7B4);
+		if (!isReadable (fenetre, 0x500))
+			return "CHFORM sans fenetre";
+		const bool visible = fenetre[0x49E] != 0;
+		unsigned long faute = 0;
+		if (mode == 2 && visible)
+		{
+			faute = guardedAppel3 (base + 0x337640, fenetre, 0, 1);
+			if (faute == 0)
+				faute = guardedAppel3 (base + 0x337640, fenetre, 1, 1);
+		}
+		requestRefresh ();
+		return "CHFORM OK visible " + std::to_string (visible ? 1 : 0)
+		       + " faute " + std::to_string (faute);
+	}
+
 	// Copie un canal entier (sample, plugin, reglages) dans un fichier .fst.
 	//   SAVECHANNEL <index> <chemin absolu>
 	if (line.rfind ("SAVECHANNEL ", 0) == 0)
@@ -4924,7 +5053,11 @@ static DWORD WINAPI serverThread (LPVOID)
 				// Certaines commandes sont lentes : le mixeur redessine son interface,
 				// et ADDCHANNEL scanne la base de plugins sur disque (jusqu'a 6 s).
 				// On patiente jusqu'a 12 s, en revenant des que la reponse est prete.
-				for (int i = 0; i < 10000 && !r->done.load (); ++i)
+				// Un chargement va au bout (Zenology : 35 s) : TIMEOUT ferait croire
+				// a un refus alors que le canal finit par arriver.
+				const int attente = commandeLourde (line) ? 200000 : 10000;
+				for (int i = 0; i < attente && !r->done.load ()
+					 && InterlockedCompareExchange (&g_stopServer, 0, 0) == 0; ++i)
 					Sleep (1);
 
 				std::string out = r->done.load () ? r->reply : std::string ("TIMEOUT");
@@ -4944,6 +5077,8 @@ static DWORD WINAPI serverThread (LPVOID)
 				}
 				if (coupe)
 					break;
+				// Le temps d'un chargement n'est pas du silence du client.
+				dernierOctet = GetTickCount ();
 			}
 			if (coupe)
 				break;
